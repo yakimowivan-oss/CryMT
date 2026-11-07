@@ -1,4 +1,4 @@
-CryMT v13 for Crysis (2007): multithreaded rendering, DirectX 12, NVIDIA DLAA, global illumination
+CryMT v14 for Crysis (2007): multithreaded rendering, DirectX 12, NVIDIA DLAA, global illumination
 ==================================================================================================
 
 What it is
@@ -22,9 +22,9 @@ Requirements
 ------------
   * Crysis 1.2.1, 64-bit (build 6156): Steam, GOG or disc with patch 1.2.1.
     Warhead, Wars and Remastered are not supported.
-  * c1-launcher v8 as Bin64\Crysis.exe: https://github.com/ccomrade/c1-launcher/releases
-    It fixes the 64-bit game's crashes with memory above 4 GB. Without it CryMT stays off and
-    the game runs as usual.
+  * c1-launcher as Bin64\Crysis.exe (GOG installs it): https://github.com/ccomrade/c1-launcher/releases
+    v7 (GOG's) and v8 both work. Only v8 fixes the 64-bit game's crashes with memory above
+    4 GB; with an older one CryMT applies its own fix.
   * Windows 10/11 64-bit. The launcher needs the Microsoft Edge WebView2 Runtime, which is
     already part of an updated Windows 10 or 11.
   * DLAA needs an NVIDIA RTX card. The other modes work on any DirectX 12 card.

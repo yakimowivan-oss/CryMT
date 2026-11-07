@@ -611,9 +611,11 @@ std::wstring Status()
         swprintf_s(key, L"\\StringFileInfo\\%04x%04x\\FileVersion", lang[0], lang[1]);
         VerQueryValueW(info.data(), key, reinterpret_cast<void**>(&version), &len);
     }
-    const bool c1 = product && wcsstr(product, L"C1-Launcher") && version && (wcsstr(version, L"v8") || wcsstr(version, L"v9"));
-    s += c1 ? T(L"c1-launcher v8: есть", L"c1-launcher v8: found") : T(L"Нужен c1-launcher v8 в Bin64\\Crysis.exe (без него CryMT выключен)",
-                                                                       L"c1-launcher v8 is needed as Bin64\\Crysis.exe (CryMT stays off without it)");
+    const bool c1 = product && wcsstr(product, L"C1-Launcher");
+    const bool v8 = c1 && version && (wcsstr(version, L"v8") || wcsstr(version, L"v9"));
+    s += v8 ? T(L"c1-launcher v8: есть", L"c1-launcher v8: found")
+       : c1 ? T(L"c1-launcher старше v8: CryMT ставит своё исправление памяти", L"c1-launcher older than v8: CryMT adds its own memory fix")
+            : T(L"Bin64\\Crysis.exe — не c1-launcher: с ним CryMT не проверялся", L"Bin64\\Crysis.exe is not c1-launcher: CryMT is untested with it");
     s += L"\r\n";
     s += Exists(g_game + L"Bin64\\dbghelp.dll") ? T(L"Загрузчик Bin64\\dbghelp.dll: есть", L"Loader Bin64\\dbghelp.dll: found")
                                                  : T(L"Нет Bin64\\dbghelp.dll: распакуйте архив CryMT в папку игры", L"Bin64\\dbghelp.dll missing: unpack CryMT into the game folder");
@@ -773,7 +775,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR args, int show)
     RegisterClassW(&wc);
     RECT r{0, 0, MulDiv(480, dpi, 96), MulDiv(408, dpi, 96)};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
-    g_wnd = CreateWindowW(L"CryMTSettings", L"CryMT v13", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
+    g_wnd = CreateWindowW(L"CryMTSettings", L"CryMT v14", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
                           r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     Build(dpi);
     Load();

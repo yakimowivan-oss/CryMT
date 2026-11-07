@@ -30,17 +30,24 @@ std::wstring ModuleDir(HMODULE module)
     return s.substr(0, s.find_last_of(L"\\/") + 1);
 }
 
-// -crymt=<mode> on the command line, else the ini's Mode (mt when there is none), lower case.
-std::wstring ChosenMode(const std::wstring& ini)
+// The value of <name><value> on the command line (lower case), or empty.
+std::wstring ArgValue(const wchar_t* name)
 {
     std::wstring cmd = GetCommandLineW();
     CharLowerBuffW(cmd.data(), static_cast<DWORD>(cmd.size()));
-    const size_t at = cmd.find(L"-crymt=");
-    if (at != std::wstring::npos)
-    {
-        const size_t start = at + 7;
-        return cmd.substr(start, cmd.find_first_of(L" \t\"", start) - start);
-    }
+    const size_t at = cmd.find(name);
+    if (at == std::wstring::npos)
+        return {};
+    const size_t start = at + wcslen(name);
+    return cmd.substr(start, cmd.find_first_of(L" \t\"", start) - start);
+}
+
+// -crymt=<mode> on the command line, else the ini's Mode (mt when there is none), lower case.
+std::wstring ChosenMode(const std::wstring& ini)
+{
+    const std::wstring arg = ArgValue(L"-crymt=");
+    if (!arg.empty())
+        return arg;
     wchar_t value[32] = {};
     GetPrivateProfileStringW(L"CryMT", L"Mode", L"mt", value, 32, ini.c_str());
     CharLowerW(value);
@@ -97,9 +104,15 @@ void LoadCryMT(HMODULE self)
     }
     SetEnvironmentVariableW(L"CRYMT_TESTCMD", commands.c_str());
     SetEnvironmentVariableW(L"CRYMT_TESTCMDSEC", L"0");
+    // GI from the ini, or -crymt-gi=0|1 on the command line (the launcher's benchmarks run presets without touching it).
     wchar_t gi[8] = {};
-    if (mode != L"mt" && GetPrivateProfileStringW(L"CryMT", L"GI", L"0", gi, 8, ini.c_str()) && wcscmp(gi, L"0") != 0)
-        SetEnvironmentVariableW(L"CRYMT_GI", gi); // screen-space GI, D3D12 modes; needs the patched shaders
+    const std::wstring giArg = ArgValue(L"-crymt-gi=");
+    if (!giArg.empty())
+        wcsncpy_s(gi, giArg.c_str(), _TRUNCATE);
+    else
+        GetPrivateProfileStringW(L"CryMT", L"GI", L"0", gi, 8, ini.c_str());
+    if (mode != L"mt" && gi[0] && wcscmp(gi, L"0") != 0)
+        SetEnvironmentVariableW(L"CRYMT_GI", gi); // GI, D3D12 modes; needs the patched shaders
     wchar_t env[4096] = {};
     GetPrivateProfileSectionW(L"Env", env, 4096, ini.c_str());
     for (wchar_t* p = env; *p; p += wcslen(p) + 1)

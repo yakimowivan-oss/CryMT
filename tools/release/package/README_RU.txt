@@ -1,4 +1,4 @@
-CryMT v13 для Crysis (2007) — многопоточный рендер, DirectX 12, NVIDIA DLAA, глобальное освещение
+CryMT v14 для Crysis (2007) — многопоточный рендер, DirectX 12, NVIDIA DLAA, глобальное освещение
 ===================================================================================================
 
 Что это
@@ -20,9 +20,9 @@ zzCryMT.pak с правками пяти шейдеров.
 ----------
   * Crysis 1.2.1, 64 бита (сборка 6156): Steam, GOG или диск с патчем 1.2.1.
     Warhead, Wars и Remastered не поддерживаются.
-  * c1-launcher v8 в роли Bin64\Crysis.exe: https://github.com/ccomrade/c1-launcher/releases
-    Он исправляет вылеты 64-битной игры из-за памяти выше 4 ГБ. Без него CryMT
-    не включается, и игра работает как обычно.
+  * c1-launcher в роли Bin64\Crysis.exe (GOG ставит его сам): https://github.com/ccomrade/c1-launcher/releases
+    Подходит v7 (GOG) и v8. Вылеты 64-битной игры из-за памяти выше 4 ГБ CryMT исправляет
+    сам, если в c1-launcher этого исправления нет (оно есть только в v8).
   * Windows 10/11 64 бит. Лаунчеру нужен Microsoft Edge WebView2 Runtime (он уже есть
     в обновлённых Windows 10 и 11).
   * Для DLAA — видеокарта NVIDIA RTX. Остальные режимы работают на любой видеокарте с DirectX 12.

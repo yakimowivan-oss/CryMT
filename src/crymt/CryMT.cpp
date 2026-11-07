@@ -26,6 +26,7 @@
 #include "Dlss.h"
 #include "DlssScene.h"
 #include "GiControl.h"
+#include "MemoryFix.h"
 #include "Paths.h"
 #include "RenderDocCapture.h"
 #include "RendererClasses6156.h"
@@ -44,6 +45,7 @@ void D3DLayerPassName(const char* text); // a pass name for frame debuggers, in 
 bool D3DLayerDlssScreen(uint32_t* width, uint32_t* height);
 void Dx12CaptureNow(int frames, int flags); // D3D12Backend.cpp: the capture key
 void Dx12SetObjectMotion(bool on);           // D3D12Backend.cpp: object velocities in DLSS's motion vectors
+bool Dx12DlssActive();                       // D3D12Backend.cpp: DLSS runs (Streamline started on an RTX card)
 bool D3DLayerScreen(uint32_t* width, uint32_t* height);
 extern uint64_t g_gcDeferred;
 extern uint64_t g_releaseDeferred;
@@ -751,9 +753,9 @@ void PatchText(uintptr_t at, const char* expect, const char* text)
     VirtualProtect(reinterpret_cast<void*>(at), n, old, &old);
 }
 
-constexpr wchar_t kVersion[] = L"v13";
+constexpr wchar_t kVersion[] = L"v14";
 
-// What CryMT runs, for the window title (" | CryMT v13: D3D12 + DLAA, render thread"), or why it is off.
+// What CryMT runs, for the window title (" | CryMT v14: D3D12 + DLAA, render thread"), or why it is off.
 std::wstring ModeText()
 {
     wchar_t text[224];
@@ -849,6 +851,7 @@ void WriteStats()
         return;
     const double frames = g_frame ? static_cast<double>(g_frame) : 1.0;
     fprintf(f, "%s", g_setupLog);
+    memfix::WriteStats(f);
     DlssWriteStats(f);
     fprintf(f, "frames=%llu avgRenderMs=%.3f avgWindowMs=%.3f otherEndEfCalls=%llu slots=%d\n",
             static_cast<unsigned long long>(g_frame), g_renderSum * g_qpcToMs / frames,
@@ -1178,6 +1181,28 @@ FILE* PakOpenPathHook(void* pak, const char* name, const char* mode, char* path,
     return f;
 }
 } // namespace
+
+// MSAA (the game's anti-aliasing quality, r_FSAA) is not supported with CryMT yet: with multisampled targets DLAA and
+// GI do not start and shadows went missing and flickered (island GPU demo, MSAA 4x, 2026-11-07). The renderer's cvars
+// (registered at CryRenderD3D10 0x3810DE81: r_FSAA -> 0x382E9B40, r_FSAA_samples -> 0x382E9B3C, build 6156) are put
+// to 0 when the renderer creates its device (the configs are read by then, its targets not made yet) and every frame
+// (the options menu may set them again; a resolution change re-creates the targets).
+constexpr uintptr_t kCvFsaa = 0x382E9B40;
+constexpr uintptr_t kCvFsaaSamples = 0x382E9B3C;
+
+void CryMTForceNoMsaa()
+{
+    if (g_off || !GetModuleHandleW(L"CryRenderD3D10.dll"))
+        return;
+    auto* fsaa = reinterpret_cast<volatile int*>(kCvFsaa);
+    if (*fsaa == 0)
+        return;
+    char line[112];
+    sprintf_s(line, "MSAA forced off: r_FSAA %d, samples %d (not supported with CryMT yet)", *fsaa,
+              *reinterpret_cast<volatile int*>(kCvFsaaSamples));
+    SetupLog(line);
+    *fsaa = 0;
+}
 
 void CryMTInstallPakLog()
 {
@@ -6871,6 +6896,13 @@ void RunTestCommands()
     command[n] = 0;
     if (g_testCommands[g_testNext] == ';')
         g_testNext++;
+    // The loader turns the game's edge anti-aliasing off in DLAA mode; that is right only when DLAA runs. Without an RTX
+    // card (AMD, Intel, older NVIDIA) Streamline reports no DLSS, and the game keeps its own anti-aliasing.
+    if (_stricmp(command, "r_UseEdgeAA 0") == 0 && !Dx12DlssActive())
+    {
+        SetupLog("DLAA is not running: r_UseEdgeAA 0 skipped, the game's own anti-aliasing stays");
+        return;
+    }
     ConsoleCommand(command);
 }
 
@@ -7142,6 +7174,7 @@ void Capture10Install()
 
 bool HookPreUpdate(void* framework, bool engineFocus, unsigned int flags)
 {
+    CryMTForceNoMsaa();
     RunTestCommands();
     RecordHotkeys();
     GiHotkeys();
@@ -7973,9 +8006,21 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         if (GetEnvironmentVariableW(L"CRYMT_MODE", mode, 8))
             g_mode = _wtoi(mode);
         // c1-launcher v8 carries the fix for the 64-bit allocator (pointers above 4 GB) and exports the memory
-        // functions the deferred free needs; without it the render thread is not safe.
-        if (g_mode == 2 && !GetProcAddress(GetModuleHandleW(nullptr), "CryMalloc"))
-            TurnOff("CryMT off: Bin64\\Crysis.exe is not c1-launcher v8 (needed for the 64-bit memory fix)");
+        // functions the engine modules look for in the executable first; the deferred free hooks them there. Without
+        // it (GOG's c1-launcher v7 and others) CryMT brings the same fix (MemoryFix.cpp): a pool below 4 GB and the
+        // same exports added to the executable's export table in memory, before the engine modules load.
+        wchar_t memfixVar[8] = {};
+        if (GetEnvironmentVariableW(L"CRYMT_MEMFIX", memfixVar, 8) && wcscmp(memfixVar, L"0") == 0)
+            SetupLog("memory fix off (CRYMT_MEMFIX=0, tests)");
+        else if (!GetProcAddress(GetModuleHandleW(nullptr), "CryMalloc"))
+        {
+            const bool pool = memfix::Init();
+            if (!memfix::ExportFromExe())
+                TurnOff("CryMT off: no c1-launcher v8, and the memory functions could not be added to Crysis.exe");
+            else
+                SetupLog(pool ? "no c1-launcher v8: CryMT's memory fix on (pool below 4 GB, exports added to Crysis.exe)"
+                              : "no c1-launcher v8: CryMT's memory functions exported, NO pool (CRYMT_SAFEPOOL_MB=0)");
+        }
         if (g_off)
             g_mode = 0;
         else

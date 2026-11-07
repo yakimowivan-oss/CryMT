@@ -51,6 +51,8 @@ std::wstring g_dir, g_game, g_ui; // with trailing backslashes
 std::wstring g_page;               // --page=<suffix>: appended to the page's address (tests: #news?auto=update)
 bool g_dev;
 bool g_backedUp;
+bool g_en = PRIMARYLANGID(GetUserDefaultUILanguage()) != LANG_RUSSIAN; // set by the page ('lang')
+const wchar_t* T(const wchar_t* ru, const wchar_t* en) { return g_en ? en : ru; }
 HANDLE g_once;                 // the one-launcher mutex (released before a restart)
 std::atomic<bool> g_working;   // an update, rollback, check or download runs on a worker thread
 std::mutex g_manifestLock;
@@ -173,13 +175,45 @@ void SendLater(const std::wstring& json) { PostMessageW(g_wnd, WM_HOSTJSON, 0, r
 
 std::wstring IniPath() { return g_dir + L"CryMT.ini"; }
 
-bool InstalledInfo(std::string& version, std::string& date); // CryMTersion.txt (below, with the updates)
+bool InstalledInfo(std::string& version, std::string& date); // CryMT\version.txt (below, with the updates)
+
+// The game's MSAA setting (Options > Graphics > Anti-aliasing quality) as the profiles keep it: Documents\My Games\
+// Crysis\Profiles\<profile>\attributes.xml, <Attr name="Option.fsaa_mode" value="..."/>; empty: off.
+std::wstring GameMsaa()
+{
+    PWSTR docs = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs)))
+        return {};
+    const std::wstring profiles = std::wstring(docs) + L"\\My Games\\Crysis\\Profiles\\";
+    CoTaskMemFree(docs);
+    WIN32_FIND_DATAW f;
+    const HANDLE h = FindFirstFileW((profiles + L"*").c_str(), &f);
+    std::wstring found;
+    if (h == INVALID_HANDLE_VALUE)
+        return found;
+    do
+    {
+        if (!(f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || f.cFileName[0] == L'.')
+            continue;
+        const std::string xml = ReadAll(profiles + f.cFileName + L"\\attributes.xml");
+        const size_t at = xml.find("name=\"Option.fsaa_mode\"");
+        const size_t v = at == std::string::npos ? at : xml.find("value=\"", at);
+        if (v == std::string::npos)
+            continue;
+        const size_t end = xml.find('"', v + 7);
+        const std::string value = xml.substr(v + 7, end == std::string::npos ? 0 : end - v - 7);
+        if (!value.empty() && value != "0")
+            found = Utf16(value);
+    } while (found.empty() && FindNextFileW(h, &f));
+    FindClose(h);
+    return found;
+}
 
 // The game's state for the status bar: build, c1-launcher, the proxy, why CryMT stayed off last time.
 std::wstring Status()
 {
-    std::wstring build = L"?", launcher = L"нет c1-launcher";
-    bool buildOk = false, launcherOk = false;
+    std::wstring build = L"?", launcher = T(L"Crysis.exe без c1-launcher (не проверялся)", L"Crysis.exe without c1-launcher (untested)");
+    bool buildOk = false, launcherOk = false, launcherWarn = false;
     DWORD dummy = 0;
     const std::wstring sys = g_game + L"Bin64\\CrySystem.dll";
     if (const DWORD size = GetFileVersionInfoSizeW(sys.c_str(), &dummy))
@@ -212,18 +246,20 @@ std::wstring Status()
         }
         if (product && wcsstr(product, L"C1-Launcher"))
         {
+            // v8 brings the 64-bit memory fix itself; with an older one (GOG's v7) CryMT adds its own (MemoryFix.cpp).
             launcher = std::wstring(L"c1-launcher ") + (version ? version : L"");
-            launcherOk = version && (wcsstr(version, L"v8") || wcsstr(version, L"v9"));
-            if (!launcherOk)
-                launcher += L" — нужен v8";
+            launcherOk = true;
+            launcherWarn = !(version && (wcsstr(version, L"v8") || wcsstr(version, L"v9")));
+            if (launcherWarn)
+                launcher += T(L" + исправление памяти CryMT (меньше проверено, лучше v8)", L" + CryMT's memory fix (less tested, v8 recommended)");
         }
     }
     const std::string off = ReadAll(g_dir + L"logs\\mt\\crymt_off.txt");
     std::string version, date;
     InstalledInfo(version, date);
-    return L"{\"installed\":" + Json(Utf16(version)) + L",\"installedDate\":" + Json(Utf16(date)) +
+    return L"{\"msaa\":" + Json(GameMsaa()) + L",\"installed\":" + Json(Utf16(version)) + L",\"installedDate\":" + Json(Utf16(date)) +
            L",\"game\":" + Json(g_game) + L",\"build\":" + Json(build) + L",\"buildOk\":" + Bool(buildOk) + L",\"launcher\":" + Json(launcher) +
-           L",\"launcherOk\":" + Bool(launcherOk) + L",\"proxy\":" + Bool(Exists(g_game + L"Bin64\\dbghelp.dll")) + L",\"lastOff\":" + Json(Utf16(off)) + L"}";
+           L",\"launcherOk\":" + Bool(launcherOk) + L",\"launcherWarn\":" + Bool(launcherWarn) + L",\"proxy\":" + Bool(Exists(g_game + L"Bin64\\dbghelp.dll")) + L",\"lastOff\":" + Json(Utf16(off)) + L"}";
 }
 
 void SendState(const wchar_t* reason)
@@ -251,7 +287,7 @@ void Save(const std::wstring& text)
         g_backedUp = CopyFileW(ini.c_str(), (g_dir + L"cache\\CryMT.ini.bak").c_str(), FALSE) || true;
     if (!WriteAll(ini, data))
     {
-        Send(L"{\"type\":\"error\",\"error\":" + Json(L"не удалось записать " + ini) + L"}");
+        Send(L"{\"type\":\"error\",\"error\":" + Json(T(L"не удалось записать ", L"could not write ") + ini) + L"}");
         return;
     }
     g_iniTime = WriteTime(ini);
@@ -279,15 +315,15 @@ void Play(bool gi, const std::wstring& args, const std::wstring& after)
         std::wstring error;
         const std::wstring settings = g_dir + L"CryMTSettings.exe";
         if (!Exists(settings))
-            error = L"нет " + settings;
+            error = T(L"нет ", L"missing: ") + settings;
         else if (const DWORD code = RunWait(L"\"" + settings + L"\" " + (gi ? L"--gi-install" : L"--gi-remove")))
-            error = std::wstring(gi ? L"шейдеры GI не установились" : L"шейдеры GI не удалились") + L" (код " + std::to_wstring(code) + L")";
+            error = std::wstring(gi ? T(L"шейдеры GI не установились", L"the GI shaders were not installed") : T(L"шейдеры GI не удалились", L"the GI shaders were not removed")) + T(L" (код ", L" (code ") + std::to_wstring(code) + L")";
         if (error.empty())
         {
             const std::wstring bin = g_game + L"Bin64";
             const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", (bin + L"\\Crysis.exe").c_str(), args.c_str(), bin.c_str(), SW_SHOWNORMAL));
             if (r <= 32)
-                error = L"Bin64\\Crysis.exe не запустился (" + std::to_wstring(r) + L")";
+                error = T(L"Bin64\\Crysis.exe не запустился (", L"Bin64\\Crysis.exe did not start (") + std::to_wstring(r) + L")";
         }
         SendLater(L"{\"type\":\"played\",\"ok\":" + std::wstring(Bool(error.empty())) + L",\"error\":" + Json(error) + L",\"after\":" +
                   Json(error.empty() ? after : L"stay") + L"}");
@@ -420,13 +456,13 @@ bool HttpGet(const std::wstring& url, std::string& body, DWORD& status, std::wst
     uc.dwExtraInfoLength = 4096;
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc) || uc.nScheme != INTERNET_SCHEME_HTTPS)
     {
-        error = L"не https-адрес";
+        error = T(L"не https-адрес", L"not an https address");
         return false;
     }
-    const HINTERNET session = WinHttpOpen(L"CryMT-Launcher/13", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    const HINTERNET session = WinHttpOpen(L"CryMT-Launcher", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session)
     {
-        error = L"WinHTTP не запустился";
+        error = T(L"WinHTTP не запустился", L"WinHTTP did not start");
         return false;
     }
     WinHttpSetTimeouts(session, 15000, 15000, 30000, 60000);
@@ -475,10 +511,10 @@ bool HttpGet(const std::wstring& url, std::string& body, DWORD& status, std::wst
             progress(body.size(), total);
     }
     if (!ok)
-        error = L"сеть: ошибка " + std::to_wstring(GetLastError());
+        error = T(L"сеть: ошибка ", L"network error ") + std::to_wstring(GetLastError());
     else if (status != 200)
     {
-        error = L"сервер ответил " + std::to_wstring(status);
+        error = T(L"сервер ответил ", L"the server answered ") + std::to_wstring(status);
         ok = false;
     }
     if (request)
@@ -587,7 +623,7 @@ bool StartWork(const wchar_t* kind, std::function<void()> work)
     bool expected = false;
     if (!g_working.compare_exchange_strong(expected, true))
     {
-        SendLater(L"{\"type\":\"error\",\"error\":" + Json(std::wstring(L"лаунчер занят: ") + kind) + L"}");
+        SendLater(L"{\"type\":\"error\",\"error\":" + Json(std::wstring(T(L"лаунчер занят: ", L"the launcher is busy: ")) + kind) + L"}");
         return false;
     }
     std::thread([work] {
@@ -599,7 +635,7 @@ bool StartWork(const wchar_t* kind, std::function<void()> work)
 
 void FetchText(const std::wstring& id, const std::wstring& url)
 {
-    StartWork(L"запрос", [id, url] {
+    StartWork(T(L"запрос", L"request"), [id, url] {
         std::string body;
         DWORD status = 0;
         std::wstring error;
@@ -611,7 +647,7 @@ void FetchText(const std::wstring& id, const std::wstring& url)
 
 void CheckManifest(const std::wstring& url, const std::wstring& sigUrl)
 {
-    StartWork(L"проверка обновления", [url, sigUrl] {
+    StartWork(T(L"проверка обновления", L"update check"), [url, sigUrl] {
         std::string text, sig;
         DWORD status = 0;
         std::wstring error;
@@ -620,12 +656,12 @@ void CheckManifest(const std::wstring& url, const std::wstring& sigUrl)
         if (ok && !SignatureOk(text, sig))
         {
             ok = false;
-            error = L"подпись обновления не совпала с ключом CryMT — не устанавливаю";
+            error = T(L"подпись обновления не совпала с ключом CryMT — не устанавливаю", L"the update's signature does not match the CryMT key — not installing");
         }
         else if (ok && !ParseManifest(text, m))
         {
             ok = false;
-            error = L"список файлов обновления не читается";
+            error = T(L"список файлов обновления не читается", L"the update's file list cannot be read");
         }
         if (ok)
         {
@@ -644,7 +680,7 @@ void Progress(const wchar_t* stage, uint64_t done, uint64_t total)
 
 void Install(const std::wstring& zipUrl)
 {
-    StartWork(L"обновление", [zipUrl] {
+    StartWork(T(L"обновление", L"update"), [zipUrl] {
         std::string text;
         {
             std::lock_guard<std::mutex> guard(g_manifestLock);
@@ -659,7 +695,7 @@ void Install(const std::wstring& zipUrl)
         };
         if (!ParseManifest(text, m))
         {
-            error = L"нет проверенного списка файлов";
+            error = T(L"нет проверенного списка файлов", L"no checked file list");
             return done(false);
         }
         const std::wstring stage = g_dir + L"cache\\update\\" + Utf16(m.version);
@@ -671,14 +707,14 @@ void Install(const std::wstring& zipUrl)
             return done(false);
         if (!WriteAll(stage + L"\\package.zip", zip))
         {
-            error = L"не удалось сохранить архив";
+            error = T(L"не удалось сохранить архив", L"could not save the archive");
             return done(false);
         }
         zip.clear();
         Progress(L"unpack", 0, 0);
         if (RunWait(L"tar.exe -xf \"" + stage + L"\\package.zip\" -C \"" + stage + L"\\files\"") != 0)
         {
-            error = L"архив не распаковался (tar.exe)";
+            error = T(L"архив не распаковался (tar.exe)", L"the archive did not unpack (tar.exe)");
             return done(false);
         }
         // Every file of the package against the signed manifest before anything in the game folder changes.
@@ -688,14 +724,14 @@ void Install(const std::wstring& zipUrl)
             const std::string data = ReadAll(Backslashes(stage + L"\\files\\" + Utf16(f.path)));
             if (data.size() != f.size || Sha256Hex(data) != f.sha)
             {
-                error = L"файл не совпал со списком: " + Utf16(f.path);
+                error = T(L"файл не совпал со списком: ", L"a file does not match the list: ") + Utf16(f.path);
                 return done(false);
             }
             Progress(L"check", ++checked, m.files.size());
         }
         if (GameRunning())
         {
-            error = L"игра запущена — закройте её и обновите снова";
+            error = T(L"игра запущена — закройте её и обновите снова", L"the game is running — close it and update again");
             return done(false);
         }
         // The files this update touches, as they are now, go to backup\<installed version>.
@@ -715,7 +751,7 @@ void Install(const std::wstring& zipUrl)
                 const std::wstring copy = Backslashes(backup + L"\\" + Utf16(f.path));
                 if (!MakeDirFor(copy) || !CopyFileW(target.c_str(), copy.c_str(), FALSE))
                 {
-                    error = L"не удалось сохранить копию " + Utf16(f.path);
+                    error = T(L"не удалось сохранить копию ", L"could not back up ") + Utf16(f.path);
                     return done(false);
                 }
                 list += "old " + f.path + "\n";
@@ -739,7 +775,7 @@ void Install(const std::wstring& zipUrl)
             {
                 if (!PutFile(Backslashes(stage + L"\\files\\" + Utf16(f.path)), target))
                 {
-                    error = L"не удалось заменить " + Utf16(f.path) + L" (вернуть прежнее: «Откатить»)";
+                    error = T(L"не удалось заменить ", L"could not replace ") + Utf16(f.path) + T(L" (вернуть прежнее: «Откатить»)", L" (to go back: Roll back)");
                     return done(false);
                 }
                 restart = restart || LauncherFile(f.path);
@@ -755,7 +791,7 @@ void Install(const std::wstring& zipUrl)
 // One step back: the newest backup\<version> is put back (files that were new are removed).
 void Rollback()
 {
-    StartWork(L"откат", [] {
+    StartWork(T(L"откат", L"rollback"), [] {
         std::wstring error, name;
         bool restart = false;
         const auto done = [&](bool ok) {
@@ -780,12 +816,12 @@ void Rollback()
         const std::string list = name.empty() ? std::string() : ReadAll(backup + L"\\files.txt");
         if (list.empty())
         {
-            error = L"нет сохранённой версии для отката";
+            error = T(L"нет сохранённой версии для отката", L"no saved version to roll back to");
             return done(false);
         }
         if (GameRunning())
         {
-            error = L"игра запущена — закройте её";
+            error = T(L"игра запущена — закройте её", L"the game is running — close it");
             return done(false);
         }
         bool hadVersion = false;
@@ -804,7 +840,7 @@ void Rollback()
                 {
                     if (!PutFile(Backslashes(backup + L"\\" + Utf16(path)), target))
                     {
-                        error = L"не удалось вернуть " + Utf16(path);
+                        error = T(L"не удалось вернуть ", L"could not restore ") + Utf16(path);
                         return done(false);
                     }
                 }
@@ -825,7 +861,7 @@ void Rollback()
 // The installed files against CryMT\version.txt.
 void VerifyInstalled()
 {
-    StartWork(L"проверка файлов", [] {
+    StartWork(T(L"проверка файлов", L"file check"), [] {
         Manifest m;
         std::wstring bad;
         int checked = 0, wrong = 0;
@@ -909,6 +945,8 @@ void OnMessage(const std::wstring& m)
     }
     else if (cmd == L"update-install")
         Install(rest);
+    else if (cmd == L"lang")
+        g_en = rest == L"en";
     else if (cmd == L"rollback")
         Rollback();
     else if (cmd == L"verify")
@@ -926,14 +964,14 @@ void CreateView()
     using Create = HRESULT(STDAPICALLTYPE*)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions*, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
     const auto create = loader ? reinterpret_cast<Create>(GetProcAddress(loader, "CreateCoreWebView2EnvironmentWithOptions")) : nullptr;
     const auto fail = [](const std::wstring& what) {
-        MessageBoxW(g_wnd, (what + L"\n\nНужен Microsoft Edge WebView2 Runtime (есть в Windows 10 и 11 с обновлениями):\n"
-                                   L"https://developer.microsoft.com/microsoft-edge/webview2/").c_str(),
+        MessageBoxW(g_wnd, (what + T(L"\n\nНужен Microsoft Edge WebView2 Runtime (есть в Windows 10 и 11 с обновлениями):\n", L"\n\nThe Microsoft Edge WebView2 Runtime is needed (part of updated Windows 10 and 11):\n")
+                                   + L"https://developer.microsoft.com/microsoft-edge/webview2/").c_str(),
                     L"CryMT", MB_ICONERROR);
         PostMessageW(g_wnd, WM_CLOSE, 0, 0);
     };
     if (!create)
     {
-        fail(L"Не найден WebView2Loader.dll рядом с лаунчером.");
+        fail(T(L"Не найден WebView2Loader.dll рядом с лаунчером.", L"WebView2Loader.dll was not found next to the launcher."));
         return;
     }
     const std::wstring data = g_dir + L"cache\\launcher";
@@ -942,7 +980,7 @@ void CreateView()
             IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler, [fail](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
                 if (FAILED(hr) || !env)
                 {
-                    fail(L"WebView2 не запустился (0x" + std::to_wstring(static_cast<unsigned long>(hr)) + L").");
+                    fail(T(L"WebView2 не запустился (0x", L"WebView2 did not start (0x") + std::to_wstring(static_cast<unsigned long>(hr)) + L").");
                     return S_OK;
                 }
                 return env->CreateCoreWebView2Controller(g_wnd,
@@ -1006,7 +1044,7 @@ void CreateView()
                         }));
             }));
     if (FAILED(hr))
-        fail(L"WebView2 не запустился (0x" + std::to_wstring(static_cast<unsigned long>(hr)) + L").");
+        fail(T(L"WebView2 не запустился (0x", L"WebView2 did not start (0x") + std::to_wstring(static_cast<unsigned long>(hr)) + L").");
 }
 
 LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)

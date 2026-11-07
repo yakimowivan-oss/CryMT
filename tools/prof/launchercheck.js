@@ -26,14 +26,14 @@ const HIDDEN = new Set([
     'GI_SHADOWGEOM', 'GI_SKYFILL', 'GI_STARTTIME', 'GI_SUNALBEDO', 'GI_THIN', 'GI_TIMESPEED', 'GI_UPSAMPLE',
     'GI_VOXELREACH', 'GI_VOXELSIZE', 'GI_VOXELVIEW', 'LOOPGROUPS', 'MIPBIAS', 'MOTION', 'NODEFERFREE', 'NOPROXY',
     'NOPUMP', 'PIFAST', 'PROCBUDGET', 'SCENESYNC', 'SETREUSE', 'SPRITEFIX', 'SYNC_BEGINFRAME', 'TERRAINFENCE',
-    'TERRAINTEX', 'WARMUP', 'WORLDSYNC', 'ZBUCKET', 'ZGROUPVALUES', 'ZOWNDRAW', 'ZOWNSPLIT'
+    'TERRAINTEX', 'WARMUP', 'WORLDSYNC', 'ZBUCKET', 'ZGROUPVALUES', 'ZOWNDRAW', 'ZOWNSPLIT', 'MARKERS', 'RENDERDOC', 'SAFEPOOL_MB', 'MEMFIX'
 ].map(k => 'CRYMT_' + k));
 // Set by the proxy from [CryMT] Mode / GI / Borderless / PauseOnFocusLoss.
 const FROM_MODE = new Set(['CRYMT_MODE', 'CRYMT_LEVEL', 'CRYMT_FILL', 'CRYMT_TERRAINOWN', 'CRYMT_D3D12', 'CRYMT_D3DSTREAM', 'CRYMT_DLSS',
                            'CRYMT_GI', 'CRYMT_BORDERLESS', 'CRYMT_PAUSEONFOCUS']);
 
 const src = path.join(repo, 'src', 'crymt');
-const files = ['CryMT.cpp', 'D3D12Backend.cpp', 'D3DLayer.cpp', 'Dlss.cpp', 'ZPass.cpp', 'Window.cpp'].map(f => fs.readFileSync(path.join(src, f), 'utf8'));
+const files = ['CryMT.cpp', 'D3D12Backend.cpp', 'D3DLayer.cpp', 'Dlss.cpp', 'ZPass.cpp', 'Window.cpp', 'RenderDocCapture.cpp', 'MemoryFix.cpp'].map(f => fs.readFileSync(path.join(src, f), 'utf8'));
 const code = new Set();
 files.forEach(t => (t.match(/"CRYMT_[A-Z0-9_]+"/g) || []).forEach(m => code.add(m.slice(1, -1))));
 const launcher = new Map(); // key -> option

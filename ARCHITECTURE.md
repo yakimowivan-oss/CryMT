@@ -6,9 +6,12 @@ All addresses are for Crysis 1.2.1, 64-bit, build 6156. CryMT checks this build 
 
 - `Bin64\Crysis.exe` (c1-launcher v8) imports `dbghelp.dll`. That DLL is not a KnownDLL, so `Bin64\dbghelp.dll`, CryMT's proxy, loads before any engine module.
 - The proxy reads `CryMT\CryMT.ini`, sets the `CRYMT_*` environment and loads `CryMT.dll`. Every real dbghelp call is forwarded to the system copy.
-- c1-launcher v8 is required for two reasons:
-  - It exports `CryMalloc`/`CryFree`, which CryMT patches to defer frees made during a frame.
-  - Its pool keeps the engine's node allocator below 4 GB. That allocator stores pointers through 32-bit moves, the 64-bit crash of the original game.
+- The 64-bit memory fix. The engine's node allocator stores pointers through 32-bit moves, and a block above 4 GB crashes the game: the stock game crashed while loading the island level.
+  - The allocator takes 0x80000-byte blocks from `CryMalloc`. The engine modules look for `CryMalloc`/`CryFree`/… among the executable's exports first, then CrySystem's.
+  - c1-launcher v8 exports them with a pool below 4 GB.
+  - With an older c1-launcher (GOG's v7), CryMT does the same itself (`MemoryFix.cpp`). It reserves a 2 GB pool from 0x40000000, above the engine's modules, and adds the functions to the executable's export table in memory.
+  - Only the exact start of a block the pool handed out is freed back to it. CrySystem's own allocator carves small pieces out of such blocks, and those go to CrySystem.
+- CryMT hooks the exported `CryFree`/`CryRealloc` to defer frees made during a frame.
 
 ## Threads
 

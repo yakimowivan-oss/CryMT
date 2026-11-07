@@ -5,6 +5,7 @@
 # Inject (Inject.exe: development launches).
 param([string[]]$Only = @(), [string]$Out = "$PSScriptRoot\build")
 $ErrorActionPreference = 'Stop'
+$Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $root = $PSScriptRoot
 $cxx = "$root\tools\llvm\bin\x86_64-w64-mingw32-clang++.exe"
 if (-not (Test-Path $cxx)) { throw "llvm-mingw not found at $cxx (BUILDING.md)" }
@@ -15,7 +16,7 @@ $launcher = "$root\src\launcher"
 $parts = [ordered]@{
     CryMT    = @{Out = 'CryMT.dll'; Args = @('-shared', '-Wno-unused-but-set-global', '-Wno-unused-function', "-I$root\sdk\streamline-v2.14.16\include",
                                               "-I$root\sdk\renderdoc") + @('CryMT.cpp', 'D3DLayer.cpp', 'D3D12Backend.cpp', 'Dlss.cpp', 'ZPass.cpp',
-                                              'Paths.cpp', 'Window.cpp', 'RenderDocCapture.cpp' | ForEach-Object { "$crymt\$_" }) +
+                                              'Paths.cpp', 'Window.cpp', 'RenderDocCapture.cpp', 'MemoryFix.cpp' | ForEach-Object { "$crymt\$_" }) +
                                             @('-luser32', '-luuid', '-ldxgi', '-lgdi32')}
     Loader   = @{Out = 'dbghelp.dll'; Args = @('-shared', "$crymt\proxy\DbgHelpProxy.cpp", "$crymt\proxy\DbgHelpStubs.S", "$crymt\proxy\DbgHelp.def")}
     Settings = @{Out = 'CryMTSettings.exe'; Args = @('-municode', '-mwindows', "$crymt\settings\Settings.cpp", '-luser32', '-lgdi32', '-lshell32',

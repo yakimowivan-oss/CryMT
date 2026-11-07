@@ -15,6 +15,7 @@
 bool CryMtPassMatrices(float* out);
 
 void CryMTInstallPakLog(); // CryMT.cpp: CRYMT_PAKLOG
+void CryMTForceNoMsaa();   // CryMT.cpp: MSAA is not supported with CryMT yet
 
 #include <immintrin.h>
 
@@ -1739,6 +1740,7 @@ std::vector<std::pair<void*, std::wstring>> ReserveModuleRanges()
 
 HRESULT WINAPI HookD3D10CreateDevice(IDXGIAdapter* adapter, D3D10_DRIVER_TYPE type, HMODULE software, UINT flags, UINT sdk, ID3D10Device** out)
 {
+    ::CryMTForceNoMsaa(); // before the renderer makes its targets
     ::CryMTInstallPakLog(); // the renderer's gEnv is set by now, its shaders not loaded yet
     char line[128];
     snprintf(line, sizeof(line), "D3D10CreateDevice called: type=%d flags=0x%x sdk=%u original=%p", type, flags, sdk,
