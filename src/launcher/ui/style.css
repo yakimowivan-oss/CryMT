@@ -398,7 +398,7 @@ kbd {
 .news { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: var(--gap); align-items: start; }
 .news-list, .news-side { padding: 16px 18px; }
 .news h3 { font-size: calc(16px * var(--head-size)); margin-bottom: 10px; }
-.news article { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+.news article { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
 .news time { font: 500 12px var(--mono); color: var(--accent); padding-top: 2px; }
 .news article p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
 .upd { padding: 10px 12px; margin: 8px 0; border: 1px solid var(--accent); background: var(--accent-soft); border-radius: var(--radius); }
