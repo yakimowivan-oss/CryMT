@@ -103,7 +103,7 @@ h2, h3 { font-family: var(--font-head); text-transform: var(--caps); letter-spac
     flex-direction: column;
     gap: 14px;
 }
-.top { display: flex; align-items: center; gap: 22px; padding: 14px 104px 0 0; min-height: 62px; cursor: default; }
+.top { display: flex; align-items: center; gap: 22px; padding: 14px 150px 0 0; min-height: 62px; cursor: default; }
 html.in-host .top { -webkit-user-select: none; user-select: none; }
 
 /* window buttons, top right like a title bar (the page asks the window to minimise / close / move) */
@@ -115,6 +115,25 @@ html.in-host .top { -webkit-user-select: none; user-select: none; }
 .wincaps .close i { width: 13px; }
 .wincaps .close i:first-child { transform: translate(-50%, -50%) rotate(45deg); }
 .wincaps .close i:last-child { transform: translate(-50%, -50%) rotate(-45deg); }
+.wincaps .max i { width: 10px; height: 10px; background: transparent; border: 1px solid currentColor; }
+.wincaps .max i:last-child { display: none; }
+html.maxed .wincaps .max i { width: 8px; height: 8px; transform: translate(-35%, -65%); }
+html.maxed .wincaps .max i:last-child { display: block; transform: translate(-65%, -35%); background: var(--bg0); }
+html:not(.in-host) .wincaps { display: none; }
+/* the window's edges (the page covers it): the window does the sizing */
+.grips i { position: fixed; z-index: 30; }
+html:not(.in-host) .grips, html.maxed .grips { display: none; }
+.grips [data-e="n"], .grips [data-e="s"] { left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+.grips [data-e="n"] { top: 0; }
+.grips [data-e="s"] { bottom: 0; }
+.grips [data-e="e"], .grips [data-e="w"] { top: 8px; bottom: 8px; width: 5px; cursor: ew-resize; }
+.grips [data-e="e"] { right: 0; }
+.grips [data-e="w"] { left: 0; }
+.grips [data-e="ne"], .grips [data-e="nw"], .grips [data-e="se"], .grips [data-e="sw"] { width: 8px; height: 8px; }
+.grips [data-e="ne"] { top: 0; right: 0; cursor: nesw-resize; }
+.grips [data-e="sw"] { bottom: 0; left: 0; cursor: nesw-resize; }
+.grips [data-e="nw"] { top: 0; left: 0; cursor: nwse-resize; }
+.grips [data-e="se"] { bottom: 0; right: 0; cursor: nwse-resize; }
 .brand { display: flex; align-items: center; gap: 12px; margin-right: auto; }
 .mark { width: 34px; height: 34px; position: relative; }
 .mark i { position: absolute; background: var(--accent); }
@@ -139,6 +158,7 @@ html.in-host .top { -webkit-user-select: none; user-select: none; }
 .tab { clip-path: polygon(10px 0, 100% 0, calc(100% - 10px) 100%, 0 100%); border-bottom: 2px solid transparent; }
 .tab.on { background: var(--panel2); color: var(--accent); border-bottom-color: var(--accent); }
 .tab:hover:not(.on) { color: var(--text); }
+.tab.badge::after { content: ""; position: absolute; top: 7px; right: 14px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
 
 
 main { flex: 1; min-height: 0; overflow: auto; margin-right: -8px; padding-right: 8px; }
@@ -292,6 +312,20 @@ kbd {
 .notes { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; display: grid; gap: 4px; }
 .quick { display: flex; flex-direction: column; gap: 4px; }
 .quick .btn { margin-top: auto; align-self: flex-start; }
+.quick .quick-btns { margin-top: auto; display: flex; gap: 8px; flex-wrap: wrap; padding-top: 8px; }
+.quick .quick-btns .btn { margin-top: 0; }
+.opt.lead { border-bottom: 1px solid var(--line-strong); }
+.ctl-select {
+    min-width: 170px;
+    max-width: min(270px, 42vw);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel2);
+    color: var(--text);
+    padding: 7px 10px;
+    font: 500 13px/1.2 var(--font-body, inherit);
+}
+.ctl-select option { background: var(--panel2); color: var(--text); }
 
 /* ---------------------------------------------------------------- advanced */
 .adv { display: grid; grid-template-columns: 230px minmax(0, 1fr) 360px; gap: var(--gap); height: 100%; min-height: 460px; }
@@ -301,7 +335,7 @@ kbd {
 .nav-item:hover { color: var(--text); background: var(--accent-soft); }
 .nav-item.on { color: var(--text); border-left-color: var(--accent); background: var(--accent-soft); }
 .nav-item em { margin-left: auto; font: normal 11px var(--mono); color: var(--dim); }
-.nav-item.empty { opacity: 0.35; }
+.nav-item.empty { display: none; }
 .sec-n { font: 500 11px var(--mono); color: var(--dim); }
 .nav-item.on .sec-n { color: var(--accent); }
 .nav-exp { margin-top: auto; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 12px 8px; border-top: 1px solid var(--line); }
@@ -356,6 +390,7 @@ kbd {
 
 .side { display: flex; flex-direction: column; gap: var(--gap); min-height: 0; }
 .help { padding: 16px 18px; overflow: auto; flex: 0 1 auto; max-height: 62%; }
+.adv.simple .help { max-height: none; flex: 1; }
 .help-sec { font: 500 11px var(--font-head); color: var(--dim); text-transform: uppercase; letter-spacing: 0.12em; }
 .help h3 { font-size: calc(19px * var(--head-size)); color: var(--accent); margin: 4px 0 8px; }
 .help p { margin: 0 0 12px; color: var(--text); font-size: 13.5px; }
@@ -398,8 +433,8 @@ kbd {
 .news { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: var(--gap); align-items: start; }
 .news-list, .news-side { padding: 16px 18px; }
 .news h3 { font-size: calc(16px * var(--head-size)); margin-bottom: 10px; }
-.news article { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
-.news time { font: 500 12px var(--mono); color: var(--accent); padding-top: 2px; }
+.news article { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 16px; padding: 10px 0; border-top: 1px solid var(--line); }
+.news time { font: 500 12px var(--mono); color: var(--accent); padding-top: 2px; white-space: nowrap; }
 .news article p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
 .upd { padding: 10px 12px; margin: 8px 0; border: 1px solid var(--accent); background: var(--accent-soft); border-radius: var(--radius); }
 .upd div { display: flex; flex-direction: column; gap: 2px; }
@@ -427,6 +462,7 @@ kbd {
     .presets { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .adv { grid-template-columns: 200px minmax(0, 1fr); height: auto; }
     .adv .side { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; }
+    .adv.simple .side { grid-template-columns: minmax(0, 1fr); }
     .help { max-height: none; }
     .list-body { max-height: 70vh; padding-bottom: 20px; }
 }

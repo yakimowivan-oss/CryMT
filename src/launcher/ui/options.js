@@ -66,6 +66,12 @@ window.CRYMT = (function () {
         {id: 'overlay', section: 'mode', label: L('Оверлей производительности', 'Performance overlay'), type: 'toggle', def: false, personal: true, needs: 'mtMode', hotkey: 'Ctrl+F11',
          ini: ['Env', 'CRYMT_OVERLAY'], codec: present,
          hint: L('Время кадра, загрузка потоков и видеокарты поверх игры. Включается и выключается в игре клавишами Ctrl+F11.', 'Frame time, thread and GPU load over the game. Ctrl+F11 turns it on and off in game.'), affects: L('оверлей поверх игры', 'overlay over the game')},
+        {id: 'mod', section: 'mode', label: L('Модификация', 'Mod'), type: 'select', def: '', personal: true, dropdown: true,
+         choices: [{v: '', label: L('Без мода', 'No mod')}], // + the folders of <game>\Mods (STATUS.mods)
+         ini: ['Launcher', 'Mod'], codec: {write: v => v || null, read: s => t(s) || ''},
+         hint: L('Папка из Mods: «Играть» запускает игру с -mod <имя>. CryMT работает и с модами со своей DLL игры. Если мод меняет шейдеры, которые правит GI, GI для него выключается.',
+                 'A folder of Mods: Play starts the game with -mod <name>. CryMT works with mods that bring their own game DLL too. If the mod changes the shaders the GI patches, the GI is off for it.'),
+         affects: L('какой мод загружается', 'which mod loads')},
         {id: 'afterStart', section: 'mode', label: L('После запуска игры', 'After the game starts'), type: 'select', def: 'minimize', personal: true,
          choices: [{v: 'minimize', label: L('Свернуть', 'Minimize')}, {v: 'close', label: L('Закрыть', 'Close')}, {v: 'stay', label: L('Оставить', 'Stay')}],
          ini: ['Launcher', 'AfterStart'], codec: pick({minimize: null, close: 'close', stay: 'stay'}),
@@ -263,6 +269,7 @@ window.CRYMT = (function () {
     const STATUS = {
         game: 'D:\\Games\\Crysis', build: '6156', buildOk: true, launcher: 'c1-launcher v8', launcherOk: true,
         installed: '', installedDate: '', channel: 'stable',
+        mods: [], gpu: '', dlss: true, editor: false, // <game>\Mods: [{name, dll, dll32, shaders, gi}]; the graphics card
     };
 
     return {SECTIONS, OPTIONS, PRESETS, HOTKEYS, ALWAYS, NEWS, STATUS, UPDATE, BENCH};

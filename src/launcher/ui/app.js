@@ -1,6 +1,7 @@
 // CryMT launcher UI. Everything shown comes from options.js, CryMT.ini goes through ini.js; this file draws and talks to
-// the window (CryMTLauncher.exe, WebView2): messages 'load', 'save\n<ini>', 'play\n<gi>\n<args>\n<after>', 'drag',
-// 'min', 'close', 'open\n<what>'; replies {type: 'state' | 'saved' | 'played' | 'error'}. Opened as a plain page in a
+// the window (CryMTLauncher.exe, WebView2): messages 'load', 'save\n<ini>', 'play\n<gi>\n<args>\n<after>',
+// 'editor\n<args>\n<after>', 'drag', 'min', 'max', 'resize\n<edge>', 'close', 'open\n<what>'; replies {type: 'state' |
+// 'saved' | 'played' | 'window' | 'error'}. Opened as a plain page in a
 // browser it works on localStorage and shows what the window would do.
 (function () {
     'use strict';
@@ -33,6 +34,11 @@
         secById = {};
         C.SECTIONS.forEach((sec, i) => (secById[sec.id] = Object.assign({n: String(i + 1).padStart(2, '0')}, sec)));
         PERSONAL = C.OPTIONS.filter(o => o.personal).map(o => o.id); // kept when a preset is picked
+        applyMods();
+    }
+    // The mod select: "no mod" + the folders of <game>\Mods the window found (STATUS.mods).
+    function applyMods() {
+        if (byId.mod) byId.mod.choices = byId.mod.choices.slice(0, 1).concat((C.STATUS.mods || []).map(m => ({v: m.name, label: m.name})));
     }
     let saved = null;
     try { saved = JSON.parse(localStorage.getItem(STORE) || 'null'); } catch (e) { /* no storage */ }
@@ -90,11 +96,16 @@
     function blocker(o, vals) {
         if (o.ini[0] === 'Launcher') return null;
         if (o.id !== 'mode' && vals.mode === 'off') return tt('режим с CryMT', 'a CryMT mode');
+        if (o.id === 'gi' && MODES.dx12Mode(vals) && modGiOff(vals)) return tt('мод без своих шейдеров GI', 'a mod without its own GI shaders');
         if (!o.needs) return null;
         if (MODES[o.needs]) return MODES[o.needs](vals) ? null : MODE_NEED()[o.needs];
         const p = byId[o.needs];
         return blocker(p, vals) || (isOn(p, vals[p.id]) ? null : p.label);
     }
+    // The chosen mod ({name, dll, dll32, shaders, gi} from the window), if its folder is still there.
+    const modOf = vals => (vals.mod && (C.STATUS.mods || []).find(m => m.name === vals.mod)) || null;
+    // A mod with its own versions of the shaders CryMT's GI patches: the game reads the mod's, so the GI is off for it.
+    const modGiOff = vals => { const m = modOf(vals); return !!(m && m.gi); };
     const featureOn = (id, vals) => !blocker(byId[id], vals) && isOn(byId[id], vals[id]);
     function loadMs(vals) {
         let ms = 0;
@@ -102,7 +113,15 @@
         return ms;
     }
     const shadersNeeded = vals => featureOn('gi', vals);
-    const launchArgs = vals => '-dx10' + (vals.devmode ? ' -DEVMODE' : '');
+    function launchArgs(vals) {
+        const m = modOf(vals);
+        return '-dx10' + (vals.devmode ? ' -DEVMODE' : '') + (m ? ' -mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : '') +
+            (m && m.gi ? ' -crymt-gi=0' : '');
+    }
+    const editorArgs = vals => { const m = modOf(vals); return m ? '-mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : ''; };
+    // DLAA on the home page: mode dx12 <-> dlaa, when the mode has DirectX 12 and the card can (NVIDIA RTX).
+    const dlaaWhyNot = vals => (!MODES.dx12Mode(vals) ? tt('нужен режим с DirectX 12', 'needs a DirectX 12 mode') :
+        C.STATUS.gpu && !C.STATUS.dlss ? tt('нужна NVIDIA RTX, у вас ', 'needs an NVIDIA RTX card, yours: ') + C.STATUS.gpu : null);
     // The game's MSAA (Options, anti-aliasing quality) is turned off by CryMT in every CryMT mode (not supported yet:
     // with it DLAA and GI did not start and shadows were missing). Vanilla keeps it.
     const msaaOff = vals => !!C.STATUS.msaa && MODES.mtMode(vals);
@@ -160,8 +179,16 @@
             syncFooter();
             send('play\n' + (shadersNeeded(S.values) ? '1' : '0') + '\n' + launchArgs(S.values) + '\n' + S.values.afterStart);
         },
+        editor: () => {
+            host.save();
+            S.busy = true;
+            syncFooter();
+            send('editor\n' + editorArgs(S.values) + '\n' + S.values.afterStart);
+        },
         drag: () => send('drag'),
         min: () => send('min'),
+        max: () => send('max'),
+        resize: edge => send('resize\n' + edge),
         close: () => { host.save(); send('close'); },
         open: what => send('open\n' + what),
         fetch: (id, url) => send('fetch\n' + id + '\n' + url),
@@ -169,12 +196,16 @@
         install: zip => send('update-install\n' + zip),
         rollback: () => send('rollback'),
         verify: () => send('verify'),
+        restart: () => send('restart'),
     } : {
         save: () => {},
         saveSoon: () => {},
         play: () => toast(tt('В окне лаунчера: записать CryMT.ini → ', 'In the launcher window: write CryMT.ini → ') + (shadersNeeded(S.values) ? tt('поставить шейдеры GI → ', 'install the GI shaders → ') : tt('убрать шейдеры GI → ', 'remove the GI shaders → ')) +
             tt('запустить Bin64\\Crysis.exe ', 'start Bin64\\Crysis.exe ') + launchArgs(S.values)),
+        editor: () => toast(tt('В окне лаунчера: запустить редактор ', 'In the launcher window: start the editor ') + editorArgs(S.values)),
         drag: () => {},
+        max: () => {},
+        resize: () => {},
         min: () => toast(tt('Свернуть — в окне лаунчера', 'Minimize — in the launcher window')),
         close: () => toast(tt('Закрыть — в окне лаунчера', 'Close — in the launcher window')),
         open: what => toast(tt('Открыть папку «', 'Open folder «') + what + tt('» — в окне лаунчера', '» — in the launcher window')),
@@ -185,6 +216,7 @@
         install: () => toast(tt('Обновление ставит окно лаунчера', 'the launcher window installs updates')),
         rollback: () => toast(tt('Откат — в окне лаунчера', 'Rollback — in the launcher window')),
         verify: () => toast(tt('Проверка файлов — в окне лаунчера', 'File check — in the launcher window')),
+        restart: () => toast(tt('Перезапуск — в окне лаунчера', 'Restart — in the launcher window')),
     };
 
     // Updates: releases of C.UPDATE.repo on GitHub. Stable channel: releases; test channel: pre-releases too. A release
@@ -209,6 +241,22 @@
         S.upd.state = 'verifying';
         host.manifest(asset(rel, n => n === 'manifest.txt').browser_download_url, asset(rel, n => n === 'manifest.sig').browser_download_url);
     }
+    function installUpdate() {
+        const u = S.upd;
+        if (u.state !== 'available') return;
+        showTab('news');
+        Object.assign(u, {state: 'installing', progress: null});
+        buildNews();
+        syncFooter();
+        host.install(asset(u.release, n => /\.zip$/i.test(n)).browser_download_url);
+    }
+    function restartLauncher() {
+        host.save();
+        Object.assign(S.upd, {state: 'restarting'});
+        buildNews();
+        syncFooter();
+        host.restart();
+    }
     function parseManifest(text) {
         const lines = String(text || '').split(/\r?\n/);
         const head = (lines[0] || '').split(' ');
@@ -224,8 +272,10 @@
     function onHost(m) {
         if (m.type === 'state') {
             S.iniText = m.ini || '';
-            if (m.exists) S.values = I.readValues(C, S.iniText);
             Object.assign(C.STATUS, m.status || {});
+            applyMods(); // before reading: a Mod= line is valid only for a folder that is there
+            if (m.exists) S.values = I.readValues(C, S.iniText);
+            document.documentElement.classList.toggle('maxed', !!C.STATUS.max);
             if (m.reason === 'external') toast(tt('CryMT.ini изменён вне лаунчера — настройки перечитаны', 'CryMT.ini changed outside the launcher — settings read again'));
             if (firstState) {
                 firstState = false;
@@ -239,7 +289,10 @@
         } else if (m.type === 'played') {
             S.busy = false;
             syncFooter();
-            toast(m.ok ? tt('Игра запущена', 'Game started') : tt('Не удалось запустить: ', 'Could not start: ') + m.error);
+            toast(m.ok ? (m.editor ? tt('Редактор запущен', 'Editor started') : tt('Игра запущена', 'Game started')) : tt('Не удалось запустить: ', 'Could not start: ') + m.error);
+        } else if (m.type === 'window') {
+            document.documentElement.classList.toggle('maxed', !!m.max);
+            $('#winMax').title = m.max ? tt('Восстановить', 'Restore') : tt('Развернуть', 'Maximize');
         } else if (m.type === 'fetched' && m.id === 'releases') {
             if (!m.ok) Object.assign(S.upd, {state: 'error', error: tt('GitHub не ответил: ', 'GitHub did not answer: ') + (m.error || m.status)});
             else {
@@ -253,9 +306,14 @@
             buildNews();
             syncFooter();
         } else if (m.type === 'manifest') {
-            if (m.ok) Object.assign(S.upd, {state: 'available', manifest: parseManifest(m.text)});
-            if (m.ok && autoAction === 'update') setTimeout(() => $$('#view-news .btns .btn')[0].click(), 500);
-            else Object.assign(S.upd, {state: 'error', error: m.error});
+            if (m.ok) {
+                Object.assign(S.upd, {state: 'available', manifest: parseManifest(m.text)});
+                if (autoAction === 'update') setTimeout(installUpdate, 500);
+                else if (S.tab !== 'news')
+                    toast(tt('Доступна CryMT v', 'CryMT v') + S.upd.manifest.version + tt('', ' is available'), {label: tt('Обновить', 'Update'), run: installUpdate});
+            } else {
+                Object.assign(S.upd, {state: 'error', error: m.error || tt('проверка не удалась', 'the check failed')});
+            }
             buildNews();
             syncFooter();
         } else if (m.type === 'progress') {
@@ -264,8 +322,11 @@
         } else if (m.type === 'installed' || m.type === 'rolledback') {
             const what = m.type === 'installed' ? tt('Обновление до v', 'Update to v') + m.version : tt('Откат', 'Rollback');
             if (m.ok) {
-                Object.assign(S.upd, {state: m.restart ? 'restarting' : 'done', progress: null});
-                toast(what + tt(': готово', ': done') + (m.restart ? tt(' — лаунчер перезапускается', ' — the launcher restarts') : ''));
+                // Files of the launcher itself changed: the window and this page are the old ones until a restart.
+                Object.assign(S.upd, {state: 'done', progress: null, done: what, restart: !!m.restart});
+                if (m.restart && autoAction) setTimeout(restartLauncher, 1500); // tests (--page=#news?auto=...)
+                else if (m.restart) toast(what + tt(': готово. Перезапустите лаунчер', ': done. Restart the launcher'), {label: tt('Перезапустить', 'Restart'), run: restartLauncher});
+                else toast(what + tt(': готово', ': done'));
                 send('load');
             } else {
                 Object.assign(S.upd, {state: 'error', error: m.error, progress: null});
@@ -335,6 +396,11 @@
         const wrap = el('div', 'ctl');
         if (o.type === 'toggle') {
             wrap.append(toggleButton(S.values[o.id], () => set(o.id, !S.values[o.id])));
+        } else if (o.type === 'select' && o.dropdown) {
+            const box = el('select', 'ctl-select');
+            box.setAttribute('aria-label', o.label);
+            box.addEventListener('change', () => set(o.id, box.value));
+            wrap.append(box);
         } else if (o.type === 'select') {
             wrap.append(seg(o.choices.map(c => [c.v, c.label]), S.values[o.id], v => set(o.id, v)));
         } else {
@@ -362,7 +428,16 @@
     function syncControl(wrap, o) {
         const v = S.values[o.id];
         if (o.type === 'toggle') $('.tg', wrap).setAttribute('aria-pressed', v ? 'true' : 'false');
-        else if (o.type === 'select') $$('.seg button', wrap).forEach(b => b.classList.toggle('on', b.dataset.v === v));
+        else if (o.type === 'select' && o.dropdown) {
+            const box = $('select', wrap);
+            // The choices can change (the window rescans Mods): the list is made again when they differ.
+            if (Array.from(box.options).map(x => x.value).join('\n') !== o.choices.map(x => x.v).join('\n') ||
+                Array.from(box.options).map(x => x.textContent).join('\n') !== o.choices.map(x => x.label).join('\n')) {
+                box.textContent = '';
+                o.choices.forEach(x => { const opt = el('option'); opt.value = x.v; opt.textContent = x.label; box.append(opt); });
+            }
+            box.value = v;
+        } else if (o.type === 'select') $$('.seg button', wrap).forEach(b => b.classList.toggle('on', b.dataset.v === v));
         else {
             const r = $('input', wrap);
             if (document.activeElement !== r) r.value = v;
@@ -405,6 +480,9 @@
         $('.top').addEventListener('mousedown', e => {
             if (e.button === 0 && !e.target.closest('button, input, a, [role="button"]')) { e.preventDefault(); host.drag(); }
         });
+        $('.top').addEventListener('dblclick', e => { if (!e.target.closest('button, input, a, select, [role="button"]')) host.max(); });
+        $$('.grips i').forEach(g => g.addEventListener('mousedown', e => { if (e.button === 0) { e.preventDefault(); host.resize(g.dataset.e); } }));
+        $('#winMax').addEventListener('click', host.max);
         $('#winMin').addEventListener('click', host.min);
         $('#winClose').addEventListener('click', host.close);
         $('#play').addEventListener('click', () => { if (!S.busy) host.play(); });
@@ -428,6 +506,7 @@
         $$('#langSeg button').forEach(b => b.classList.toggle('on', b.dataset.v === lang));
         $('.brand-sub').textContent = tt('MT · DirectX 12 · DLAA · GI для Crysis 1.2.1', 'MT · DirectX 12 · DLAA · GI for Crysis 1.2.1');
         $('#winMin').title = tt('Свернуть', 'Minimize');
+        $('#winMax').title = document.documentElement.classList.contains('maxed') ? tt('Восстановить', 'Restore') : tt('Развернуть', 'Maximize');
         $('#winClose').title = tt('Закрыть', 'Close');
         send('lang\n' + lang);
     }
@@ -490,11 +569,26 @@
         const low = el('div', 'home-low');
         low.append(el('div', 'panel cut detail'));
         const quick = el('div', 'panel cut quick');
-        quick.append(el('h3', null, tt('Окно и управление', 'Window and controls')));
-        PERSONAL.filter(id => !byId[id].expert).forEach(id => quick.append(optRow(byId[id], true)));
+        quick.append(el('h3', null, tt('Запуск и окно', 'Launch and window')));
+        const dlaa = el('div', 'opt compact lead dlaa-row');
+        dlaa.innerHTML = tt('<div class="opt-main"><div class="opt-label">Сглаживание DLAA</div><div class="opt-why"></div></div>',
+                            '<div class="opt-main"><div class="opt-label">DLAA anti-aliasing</div><div class="opt-why"></div></div>');
+        const dlaaCtl = el('div', 'ctl');
+        dlaaCtl.append(toggleButton(false, () => { if (!dlaaWhyNot(S.values)) set('mode', S.values.mode === 'dlaa' ? 'dx12' : 'dlaa'); }));
+        dlaa.append(dlaaCtl);
+        quick.append(dlaa, optRow(byId.mod, true));
+        PERSONAL.filter(id => id !== 'mod' && !byId[id].expert).forEach(id => quick.append(optRow(byId[id], true)));
+        const btns = el('div', 'quick-btns');
         const adv = el('button', 'btn ghost', tt('Тонкая настройка', 'Fine-tuning'));
         adv.addEventListener('click', () => showTab('adv'));
-        quick.append(adv);
+        const mods = el('button', 'btn ghost', tt('Папка Mods', 'Mods folder'));
+        mods.addEventListener('click', () => host.open('mods'));
+        // Shown only when the window finds Bin64\Editor.exe (syncHome).
+        const ed = el('button', 'btn ghost editor', tt('Редактор', 'Editor'));
+        ed.title = tt('Sandbox Editor из Mod SDK, с выбранным модом, без CryMT', 'The Mod SDK\'s Sandbox Editor with the chosen mod, without CryMT');
+        ed.addEventListener('click', () => { if (!S.busy) host.editor(); });
+        btns.append(adv, mods, ed);
+        quick.append(btns);
         low.append(quick);
         v.append(low);
     }
@@ -511,7 +605,20 @@
         const notes = [];
         if (vals.mode === 'off') notes.push(tt('CryMT не загружается: игра запускается как есть, со своими настройками.', 'CryMT is not loaded: the game starts as it is, with its own settings.'));
         if (MODES.mtMode(vals)) notes.push(tt('Многопоточность ускоряет процессорную часть кадра; на видеокарту не влияет.', 'Multithreading speeds up the CPU part of the frame; it does not change the GPU load.'));
-        if (MODES.dlaaMode(vals)) notes.push(tt('DLAA работает только на видеокартах NVIDIA RTX.', 'DLAA works only on NVIDIA RTX cards.'));
+        if (MODES.dlaaMode(vals))
+            notes.push(C.STATUS.gpu && !C.STATUS.dlss
+                ? tt('Видеокарта ', 'The graphics card ') + C.STATUS.gpu + tt(' не поддерживает DLAA (нужна NVIDIA RTX): игра сохранит своё сглаживание, остальное работает.', ' has no DLAA (it needs an NVIDIA RTX): the game keeps its own anti-aliasing, the rest works.')
+                : tt('DLAA работает только на видеокартах NVIDIA RTX.', 'DLAA works only on NVIDIA RTX cards.'));
+        const mod = modOf(vals);
+        if (mod) {
+            notes.push(tt('Мод «', 'Mod «') + mod.name + tt('»: игра запускается с -mod ', '»: the game starts with -mod ') + mod.name +
+                (mod.dll ? tt('. У мода своя DLL игры — CryMT с ней работает.', '. It has its own game DLL; CryMT works with it.') : '.'));
+            if (mod.gi && MODES.dx12Mode(vals) && vals.gi)
+                notes.push(tt('Мод меняет шейдеры, которые правит GI: с ним GI выключается (-crymt-gi=0), остальное работает.', 'The mod changes the shaders the GI patches: with it the GI is off (-crymt-gi=0), the rest works.'));
+            else if (mod.shaders && featureOn('gi', vals))
+                notes.push(tt('Мод меняет шейдеры (не те, что правит GI). Если картинка сломается — «MT + DLAA».', 'The mod changes shaders (not the ones the GI patches). If the image breaks, use «MT + DLAA».'));
+            if (mod.dll32) notes.push(tt('У мода только 32-битная DLL (Bin32): в 64-битной игре его код не загрузится.', 'The mod has only a 32-bit DLL (Bin32): its code does not load in the 64-bit game.'));
+        } else if (vals.mod) notes.push(tt('Мода «', 'The mod «') + vals.mod + tt('» нет в папке Mods — запуск без мода.', '» is not in the Mods folder: starting without a mod.'));
         if (msaaOff(vals))
             notes.push(tt('В настройках игры включено сглаживание MSAA', 'The game\'s MSAA anti-aliasing is on') + ' (' + C.STATUS.msaa + '). ' +
                        tt('С CryMT оно пока не поддерживается и выключается при запуске. В режиме «Ваниль» работает как обычно.',
@@ -524,14 +631,20 @@
             tt('<div class="total"><span>Итого на видеокарте</span><b>', '<div class="total"><span>Total on the GPU</span><b>') + (ms ? '≈ ' + fmt(ms) + tt(' мс', ' ms') : '0') + '</b></div></div>' +
             tt('<p class="fine">Оценка по замерам автора, 2560×1440: разница кадра между пресетами. При 60 FPS кадр — 16.7 мс.</p>', '<p class="fine">Estimate from the author\'s measurements, 2560×1440: frame time differences between presets. At 60 FPS a frame is 16.7 ms.</p>') +
             '<ul class="notes">' + notes.map(n => '<li>' + esc(n) + '</li>').join('') + '</ul>';
-        $$('#view-home .quick .opt').forEach(syncRow);
+        $$('#view-home .quick .opt[data-id]').forEach(syncRow);
+        $('#view-home .quick .editor').hidden = !C.STATUS.editor;
+        const dlaa = $('#view-home .dlaa-row');
+        const why = dlaaWhyNot(vals);
+        dlaa.classList.toggle('off', !!why);
+        $('.opt-why', dlaa).textContent = why || '';
+        $('.tg', dlaa).setAttribute('aria-pressed', !why && vals.mode === 'dlaa' ? 'true' : 'false');
     }
 
     // ---------------------------------------------------------------- advanced
     function optRow(o, compact) {
         const row = el('div', 'opt' + (compact ? ' compact' : ''));
         row.dataset.id = o.id;
-        row.innerHTML = '<div class="opt-main"><div class="opt-label">' + esc(o.label) + (compact ? '' : '<span class="badges">' + badges(o) + '</span>') +
+        row.innerHTML = '<div class="opt-main"><div class="opt-label">' + esc(o.label) + (compact || !S.expert ? '' : '<span class="badges">' + badges(o) + '</span>') +
             '</div><div class="opt-why"></div></div>';
         row.append(control(o));
         row.addEventListener('mouseenter', () => focusOpt(o.id));
@@ -560,7 +673,8 @@
     function buildAdv() {
         const v = $('#view-adv');
         v.innerHTML = '';
-        const wrap = el('div', 'adv');
+        // Without "for enthusiasts": no CryMT.ini panel and no badges in the rows; the help has the whole side.
+        const wrap = el('div', 'adv' + (S.expert ? '' : ' simple'));
         const nav = el('aside', 'nav panel cut');
         nav.append(el('div', 'nav-title', tt('Разделы', 'Sections')));
         C.SECTIONS.forEach(s => {
@@ -575,7 +689,7 @@
         });
         const exp = el('div', 'nav-exp');
         exp.append(el('div', 'nav-exp-text', tt('<b>Для энтузиастов</b><span>все параметры, включая отладочные</span>', '<b>For enthusiasts</b><span>all settings, debugging ones too</span>')));
-        exp.append(toggleButton(S.expert, () => { S.expert = !S.expert; save(); buildList(); sync(); }));
+        exp.append(toggleButton(S.expert, () => { S.expert = !S.expert; save(); buildAdv(); sync(); }));
         nav.append(exp);
         const reset = el('button', 'btn ghost', tt('Всё по умолчанию', 'All to defaults'));
         reset.addEventListener('click', () => setValues(presetValues(C.PRESETS[C.PRESETS.length - 1]), tt('Все настройки — по умолчанию', 'All settings at their defaults')));
@@ -604,7 +718,7 @@
             else toast(tt('Буфер обмена недоступен', 'Clipboard not available'));
         });
         $('[data-a="folder"]', ini).addEventListener('click', () => host.open('crymt'));
-        side.append(ini);
+        if (S.expert) side.append(ini);
         wrap.append(nav, list, side);
         v.append(wrap);
         buildList();
@@ -662,12 +776,13 @@
             row(tt('Шейдеры', 'Shaders'), o.shaders ? tt('да — ставятся вместе с GI', 'yes — installed with the GI') : '') +
             row(tt('Сейчас', 'Now'), '<b class="' + (same(v, o.def) ? '' : 'acc') + '">' + esc(valueLabel(o, v)) + '</b>' +
                 (same(v, o.def) ? tt(' <span class="dim">(по умолчанию)</span>', ' <span class="dim">(default)</span>') : tt(' <span class="dim">по умолчанию: ', ' <span class="dim">default: ') + esc(valueLabel(o, o.def)) + '</span>')) +
-            row('CryMT.ini', iniDesc);
+            (S.expert ? row('CryMT.ini', iniDesc) : '');
         if (!same(v, o.def)) {
             const r = el('button', 'btn small ghost', tt('Вернуть по умолчанию', 'Back to default'));
             r.addEventListener('click', () => set(o.id, o.def));
             help.append(r);
         }
+        if (!$('#view-adv .ini pre')) return;
         const entries = I.wanted(C, S.values).filter(x => x.val != null);
         $('#view-adv .ini pre').innerHTML = ['CryMT', 'Env', 'CVars', 'Launcher'].map(sec => {
             const mine = entries.filter(x => x.sec === sec);
@@ -777,7 +892,9 @@
         else if (u.state === 'latest') box = tt('<div class="kv"><span>Обновления</span><div>установлена последняя</div></div>', '<div class="kv"><span>Updates</span><div>the latest is installed</div></div>');
         else if (u.state === 'none') box = tt('<div class="kv"><span>Обновления</span><div class="dim">в канале пока нет сборок</div></div>', '<div class="kv"><span>Updates</span><div class="dim">no builds in this channel yet</div></div>');
         else if (u.state === 'restarting') box = tt('<div class="kv"><span>Обновления</span><div>перезапуск…</div></div>', '<div class="kv"><span>Updates</span><div>restarting…</div></div>');
-        else if (u.state === 'done') box = tt('<div class="kv"><span>Обновления</span><div>установлено</div></div>', '<div class="kv"><span>Updates</span><div>installed</div></div>');
+        else if (u.state === 'done')
+            box = '<div class="upd"><div><b>' + esc(u.done) + tt(': готово</b><span>', ': done</b><span>') +
+                (u.restart ? tt('Перезапустите лаунчер, чтобы закончить', 'Restart the launcher to finish') : tt('Можно играть', 'Ready to play')) + '</span></div></div>';
         else if (u.state === 'error') box = tt('<div class="kv"><span>Обновления</span><div class="warn">', '<div class="kv"><span>Updates</span><div class="warn">') + esc(u.error) + '</div></div>';
         side.innerHTML = tt('<h3>Версия</h3>', '<h3>Version</h3>') +
             tt('<div class="kv"><span>Установлено</span><div>', '<div class="kv"><span>Installed</span><div>') + esc(installed) + '</div></div>' + box +
@@ -798,12 +915,8 @@
             b.addEventListener('click', run);
             btns.append(b);
         };
-        if (u.state === 'available')
-            button(tt('Обновить до v', 'Update to v') + u.manifest.version, '', () => {
-                Object.assign(S.upd, {state: 'installing', progress: null});
-                buildNews();
-                host.install(asset(u.release, n => /\.zip$/i.test(n)).browser_download_url);
-            });
+        if (u.state === 'available') button(tt('Обновить до v', 'Update to v') + u.manifest.version, '', installUpdate);
+        if (u.state === 'done' && u.restart) button(tt('Перезапустить лаунчер', 'Restart the launcher'), '', restartLauncher);
         button(tt('Проверить обновления', 'Check for updates'), 'ghost', checkUpdates);
         button(tt('Проверить файлы', 'Check files'), 'ghost', host.verify);
         button(tt('Откатить', 'Roll back'), 'ghost', host.rollback);
@@ -824,13 +937,20 @@
                 dot(st.launcherOk ? (st.launcherWarn ? 'warn' : 'ok') : 'bad') + esc(st.launcher) + '</span>' +
             (st.proxy === false ? '<span>' + dot('bad') + tt('Нет Bin64\\dbghelp.dll</span>', 'No Bin64\\dbghelp.dll</span>') : '') +
             '<span>' + shd + '</span>' +
+            (modOf(vals) ? '<span' + (modOf(vals).gi && MODES.dx12Mode(vals) && vals.gi ? ' class="warn"' : '') + '>' + dot(modOf(vals).gi && MODES.dx12Mode(vals) && vals.gi ? 'warn' : 'acc') +
+                tt('Мод: ', 'Mod: ') + esc(modOf(vals).name) + (modOf(vals).gi && MODES.dx12Mode(vals) && vals.gi ? tt(' · GI выкл', ' · GI off') : '') + '</span>' : '') +
             (msaaOff(vals) ? '<span class="warn" title="' + esc(tt('MSAA из настроек игры с CryMT выключается (пока не поддерживается)', 'The game\'s MSAA is turned off with CryMT (not supported yet)')) + '">' +
                 dot('warn') + tt('MSAA выключен', 'MSAA off') + '</span>' : '') +
             (st.lastOff ? '<span class="warn" title="' + esc(st.lastOff) + '">' + dot('warn') + tt('Прошлый запуск: CryMT был выключен</span>', 'Last start: CryMT was off</span>') : '') +
             (S.upd.state === 'available' ? '<button class="linkish" type="button" id="updLink">' + dot('acc') + tt('Есть обновление v', 'Update available: v') +
-                esc(S.upd.manifest.version) + '</button>' : '');
+                esc(S.upd.manifest.version) + '</button>' : '') +
+            (S.upd.state === 'done' && S.upd.restart ? '<button class="linkish" type="button" id="restartLink">' + dot('acc') +
+                tt('Обновлено — перезапустить лаунчер', 'Updated — restart the launcher') + '</button>' : '');
         const u = $('#updLink');
         if (u) u.addEventListener('click', () => showTab('news'));
+        const r = $('#restartLink');
+        if (r) r.addEventListener('click', restartLauncher);
+        $$('.tab').forEach(b => b.classList.toggle('badge', b.dataset.tab === 'news' && (S.upd.state === 'available' || (S.upd.state === 'done' && S.upd.restart))));
         const cur = currentPreset(vals);
         const ms = loadMs(vals);
         $('#barLoad').innerHTML = '<div><span>' + esc(cur.preset ? cur.preset.label : tt('Свои настройки', 'Own settings')) + (cur.diff ? tt(' · изменено ', ' · changed ') + cur.diff : '') +

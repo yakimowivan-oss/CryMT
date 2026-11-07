@@ -753,9 +753,9 @@ void PatchText(uintptr_t at, const char* expect, const char* text)
     VirtualProtect(reinterpret_cast<void*>(at), n, old, &old);
 }
 
-constexpr wchar_t kVersion[] = L"v14";
+constexpr wchar_t kVersion[] = L"v15";
 
-// What CryMT runs, for the window title (" | CryMT v14: D3D12 + DLAA, render thread"), or why it is off.
+// What CryMT runs, for the window title (" | CryMT v15: D3D12 + DLAA, render thread"), or why it is off.
 std::wstring ModeText()
 {
     wchar_t text[224];

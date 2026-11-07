@@ -2,10 +2,12 @@
 // minimise / close buttons and moves the window by its header) holding the HTML UI (ui\index.html) in WebView2.
 // Lives in <game>\CryMT; the page does the settings, this file only touches files and processes for it:
 //   page -> window (strings): load | save\n<CryMT.ini text> | play\n<gi 0|1>\n<arguments>\n<minimize|close|stay> |
-//                             drag | min | close | open\n<game|crymt|logs>
+//                             editor\n<arguments>\n<minimize|close|stay> |
+//                             drag | min | max | close | resize\n<n|s|e|w|ne|nw|se|sw> | open\n<game|crymt|logs|mods>
 //                             fetch\n<id>\n<url> | update-manifest\n<url>\n<signature url> | update-install\n<zip url> |
-//                             rollback | verify
+//                             rollback | verify | restart
 //   window -> page (JSON):    {type: state, ini, exists, reason, status{...}} | {type: saved, ini} | {type: played, ok, error}
+//                             {type: window, max}
 //                             {type: fetched, id, ok, status, body} | {type: manifest, ok, error, text} |
 //                             {type: progress, stage, done, total} | {type: installed | rolledback, ok, error, restart} |
 //                             {type: verified, ok, checked, wrong, bad[]}
@@ -19,13 +21,16 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <dwmapi.h>
+#include <dxgi.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <tlhelp32.h>
 #include <winhttp.h>
-#include <atomic>
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <deque>
 #include <mutex>
 #include <functional>
 #include <string>
@@ -40,7 +45,8 @@
 namespace
 {
 const wchar_t* const kClass = L"CryMTLauncher";
-const int kWidth = 1280, kHeight = 800; // at 96 DPI
+const int kWidth = 1440, kHeight = 900;       // the first start, at 96 DPI (at most 92% of the screen); then the last size
+const int kMinWidth = 1100, kMinHeight = 680; // smaller cuts the page
 const COLORREF kBack = RGB(3, 7, 6);    // the page's --bg0, shown before it paints
 const UINT WM_HOSTJSON = WM_APP + 1;    // lParam: std::wstring* JSON for the page, from a worker thread
 
@@ -54,7 +60,9 @@ bool g_backedUp;
 bool g_en = PRIMARYLANGID(GetUserDefaultUILanguage()) != LANG_RUSSIAN; // set by the page ('lang')
 const wchar_t* T(const wchar_t* ru, const wchar_t* en) { return g_en ? en : ru; }
 HANDLE g_once;                 // the one-launcher mutex (released before a restart)
-std::atomic<bool> g_working;   // an update, rollback, check or download runs on a worker thread
+std::mutex g_workLock;         // updates, rollbacks, checks and downloads: a queue for one worker thread
+std::deque<std::function<void()>> g_work;
+bool g_workerRuns;
 std::mutex g_manifestLock;
 std::string g_manifest;        // the last manifest whose signature checked out
 FILETIME g_iniTime; // CryMT.ini's write time when the page last read or wrote it
@@ -210,6 +218,140 @@ std::wstring GameMsaa()
 }
 
 // The game's state for the status bar: build, c1-launcher, the proxy, why CryMT stayed off last time.
+std::wstring Backslashes(std::wstring w);
+
+// A pak (a zip) has one of these files: its central directory, names compared in lower case with forward slashes.
+bool PakHasAny(const std::wstring& pak, const std::vector<std::string>& names, bool& anyShader)
+{
+    const HANDLE f = CreateFileW(pak.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        return false;
+    const auto readAt = [f](uint64_t at, std::string& out, size_t n) {
+        out.resize(n);
+        LARGE_INTEGER pos;
+        pos.QuadPart = static_cast<LONGLONG>(at);
+        DWORD got = 0;
+        return SetFilePointerEx(f, pos, nullptr, FILE_BEGIN) && ReadFile(f, out.data(), static_cast<DWORD>(n), &got, nullptr) && got == n;
+    };
+    bool found = false;
+    LARGE_INTEGER size{};
+    GetFileSizeEx(f, &size);
+    const uint64_t total = static_cast<uint64_t>(size.QuadPart);
+    std::string tail, dir;
+    const size_t tailSize = static_cast<size_t>(std::min<uint64_t>(total, 22 + 65535));
+    if (tailSize >= 22 && readAt(total - tailSize, tail, tailSize))
+    {
+        const auto u16 = [](const std::string& b, size_t at) { return static_cast<uint32_t>(static_cast<uint8_t>(b[at]) | static_cast<uint8_t>(b[at + 1]) << 8); };
+        const auto u32 = [&](const std::string& b, size_t at) { return u16(b, at) | u16(b, at + 2) << 16; };
+        for (size_t at = tailSize - 22; at != static_cast<size_t>(-1); at--)
+        {
+            if (u32(tail, at) != 0x06054B50)
+                continue;
+            const uint32_t dirSize = u32(tail, at + 12), dirAt = u32(tail, at + 16);
+            if (dirAt + static_cast<uint64_t>(dirSize) <= total && dirSize < (64u << 20) && readAt(dirAt, dir, dirSize))
+                for (size_t e = 0; e + 46 <= dir.size() && u32(dir, e) == 0x02014B50 && !found;)
+                {
+                    const size_t len = u16(dir, e + 28), extra = u16(dir, e + 30), comment = u16(dir, e + 32);
+                    if (e + 46 + len > dir.size())
+                        break;
+                    std::string name = dir.substr(e + 46, len);
+                    for (char& c : name)
+                        c = c == '\\' ? '/' : static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                    anyShader = anyShader || name.rfind("shaders/", 0) == 0;
+                    found = std::find(names.begin(), names.end(), name) != names.end();
+                    e += 46 + len + extra + comment;
+                }
+            break;
+        }
+    }
+    CloseHandle(f);
+    return found;
+}
+
+// The mods of <game>\Mods (folders with Game or Bin64), each as {name, dll, dll32, shaders, gi}: dll - its own 64-bit
+// game DLL (Bin64\<name>.dll as mods name it, or CryGame.dll), dll32 - only a 32-bit one (its code does not load in the
+// 64-bit game), shaders - it brings shaders, gi - among them the files CryMT's GI patches (Game\zzCryMT.pak), so with
+// this mod the GI would run on the mod's versions: the page starts it with -crymt-gi=0 then.
+std::wstring ModsJson()
+{
+    static const std::vector<std::string> giFiles = {"shaders/hwscripts/cryfx/fraglib.cfi", "shaders/hwscripts/cryfx/terrain.cfx",
+                                                     "shaders/hwscripts/cryfx/shadowmaskgen.cfx", "shaders/hwscripts/cryfx/commonzpass.cfi",
+                                                     "shaders/hwscripts/cryfx/particles.cfi"};
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW f;
+    const HANDLE h = FindFirstFileW((g_game + L"Mods\\*").c_str(), &f);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+            if ((f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(f.cFileName, L".") && wcscmp(f.cFileName, L".."))
+                names.push_back(f.cFileName);
+        while (FindNextFileW(h, &f));
+        FindClose(h);
+    }
+    std::sort(names.begin(), names.end(), [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+    std::wstring json = L"[";
+    for (const std::wstring& name : names)
+    {
+        const std::wstring dir = g_game + L"Mods\\" + name + L"\\";
+        if (!Exists(dir + L"Game") && !Exists(dir + L"Bin64"))
+            continue;
+        bool shaders = Exists(dir + L"Game\\Shaders"), gi = false;
+        for (const std::string& file : giFiles)
+            gi = gi || Exists(dir + L"Game\\" + Backslashes(Utf16(file)));
+        const HANDLE p = FindFirstFileW((dir + L"Game\\*.pak").c_str(), &f);
+        if (p != INVALID_HANDLE_VALUE)
+        {
+            do
+                gi = PakHasAny(dir + L"Game\\" + f.cFileName, giFiles, shaders) || gi;
+            while (FindNextFileW(p, &f));
+            FindClose(p);
+        }
+        const bool dll = Exists(dir + L"Bin64\\" + name + L".dll") || Exists(dir + L"Bin64\\CryGame.dll");
+        const bool dll32 = Exists(dir + L"Bin32\\" + name + L".dll") || Exists(dir + L"Bin32\\CryGame.dll");
+        json += std::wstring(json.size() > 1 ? L"," : L"") + L"{\"name\":" + Json(name) + L",\"dll\":" + Bool(dll) + L",\"dll32\":" +
+                Bool(!dll && dll32) + L",\"shaders\":" + Bool(shaders || gi) + L",\"gi\":" + Bool(gi) + L"}";
+    }
+    return json + L"]";
+}
+
+// The graphics card for the page: the NVIDIA RTX one if there is one (DLSS, so DLAA, needs Turing or newer, and all of
+// those are named RTX), else the one with the most video memory.
+std::wstring GpuJson()
+{
+    static std::wstring name;
+    static bool rtx, done;
+    if (!done)
+    {
+        done = true;
+        using Create = HRESULT(WINAPI*)(REFIID, void**);
+        const HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+        const auto create = dxgi ? reinterpret_cast<Create>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+        IDXGIFactory1* factory = nullptr;
+        if (create && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))))
+        {
+            SIZE_T best = 0;
+            IDXGIAdapter1* a = nullptr;
+            for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++)
+            {
+                DXGI_ADAPTER_DESC1 d;
+                if (SUCCEEDED(a->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
+                {
+                    const bool isRtx = d.VendorId == 0x10DE && wcsstr(d.Description, L"RTX");
+                    if ((isRtx && !rtx) || (isRtx == rtx && d.DedicatedVideoMemory > best))
+                    {
+                        name = d.Description;
+                        best = d.DedicatedVideoMemory;
+                    }
+                    rtx = rtx || isRtx;
+                }
+                a->Release();
+            }
+            factory->Release();
+        }
+    }
+    return L"\"gpu\":" + Json(name) + L",\"dlss\":" + Bool(rtx);
+}
+
 std::wstring Status()
 {
     std::wstring build = L"?", launcher = T(L"Crysis.exe без c1-launcher (не проверялся)", L"Crysis.exe without c1-launcher (untested)");
@@ -257,7 +399,8 @@ std::wstring Status()
     const std::string off = ReadAll(g_dir + L"logs\\mt\\crymt_off.txt");
     std::string version, date;
     InstalledInfo(version, date);
-    return L"{\"msaa\":" + Json(GameMsaa()) + L",\"installed\":" + Json(Utf16(version)) + L",\"installedDate\":" + Json(Utf16(date)) +
+    const bool editor = Exists(g_game + L"Bin64\\Editor.exe");
+    return L"{\"msaa\":" + Json(GameMsaa()) + L",\"mods\":" + ModsJson() + L"," + GpuJson() + L",\"editor\":" + Bool(editor) + L",\"max\":" + Bool(g_wnd && IsZoomed(g_wnd)) + L",\"installed\":" + Json(Utf16(version)) + L",\"installedDate\":" + Json(Utf16(date)) +
            L",\"game\":" + Json(g_game) + L",\"build\":" + Json(build) + L",\"buildOk\":" + Bool(buildOk) + L",\"launcher\":" + Json(launcher) +
            L",\"launcherOk\":" + Bool(launcherOk) + L",\"launcherWarn\":" + Bool(launcherWarn) + L",\"proxy\":" + Bool(Exists(g_game + L"Bin64\\dbghelp.dll")) + L",\"lastOff\":" + Json(Utf16(off)) + L"}";
 }
@@ -328,6 +471,26 @@ void Play(bool gi, const std::wstring& args, const std::wstring& after)
         SendLater(L"{\"type\":\"played\",\"ok\":" + std::wstring(Bool(error.empty())) + L",\"error\":" + Json(error) + L",\"after\":" +
                   Json(error.empty() ? after : L"stay") + L"}");
     }).detach();
+}
+
+// The Sandbox Editor of the Mod SDK (Bin64\Editor.exe), through c1-launcher's EditorLauncher.exe when it is there (its
+// memory fixes), with the chosen mod. Without CryMT: the loader only starts it in Crysis.exe, its render thread and
+// DX12 back end expect one game window, the editor draws several viewports.
+void Editor(const std::wstring& args, const std::wstring& after)
+{
+    std::wstring error;
+    const std::wstring bin = g_game + L"Bin64";
+    const std::wstring exe = bin + (Exists(bin + L"\\EditorLauncher.exe") ? L"\\EditorLauncher.exe" : L"\\Editor.exe");
+    if (!Exists(bin + L"\\Editor.exe"))
+        error = T(L"нет Bin64\\Editor.exe (редактор ставится с Crysis Mod SDK)", L"no Bin64\\Editor.exe (the editor comes with the Crysis Mod SDK)");
+    else
+    {
+        const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", exe.c_str(), args.c_str(), bin.c_str(), SW_SHOWNORMAL));
+        if (r <= 32)
+            error = exe.substr(g_game.size()) + T(L" не запустился (", L" did not start (") + std::to_wstring(r) + L")";
+    }
+    SendLater(L"{\"type\":\"played\",\"ok\":" + std::wstring(Bool(error.empty())) + L",\"error\":" + Json(error) + L",\"after\":" +
+              Json(error.empty() ? after : L"stay") + L",\"editor\":true}");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -570,9 +733,11 @@ bool PutFile(const std::wstring& from, const std::wstring& to)
     return MoveFileExW(to.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING) && CopyFileW(from.c_str(), to.c_str(), FALSE);
 }
 
+// The launcher's own files: the running window and page stay the old ones until it starts again.
 bool LauncherFile(const std::string& path)
 {
-    return _stricmp(path.c_str(), "CryMT/CryMTLauncher.exe") == 0 || _stricmp(path.c_str(), "CryMT/WebView2Loader.dll") == 0;
+    return _stricmp(path.c_str(), "CryMT/CryMTLauncher.exe") == 0 || _stricmp(path.c_str(), "CryMT/WebView2Loader.dll") == 0 ||
+           _strnicmp(path.c_str(), "CryMT/ui/", 9) == 0;
 }
 
 bool InstalledInfo(std::string& version, std::string& date)
@@ -617,25 +782,37 @@ void RemoveTree(const std::wstring& dir)
 
 DWORD RunWait(std::wstring cmd);
 
-// On a worker thread, one at a time.
-bool StartWork(const wchar_t* kind, std::function<void()> work)
+// On one worker thread, in the order asked: a check pressed while the start-up check still runs waits for it instead
+// of failing.
+void StartWork(std::function<void()> work)
 {
-    bool expected = false;
-    if (!g_working.compare_exchange_strong(expected, true))
-    {
-        SendLater(L"{\"type\":\"error\",\"error\":" + Json(std::wstring(T(L"лаунчер занят: ", L"the launcher is busy: ")) + kind) + L"}");
-        return false;
-    }
-    std::thread([work] {
-        work();
-        g_working = false;
+    std::lock_guard<std::mutex> guard(g_workLock);
+    g_work.push_back(std::move(work));
+    if (g_workerRuns)
+        return;
+    g_workerRuns = true;
+    std::thread([] {
+        for (;;)
+        {
+            std::function<void()> next;
+            {
+                std::lock_guard<std::mutex> guard(g_workLock);
+                if (g_work.empty())
+                {
+                    g_workerRuns = false;
+                    return;
+                }
+                next = std::move(g_work.front());
+                g_work.pop_front();
+            }
+            next();
+        }
     }).detach();
-    return true;
 }
 
 void FetchText(const std::wstring& id, const std::wstring& url)
 {
-    StartWork(T(L"запрос", L"request"), [id, url] {
+    StartWork([id, url] {
         std::string body;
         DWORD status = 0;
         std::wstring error;
@@ -647,7 +824,7 @@ void FetchText(const std::wstring& id, const std::wstring& url)
 
 void CheckManifest(const std::wstring& url, const std::wstring& sigUrl)
 {
-    StartWork(T(L"проверка обновления", L"update check"), [url, sigUrl] {
+    StartWork([url, sigUrl] {
         std::string text, sig;
         DWORD status = 0;
         std::wstring error;
@@ -680,7 +857,7 @@ void Progress(const wchar_t* stage, uint64_t done, uint64_t total)
 
 void Install(const std::wstring& zipUrl)
 {
-    StartWork(T(L"обновление", L"update"), [zipUrl] {
+    StartWork([zipUrl] {
         std::string text;
         {
             std::lock_guard<std::mutex> guard(g_manifestLock);
@@ -791,7 +968,7 @@ void Install(const std::wstring& zipUrl)
 // One step back: the newest backup\<version> is put back (files that were new are removed).
 void Rollback()
 {
-    StartWork(T(L"откат", L"rollback"), [] {
+    StartWork([] {
         std::wstring error, name;
         bool restart = false;
         const auto done = [&](bool ok) {
@@ -861,7 +1038,7 @@ void Rollback()
 // The installed files against CryMT\version.txt.
 void VerifyInstalled()
 {
-    StartWork(T(L"проверка файлов", L"file check"), [] {
+    StartWork([] {
         Manifest m;
         std::wstring bad;
         int checked = 0, wrong = 0;
@@ -889,6 +1066,10 @@ void Restart()
     wchar_t self[MAX_PATH];
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     std::wstring args = PathGetArgsW(GetCommandLineW());
+    // A test's --page=#news?auto=update|rollback runs once, not again in the restarted window.
+    const size_t autoAt = args.find(L"auto=");
+    if (autoAt != std::wstring::npos)
+        args.erase(autoAt, args.find_first_of(L" \"", autoAt) - autoAt);
     if (args.find(L"--restarted") == std::wstring::npos)
         args += L" --restarted";
     if (g_once)
@@ -911,6 +1092,20 @@ void OnMessage(const std::wstring& m)
     }
     else if (cmd == L"min")
         ShowWindow(g_wnd, SW_MINIMIZE);
+    else if (cmd == L"max")
+        ShowWindow(g_wnd, IsZoomed(g_wnd) ? SW_RESTORE : SW_MAXIMIZE);
+    else if (cmd == L"resize" && !IsZoomed(g_wnd))
+    {
+        // The page covers the window, so its edges are the page's: it asks for the system's sizing loop.
+        static const std::pair<const wchar_t*, WPARAM> edges[] = {{L"n", HTTOP}, {L"s", HTBOTTOM}, {L"e", HTRIGHT}, {L"w", HTLEFT},
+                                                                  {L"ne", HTTOPRIGHT}, {L"nw", HTTOPLEFT}, {L"se", HTBOTTOMRIGHT}, {L"sw", HTBOTTOMLEFT}};
+        for (const auto& [name, hit] : edges)
+            if (rest == name)
+            {
+                ReleaseCapture();
+                SendMessageW(g_wnd, WM_NCLBUTTONDOWN, hit, 0);
+            }
+    }
     else if (cmd == L"close")
         PostMessageW(g_wnd, WM_CLOSE, 0, 0);
     else if (cmd == L"load")
@@ -930,6 +1125,11 @@ void OnMessage(const std::wstring& m)
         }
         part.resize(3);
         Play(part[0] == L"1", part[1], part[2]);
+    }
+    else if (cmd == L"editor")
+    {
+        const size_t nl2 = rest.find(L'\n');
+        Editor(rest.substr(0, nl2), nl2 == std::wstring::npos ? L"stay" : rest.substr(nl2 + 1));
     }
     else if (cmd == L"fetch")
     {
@@ -951,9 +1151,13 @@ void OnMessage(const std::wstring& m)
         Rollback();
     else if (cmd == L"verify")
         VerifyInstalled();
+    else if (cmd == L"restart")
+        Restart();
     else if (cmd == L"open")
     {
-        const std::wstring path = rest == L"game" ? g_game : rest == L"logs" ? g_dir + L"logs" : g_dir;
+        const std::wstring path = rest == L"game" ? g_game : rest == L"logs" ? g_dir + L"logs" : rest == L"mods" ? g_game + L"Mods" : g_dir;
+        if (rest == L"mods")
+            CreateDirectoryW(path.c_str(), nullptr);
         ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
 }
@@ -1053,15 +1257,23 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     {
     case WM_NCCALCSIZE: // no system frame: the client area is the whole window
         if (wp)
+        {
+            // Maximised, a sizable window reaches past the screen by its frame: the client is the work area then.
+            if (IsZoomed(wnd))
+            {
+                MONITORINFO mi{sizeof(mi)};
+                if (GetMonitorInfoW(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi))
+                    reinterpret_cast<NCCALCSIZE_PARAMS*>(lp)->rgrc[0] = mi.rcWork;
+            }
             return 0;
+        }
         break;
     case WM_NCHITTEST:
         return HTCLIENT;
-    case WM_GETMINMAXINFO: // a fixed size (at this monitor's DPI)
+    case WM_GETMINMAXINFO: // the smallest size the page fits in (at this monitor's DPI)
     {
         const UINT dpi = GetDpiForWindow(wnd);
-        auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-        mm->ptMinTrackSize = mm->ptMaxTrackSize = {MulDiv(kWidth, dpi, 96), MulDiv(kHeight, dpi, 96)};
+        reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {MulDiv(kMinWidth, dpi, 96), MulDiv(kMinHeight, dpi, 96)};
         return 0;
     }
     case WM_DPICHANGED:
@@ -1077,6 +1289,14 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
             RECT r;
             GetClientRect(wnd, &r);
             g_ctrl->put_Bounds(r);
+        }
+        if (wp != SIZE_MINIMIZED && g_view)
+        {
+            static int last = -1;
+            const int max = wp == SIZE_MAXIMIZED;
+            if (max != last)
+                Send(L"{\"type\":\"window\",\"max\":" + std::wstring(Bool(max)) + L"}");
+            last = max;
         }
         return 0;
     case WM_MOVE:
@@ -1103,18 +1323,21 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
             else if (json->find(L"\"after\":\"minimize\"") != std::wstring::npos)
                 ShowWindow(wnd, SW_MINIMIZE);
         }
-        if (json->find(L"\"restart\":true") != std::wstring::npos)
-            SetTimer(wnd, 1, 1500, nullptr); // the page shows "restarting" first
         delete json;
         return 0;
     }
-    case WM_TIMER:
-    {
-        KillTimer(wnd, wp);
-        Restart();
-        return 0;
-    }
     case WM_DESTROY:
+    {
+        // The size and the maximised state for the next start: cache\window.txt, "<width> <height> <maximised>" at 96 DPI.
+        WINDOWPLACEMENT wp2{sizeof(wp2)};
+        if (GetWindowPlacement(wnd, &wp2))
+        {
+            const UINT dpi = GetDpiForWindow(wnd);
+            const RECT& r = wp2.rcNormalPosition;
+            WriteAll(g_dir + L"cache\\window.txt", std::to_string(MulDiv(r.right - r.left, 96, dpi)) + " " + std::to_string(MulDiv(r.bottom - r.top, 96, dpi)) +
+                                                    (wp2.showCmd == SW_SHOWMAXIMIZED ? " 1" : " 0"));
+        }
+    }
         if (g_ctrl)
         {
             g_ctrl->Close();
@@ -1212,10 +1435,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int show)
             UINT y = 96;
             getDpi(mon, 0, &dpi, &y);
         }
-    const int w = MulDiv(kWidth, dpi, 96), h = MulDiv(kHeight, dpi, 96);
     const RECT& work = mi.rcWork;
+    int w = kWidth, h = kHeight, maxed = 0;
+    sscanf(ReadAll(g_dir + L"cache\\window.txt").c_str(), "%d %d %d", &w, &h, &maxed);
+    w = std::min(std::max(MulDiv(std::max(w, kMinWidth), dpi, 96), 1), std::max<int>((work.right - work.left) * 92 / 100, MulDiv(kMinWidth, dpi, 96)));
+    h = std::min(std::max(MulDiv(std::max(h, kMinHeight), dpi, 96), 1), std::max<int>((work.bottom - work.top) * 92 / 100, MulDiv(kMinHeight, dpi, 96)));
+    if (maxed && show != SW_SHOWMINIMIZED && show != SW_MINIMIZE && show != SW_SHOWMINNOACTIVE)
+        show = SW_SHOWMAXIMIZED;
     // WS_CAPTION / WS_THICKFRAME keep the shadow, the taskbar's minimise and Aero snap; WM_NCCALCSIZE hides the frame.
-    g_wnd = CreateWindowExW(0, kClass, L"CryMT", WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX,
+    g_wnd = CreateWindowExW(0, kClass, L"CryMT", WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
                             work.left + (work.right - work.left - w) / 2, work.top + (work.bottom - work.top - h) / 2, w, h, nullptr, nullptr, inst, nullptr);
     const MARGINS shadow{1, 1, 1, 1};
     DwmExtendFrameIntoClientArea(g_wnd, &shadow);

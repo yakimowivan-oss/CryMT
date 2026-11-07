@@ -775,7 +775,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR args, int show)
     RegisterClassW(&wc);
     RECT r{0, 0, MulDiv(480, dpi, 96), MulDiv(408, dpi, 96)};
     AdjustWindowRect(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
-    g_wnd = CreateWindowW(L"CryMTSettings", L"CryMT v14", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
+    g_wnd = CreateWindowW(L"CryMTSettings", L"CryMT v15", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
                           r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     Build(dpi);
     Load();

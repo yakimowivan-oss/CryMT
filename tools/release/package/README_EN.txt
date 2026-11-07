@@ -1,4 +1,4 @@
-CryMT v14 for Crysis (2007): multithreaded rendering, DirectX 12, NVIDIA DLAA, global illumination
+CryMT v15 for Crysis (2007): multithreaded rendering, DirectX 12, NVIDIA DLAA, global illumination
 ==================================================================================================
 
 What it is
@@ -33,6 +33,11 @@ Install
 -------
   1. Unpack the archive into the game folder (where Bin64 is).
   2. Start CryMT\CryMTLauncher.exe, pick a mode and press Play.
+
+Mods: put the mod into the game's Mods folder and pick it on the launcher's home page (Mod).
+Play starts the game with -mod <name>. If the mod changes the shaders the GI patches, the GI
+is off for it. The Editor button (with the Mod SDK installed) opens the Sandbox Editor with the
+chosen mod, without CryMT.
 
 Starting the game the usual way (Steam, shortcut, a mod's .bat) works too. It then uses
 CryMT\CryMT.ini, which the launcher writes.
