@@ -1,0 +1,133 @@
+// Bin64\dbghelp.dll: loads CryMT at the start of every Crysis.exe launch (Steam, shortcuts, mod .bat files), before
+// any engine module, and forwards all of dbghelp to the system copy (DbgHelpStubs.S jumps through g_dbghelp).
+// Mode: CryMT\CryMT.ini [CryMT] Mode=off|mt|dx12|dlaa, overridden by a -crymt=<mode> argument; [Env] NAME=VALUE lines
+// set extra CryMT switches. When a launcher has already set CRYMT_MODE (Inject.exe, the dev scripts), it controls
+// CryMT and the proxy only forwards.
+#include <windows.h>
+
+#include <cwchar>
+#include <string>
+
+#include "DbgHelpExports.h"
+
+extern "C" {
+void* g_dbghelp[kDbgHelpExports];
+
+uintptr_t MissingExport()
+{
+    SetLastError(ERROR_PROC_NOT_FOUND);
+    return 0;
+}
+}
+
+namespace
+{
+std::wstring ModuleDir(HMODULE module)
+{
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(module, path, MAX_PATH);
+    const std::wstring s(path, n);
+    return s.substr(0, s.find_last_of(L"\\/") + 1);
+}
+
+// -crymt=<mode> on the command line, else the ini's Mode (mt when there is none), lower case.
+std::wstring ChosenMode(const std::wstring& ini)
+{
+    std::wstring cmd = GetCommandLineW();
+    CharLowerBuffW(cmd.data(), static_cast<DWORD>(cmd.size()));
+    const size_t at = cmd.find(L"-crymt=");
+    if (at != std::wstring::npos)
+    {
+        const size_t start = at + 7;
+        return cmd.substr(start, cmd.find_first_of(L" \t\"", start) - start);
+    }
+    wchar_t value[32] = {};
+    GetPrivateProfileStringW(L"CryMT", L"Mode", L"mt", value, 32, ini.c_str());
+    CharLowerW(value);
+    return value;
+}
+
+void LoadCryMT(HMODULE self)
+{
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const wchar_t* name = wcsrchr(exe, L'\\');
+    if (!name || _wcsicmp(name + 1, L"Crysis.exe") != 0) // not the dedicated server or tools
+        return;
+    if (GetEnvironmentVariableW(L"CRYMT_MODE", nullptr, 0))
+        return;
+    const std::wstring bin = ModuleDir(self);
+    const std::wstring root = bin.substr(0, bin.find_last_of(L"\\/", bin.size() - 2) + 1);
+    const std::wstring dir = root + L"CryMT\\";
+    const std::wstring ini = dir + L"CryMT.ini";
+    const std::wstring mode = ChosenMode(ini);
+    if (mode != L"mt" && mode != L"dx12" && mode != L"dlaa")
+        return;
+    SetEnvironmentVariableW(L"CRYMT_MODE", L"2");
+    SetEnvironmentVariableW(L"CRYMT_LEVEL", L"2");
+    SetEnvironmentVariableW(L"CRYMT_FILL", L"1");
+    SetEnvironmentVariableW(L"CRYMT_TERRAINOWN", L"1");
+    if (mode != L"mt")
+    {
+        SetEnvironmentVariableW(L"CRYMT_D3D12", L"1");
+        SetEnvironmentVariableW(L"CRYMT_D3DSTREAM", L"1");
+    }
+    if (mode == L"dlaa")
+        SetEnvironmentVariableW(L"CRYMT_DLSS", L"1");
+    wchar_t borderless[8] = {};
+    GetPrivateProfileStringW(L"CryMT", L"Borderless", L"1", borderless, 8, ini.c_str());
+    SetEnvironmentVariableW(L"CRYMT_BORDERLESS", borderless);
+    wchar_t pause[8] = {};
+    GetPrivateProfileStringW(L"CryMT", L"PauseOnFocusLoss", L"1", pause, 8, ini.c_str());
+    SetEnvironmentVariableW(L"CRYMT_PAUSEONFOCUS", pause);
+    // Console commands CryMT runs on the first frame (CRYMT_TESTCMD, one per frame): what the .cmd launchers pass on the
+    // command line, plus the [CVars] lines of the ini ("r_Something=value"), so a plain start of Crysis.exe is the same.
+    std::wstring commands = L"r_DynTexMaxSize 256";
+    if (mode == L"dlaa")
+        commands += L";r_UseEdgeAA 0";
+    wchar_t cvars[2048] = {};
+    GetPrivateProfileSectionW(L"CVars", cvars, 2048, ini.c_str());
+    for (wchar_t* p = cvars; *p; p += wcslen(p) + 1)
+    {
+        std::wstring line = p;
+        for (wchar_t& ch : line)
+            if (ch == L'=')
+                ch = L' ';
+        commands += L";" + line;
+    }
+    SetEnvironmentVariableW(L"CRYMT_TESTCMD", commands.c_str());
+    SetEnvironmentVariableW(L"CRYMT_TESTCMDSEC", L"0");
+    wchar_t gi[8] = {};
+    if (mode != L"mt" && GetPrivateProfileStringW(L"CryMT", L"GI", L"0", gi, 8, ini.c_str()) && wcscmp(gi, L"0") != 0)
+        SetEnvironmentVariableW(L"CRYMT_GI", gi); // screen-space GI, D3D12 modes; needs the patched shaders
+    wchar_t env[4096] = {};
+    GetPrivateProfileSectionW(L"Env", env, 4096, ini.c_str());
+    for (wchar_t* p = env; *p; p += wcslen(p) + 1)
+        if (wchar_t* eq = wcschr(p, L'='))
+        {
+            *eq = 0;
+            SetEnvironmentVariableW(p, eq + 1);
+            *eq = L'=';
+        }
+    LoadLibraryW((dir + L"CryMT.dll").c_str());
+}
+} // namespace
+
+BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls(self);
+        wchar_t path[MAX_PATH];
+        GetSystemDirectoryW(path, MAX_PATH);
+        wcscat_s(path, L"\\dbghelp.dll");
+        HMODULE real = LoadLibraryW(path);
+        for (int i = 0; i < kDbgHelpExports; i++)
+        {
+            void* fn = real ? reinterpret_cast<void*>(GetProcAddress(real, kDbgHelpNames[i])) : nullptr;
+            g_dbghelp[i] = fn ? fn : reinterpret_cast<void*>(&MissingExport);
+        }
+        LoadCryMT(self);
+    }
+    return TRUE;
+}

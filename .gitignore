@@ -1,0 +1,36 @@
+# Only what is listed here is part of the repository: the workspace also holds game files, Crytek's shader
+# sources, the Mod SDK, other people's projects, the toolchain, SDKs, captures, logs and the release signing key.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/BUILDING.md
+!/ARCHITECTURE.md
+!/LICENSE
+!/build.ps1
+
+!/src/
+/src/*
+!/src/crymt/
+/src/crymt/build/
+/src/crymt/build2/
+/src/crymt/shaders/
+!/src/launcher/
+/src/launcher/build/
+
+!/tools/
+/tools/*
+!/tools/prof/
+/tools/prof/*.exe
+/tools/prof/ghidra/*.txt
+/tools/prof/__pycache__/
+!/tools/release/
+
+*.o
+*.map
+*.dll
+*.exe
+*.pdb
+*.rdc
+*.ppm
+*.key

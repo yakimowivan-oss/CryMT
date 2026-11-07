@@ -1,0 +1,30 @@
+Third-party components in the CryMT package
+===========================================
+
+CryMT itself: GNU GPL 3.0 (CryMT-GPL-3.0.txt), with the additional permission described in the
+README of https://github.com/yakimowivan-oss/CryMT. That permission allows combining CryMT with
+the game's binaries, NVIDIA Streamline/DLSS and Microsoft WebView2.
+
+NVIDIA Streamline 2.14.16
+  Files:   streamline\sl.interposer.dll, sl.common.dll, sl.dlss.dll
+  Source:  https://github.com/NVIDIA-RTX/Streamline
+  License: MIT (streamline.license.txt)
+
+NVIDIA DLSS (nvngx_dlss.dll)
+  Files:   streamline\nvngx_dlss.dll
+  License: NVIDIA DLSS license (nvngx_dlss.license.txt)
+  Note:    NVIDIA, DLSS and RTX are trademarks of NVIDIA Corporation.
+
+Microsoft Edge WebView2 SDK 1.0.2903.40
+  Files:   WebView2Loader.dll
+  License: BSD-style (webview2.license.txt)
+  Note:    The WebView2 Runtime itself is part of Windows.
+
+RenderDoc in-application API header (renderdoc_app.h, RenderDoc 1.47)
+  Use:     compiled into CryMT.dll. It loads renderdoc.dll only when CRYMT_RENDERDOC is set,
+           and RenderDoc itself is not shipped.
+  License: MIT, Copyright (c) 2015-2026 Baldur Karlsson, Copyright (c) 2014 Crytek
+           (https://github.com/baldurk/renderdoc)
+
+Crysis
+  Crysis and CryEngine are trademarks of Crytek. The package contains no game files.

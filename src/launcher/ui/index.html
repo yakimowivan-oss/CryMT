@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CryMT Launcher</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600&family=Exo+2:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <div class="mark" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div>
+        <div class="brand-name">CryMT</div>
+        <div class="brand-sub">MT · DirectX 12 · DLAA · GI для Crysis 1.2.1</div>
+      </div>
+      <span class="chip proto">прототип</span>
+    </div>
+    <nav class="tabs" id="tabs" role="tablist"></nav>
+  </header>
+  <div class="wincaps">
+    <button type="button" id="winMin" title="Свернуть"><i></i></button>
+    <button type="button" id="winClose" class="close" title="Закрыть"><i></i><i></i></button>
+  </div>
+
+  <main id="main">
+    <section class="view" id="view-home"></section>
+    <section class="view" id="view-adv"></section>
+    <section class="view" id="view-keys"></section>
+    <section class="view" id="view-news"></section>
+  </main>
+
+  <footer class="bar panel cut">
+    <div class="status" id="status"></div>
+    <div class="bar-load" id="barLoad"></div>
+    <button class="btn play" id="play">Играть</button>
+  </footer>
+</div>
+<div class="toasts" id="toasts"></div>
+<script src="options.js"></script>
+<script src="ini.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
