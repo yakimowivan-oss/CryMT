@@ -79,12 +79,43 @@ bool Run(std::wstring cmd)
 }
 
 // ---- GI shader patch (same edits as tools\prof\patchshaders.py) ---------------------------------------------------
+const char* const kEnvAll = R"(#if D3D10
+#if !%TEMP_VEGETATION
+#if !%TEMP_TERRAIN
+  // CryMT: an environment reflection where the material has none (CryMT_EnvSampler; black without CRYMT_ENVMAP).
+  if (pPass.nReflectionMapping == 0 && pPass.nQuality != QUALITY_LOW)
+  {
+    half crymtF = 1 - saturate(pPass.fNdotE);
+    crymtF *= crymtF;
+    crymtF *= crymtF;
+    pPass.cEnvironment = texCUBE(CryMT_EnvSampler, pPass.vReflVec.xyz).rgb * (0.04 + 0.96 * crymtF) * 0.35;
+    pPass.nReflectionMapping = 3;
+  }
+#endif
+#endif
+#endif
+
+  // do custom pass setup
+  frag_custom_begin(pPass);)";
+
 const char* const kGiDecl = R"(#include "CommonRAM.cfi"
 
 // CryMT GI: the engine binds the placeholder Textures/CryMT/gi.dds (all zero: the ambient stays as it was); CryMT's
 // D3D12 back end shows its GI texture in its place. rgb = indirect light added, a = share of the engine's ambient
 // replaced (sky occlusion) plus flags (below).
 #if D3D10
+// CryMT environment reflection: the placeholder Textures/CryMT/env.dds (a black cube) where CryMT's D3D12 back end
+// shows its environment cube (CRYMT_ENVMAP).
+samplerCUBE CryMT_EnvSampler = sampler_state
+{
+  Texture = Textures/CryMT/env.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
 sampler2D CryMT_GISampler = sampler_state
 {
   Texture = Textures/CryMT/gi.dds;
@@ -121,10 +152,11 @@ half3 CryMT_GIAmbient(half3 ambient, float4 screenProj)
 
 // The share of the sky the GI sees (1 - its occlusion), for all specular (specular occlusion): the environment map's
 // reflection is shaded by the ambient and diffuse light only, and shadow maps miss the inner faces of one-layer roofs
-// and walls, so metal glinted in shadowed rooms.
+// and walls, so metal glinted in shadowed rooms. Off for now (the user, 2026-11-09: comparing the reflections without it);
+// it was: return 1 - CryMT_GIShare(CryMT_GI(screenProj).w);
 half CryMT_GISpecular(float4 screenProj)
 {
-  return 1 - CryMT_GIShare(CryMT_GI(screenProj).w);
+  return 1;
 }
 
 // The top-left texel's a / 2: the mask of the engine's terms the GI replaces (bits below; 32: the particles' GI,
@@ -141,16 +173,21 @@ bool CryMT_GIReplaces(float4 screenProj, half bit)
   return CryMT_GIFlags(CryMT_GI(screenProj).w) > 0.5 && fmod(floor(mask / bit), 2) > 0.5;
 }
 
+// How much of a baked term the GI hands back at this distance: none up to the distance in the top-left texel (64 x half
+// of it, metres), all from 2.5 x that on (the GI fades out over the same window). 0: the GI replaces it everywhere.
+half CryMT_GIBakedShare(float4 screenProj)
+{
+  float start = floor(CryMT_GIControl() / 64) * 2;
+  return start > 0 ? saturate((screenProj.w - start) / (1.5 * start)) : 0;
+}
+
 // The engine's TerrainAO (under the trees; a 2.5D map: one canopy height per terrain cell): near the camera the GI's
-// own occlusion takes its place (bit 8), from the distance in the top-left texel on, over half that again, the
-// engine's (far trees are sprites, beyond the voxels).
+// own occlusion takes its place (bit 8), further the engine's (far trees are sprites, beyond the voxels).
 half CryMT_GITerrainAOMix(float4 screenProj, half tao)
 {
-  float c = CryMT_GIControl();
-  float start = floor(c / 64) * 2;
   if (!CryMT_GIReplaces(screenProj, 8))
     return tao;
-  return lerp(1, tao, saturate((screenProj.w - start) / (0.5 * start + 1)));
+  return lerp(1, tao, CryMT_GIBakedShare(screenProj));
 }
 
 // The engine's SSAO term, or 1 where the GI's occlusion replaces it.
@@ -163,7 +200,7 @@ half CryMT_GISSAOMix(float4 screenProj, half ssao)
 // replaces it.
 half CryMT_GIBakedMix(float4 screenProj, half baked, half bit)
 {
-  return CryMT_GIReplaces(screenProj, bit) ? 1 : baked;
+  return CryMT_GIReplaces(screenProj, bit) ? lerp(1, baked, CryMT_GIBakedShare(screenProj)) : baked;
 }
 #else
 half3 CryMT_GIAmbient(half3 ambient, float4 screenProj)
@@ -339,6 +376,7 @@ const wchar_t* kTerrain = L"Shaders\\HWScripts\\CryFX\\Terrain.cfx";
 const wchar_t* kShadowMask = L"Shaders\\HWScripts\\CryFX\\ShadowMaskGen.cfx";
 const wchar_t* kZPass = L"Shaders\\HWScripts\\CryFX\\CommonZPass.cfi";
 const wchar_t* kParticles = L"Shaders\\HWScripts\\CryFX\\Particles.cfi";
+const wchar_t* kMetal = L"Shaders\\HWScripts\\CryFX\\Metal.cfx";
 const wchar_t* kPlaceholder = L"Textures\\CryMT\\gi.dds";
 // The patch goes into the game as a pak: without -DEVMODE CryPak reads files only from paks (loose files are ignored)
 // and a later pak by name overrides the earlier ones (as the official ZPatch1.pak does), so zzCryMT.pak's sources
@@ -478,12 +516,19 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
-                particles = Lf(ReadAll(tmp + L"\\" + kParticles));
+                particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal));
     const bool ok = Replace(frag, "#include \"CommonRAM.cfi\"\n", kGiDecl) &&
+                    // The environment reflection on materials without their own (not vegetation or terrain): composed as
+                    // the engine composes its own (shaded by the light reaching the surface, times the gloss map and the
+                    // specular colour), Schlick's fresnel; Metal stronger (it defines CRYMT_ENV_STRENGTH).
+                    Replace(frag, "  // do custom pass setup\n  frag_custom_begin(pPass);", kEnvAll) &&
+                    Replace(metal, "void frag_custom_begin(inout fragPass pPass)\n{\n",
+                            "void frag_custom_begin(inout fragPass pPass)\n{\n  // CryMT: Metal's environment reflection at 1.0 (fragLib's is 0.35; no preprocessor: CryFX failed on it)\n"
+                            "  if (pPass.nReflectionMapping == 3)\n    pPass.cEnvironment *= 2.85;\n") &&
                     Replace(frag, "  // custom ambient pass\n  frag_custom_ambient(pPass, amb);", kGiAmbient) &&
                     Replace(frag, "  half3 cSpecular = pPass.cSpecularAcc.xyz * pPass.cGlossMap.xyz;                    // 2 alu",
                             "  half3 cSpecular = pPass.cSpecularAcc.xyz * pPass.cGlossMap.xyz;                    // 2 alu\n#if !%_RT_FOG\n  cSpecular *= CryMT_GISpecular(pPass.IN.screenProj); // CryMT GI: specular occlusion (lights and environment map)\n#endif") &&
@@ -551,11 +596,21 @@ std::wstring InstallGi()
     // The particles' occlusion volume placeholder: 2x1, the first texel zero (cell size 0: no change), the second 3C3C3C3C.
     std::string pvol = foliage;
     memset(&pvol[132], 0x3C, 4);
+    // The environment reflection's placeholder: a 4x4 cube (A8R8G8B8, 6 faces), black; face 0's second texel E7000000.
+    std::string env(128 + 6 * 64, '\0');
+    const unsigned int eheader[] = {0x20534444, 124, 0x100F, 4, 4, 16, 0, 1};
+    memcpy(&env[0], eheader, sizeof(eheader));
+    memcpy(&env[76], pf, sizeof(pf));
+    const unsigned int ecaps[] = {0x1008, 0xFE00}; // complex texture; cube map with all six faces
+    memcpy(&env[108], ecaps, sizeof(ecaps));
+    env[128 + 4 + 3] = static_cast<char>(0xE7);
     if (!WriteStoredZip(pak, {{"Shaders/HWScripts/CryFX/fragLib.cfi", Crlf(frag)},
                               {"Shaders/HWScripts/CryFX/Terrain.cfx", Crlf(terrain)},
                               {"Shaders/HWScripts/CryFX/ShadowMaskGen.cfx", Crlf(shadowMask)},
                               {"Shaders/HWScripts/CryFX/CommonZPass.cfi", Crlf(zpass)},
                               {"Shaders/HWScripts/CryFX/Particles.cfi", Crlf(particles)},
+                              {"Shaders/HWScripts/CryFX/Metal.cfx", Crlf(metal)},
+                              {"Textures/CryMT/env.dds", env},
                               {"Textures/CryMT/gi.dds", dds},
                               {"Textures/CryMT/jitter.dds", jitter},
                               {"Textures/CryMT/foliage.dds", foliage},

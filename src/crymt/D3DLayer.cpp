@@ -1697,7 +1697,8 @@ HMODULE WINAPI ReserveLoadLibraryExW(LPCWSTR name, HANDLE file, DWORD flags)
     return LoadLibraryExW(name, file, flags);
 }
 
-std::vector<std::pair<void*, std::wstring>> ReserveModuleRanges()
+// The preferred ranges of the Bin64 DLLs not loaded yet (or only those named in `only`), held until CrySystem loads them.
+std::vector<std::pair<void*, std::wstring>> ReserveModuleRanges(const wchar_t* const* only = nullptr, size_t count = 0)
 {
     std::vector<std::pair<void*, std::wstring>> reserved;
     wchar_t dir[MAX_PATH];
@@ -1713,6 +1714,11 @@ std::vector<std::pair<void*, std::wstring>> ReserveModuleRanges()
     do
     {
         if (GetModuleHandleW(found.cFileName))
+            continue;
+        bool wanted = !only;
+        for (size_t i = 0; i < count && !wanted; i++)
+            wanted = _wcsicmp(found.cFileName, only[i]) == 0;
+        if (!wanted)
             continue;
         const std::wstring path = std::wstring(dir) + found.cFileName;
         HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1751,7 +1757,8 @@ HRESULT WINAPI HookD3D10CreateDevice(IDXGIAdapter* adapter, D3D10_DRIVER_TYPE ty
     {
         {
             std::lock_guard<std::mutex> guard(g_reservedLock);
-            g_reserved = ReserveModuleRanges();
+            auto more = ReserveModuleRanges();
+            g_reserved.insert(g_reserved.end(), more.begin(), more.end());
         }
         static const char* const kLoads[] = {"LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW"};
         static const void* const kHooks[] = {reinterpret_cast<const void*>(&ReserveLoadLibraryA), reinterpret_cast<const void*>(&ReserveLoadLibraryW),
@@ -1811,6 +1818,23 @@ void D3DLayerOnDll(const wchar_t* name, size_t chars, uintptr_t base)
 {
     if (chars != 9 || _wcsnicmp(name, L"d3d10.dll", 9) != 0)
         return;
+    // The renderer is loading (d3d10.dll, before its own imports such as dxgi.dll): the engine modules CryMT patches that
+    // CrySystem loads after it get their address ranges held until CrySystem's LoadLibrary asks for them. Otherwise an
+    // overlay that comes with the renderer (ReShade as Bin64\dxgi.dll, its add-ons) can take that memory first, the module
+    // lands elsewhere and CryMT turns off ("CryAnimation.dll is not the ... 6156 module").
+    {
+        static const wchar_t* const kLater[] = {L"Cry3DEngine.dll", L"CryAnimation.dll"};
+        std::lock_guard<std::mutex> guard(g_reservedLock);
+        auto held = ReserveModuleRanges(kLater, 2);
+        g_reserved.insert(g_reserved.end(), held.begin(), held.end());
+        static const char* const kLoads[] = {"LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW"};
+        static const void* const kHooks[] = {reinterpret_cast<const void*>(&ReserveLoadLibraryA), reinterpret_cast<const void*>(&ReserveLoadLibraryW),
+                                             reinterpret_cast<const void*>(&ReserveLoadLibraryExA), reinterpret_cast<const void*>(&ReserveLoadLibraryExW)};
+        const int hooked = held.empty() ? 0 : CryMTPatchImports(reinterpret_cast<uintptr_t>(GetModuleHandleW(L"CrySystem.dll")), "KERNEL32.dll", kLoads, kHooks, 4);
+        char line[96];
+        snprintf(line, sizeof(line), "engine ranges held before the renderer's imports: %d (CrySystem imports hooked %d)", static_cast<int>(held.size()), hooked);
+        SetupLog(line);
+    }
     g_censusOn = GetEnvironmentVariableW(L"CRYMT_D3DCENSUS", nullptr, 0) != 0;
     g_d3d12On = GetEnvironmentVariableW(L"CRYMT_D3D12", nullptr, 0) != 0;
     g_streamOn = GetEnvironmentVariableW(L"CRYMT_D3DSTREAM", nullptr, 0) != 0;

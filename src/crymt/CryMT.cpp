@@ -6980,6 +6980,30 @@ void GiHotkeys()
         if (!pressed)
             continue;
         const float tod = g_giControl.timeOfDay;
+        // The environment maps' page: its own numpad switches (the time keys stay).
+        if (g_giControl.panel && g_giControl.page == 1)
+        {
+            bool done = true;
+            switch (kKeys[i])
+            {
+            case VK_NUMPAD0: g_giControl.env = g_giControl.env == 1 ? 0 : 1; break;
+            case VK_NUMPAD1: g_giControl.envAll = !g_giControl.envAll; break;
+            case VK_NUMPAD4: step(g_giControl.envOwnScale, -0.5f, 8.0f); break;
+            case VK_NUMPAD7: step(g_giControl.envOwnScale, 0.5f, 8.0f); break;
+            case VK_NUMPAD5: step(g_giControl.envAllScale, -0.5f, 8.0f); break;
+            case VK_NUMPAD8: step(g_giControl.envAllScale, 0.5f, 8.0f); break;
+            case VK_MULTIPLY:
+                g_giControl.envOwnScale = 1.0f;
+                g_giControl.envAllScale = 1.0f;
+                break;
+            default: done = false; break;
+            }
+            if (done)
+            {
+                FocusLog("frame %llu: env key %d", static_cast<unsigned long long>(g_frame), kKeys[i]);
+                continue;
+            }
+        }
         switch (kKeys[i])
         {
         case VK_NUMPAD0: g_giControl.enabled = !g_giControl.enabled; break;
@@ -7008,7 +7032,17 @@ void GiHotkeys()
             g_giControl.occlusionScale = 1.0f;
             g_giControl.bounceScale = 1.0f;
             break;
-        case VK_DIVIDE: g_giControl.panel = !g_giControl.panel; break;
+        case VK_DIVIDE: // the GI page, the environment maps' page, hidden
+            if (!g_giControl.panel)
+            {
+                g_giControl.page = 0;
+                g_giControl.panel = true;
+            }
+            else if (g_giControl.page == 0)
+                g_giControl.page = 1;
+            else
+                g_giControl.panel = false;
+            break;
         case VK_HOME: g_giControl.contact = g_giControl.contact != 0 ? 0 : 1; break; // -1: the default (on) not yet set
         case VK_NEXT: g_giControl.gtao = g_giControl.gtao != 0 ? 0 : 1; break;
         case VK_OEM_MINUS: g_giControl.particles = g_giControl.particles != 0 ? 0 : 1; break; // -1: the default (on) not yet set

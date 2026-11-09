@@ -441,6 +441,15 @@ struct SliceHeap
         std::lock_guard<std::mutex> guard(m);
         free[s.cls].push_back(s);
     }
+
+    uint64_t FreeBytes()
+    {
+        std::lock_guard<std::mutex> guard(m);
+        uint64_t n = 0;
+        for (int c = 0; c < kClasses; c++)
+            n += free[c].size() * (256ull << c);
+        return n;
+    }
 };
 SliceHeap g_slices;
 // Map(DISCARD) renames by kind (constant buffers, vertex/index buffers, others): how much the GPU reads from upload memory.
@@ -541,6 +550,15 @@ struct BlockHeap
         }
         std::lock_guard<std::mutex> guard(m);
         free[b.cls].push_back(b);
+    }
+
+    uint64_t FreeBytes()
+    {
+        std::lock_guard<std::mutex> guard(m);
+        uint64_t n = 0;
+        for (int c = 0; c < kClasses; c++)
+            n += free[c].size() * (256ull << c);
+        return n;
     }
 };
 BlockHeap g_blocks;
@@ -927,19 +945,23 @@ struct ResourceInfo
     int outputBound = 0;                                       // bound as a render target or depth stencil now
     uint64_t gpuWriteSerial = 0, gpuReadSerial = 0;            // staging: last main lists copying into / out of it
     uint8_t* stagingCpu = nullptr;
+    bool envCube = false; // a material's environment cube map (see IsEnvCube)
 };
 
 ResourceInfo* Info(ID3D10Resource* r);
+uint32_t EnvTestColour(); // CRYMT_ENVTEST (see IsEnvCube)
 const ResourceInfo* g_giPlaceholder; // Textures/CryMT/gi.dds, see IsGiPlaceholder
 const ResourceInfo* g_jitterPlaceholder; // Textures/CryMT/jitter.dds, see IsJitterPlaceholder
 const ResourceInfo* g_foliagePlaceholder; // Textures/CryMT/foliage.dds, see IsFoliagePlaceholder
 const ResourceInfo* g_pvolPlaceholder;    // Textures/CryMT/pvol.dds, see IsPvolPlaceholder
+const ResourceInfo* g_envPlaceholder;     // Textures/CryMT/env.dds (fragLib's CryMT_EnvSampler), see IsEnvPlaceholder
 SerializeRootSignatureFn g_serializeRoot;
 
 // CryMT GI compute pass (Device::RunGi). Root constants b0 (kGiConstants floats), t0 scene depth, t1 previous HDR colour,
 // t2 previous GI, u0 new GI, u1/u2 this and the previous frame's distances; a second table t3 the voxel grid with its
 // mips (kVoxShader); s0 point clamp, s1 linear clamp, s2 linear wrap (the grid is toroidal).
 constexpr UINT kGiConstants = 62; // with the two tables 64 DWORDs, the root signature's limit
+constexpr UINT kEnvSize = 64; // the environment maps' size (kGiShader envmap)
 constexpr UINT kPvolX = 64, kPvolY = 64, kPvolZ = 32, kPvolTiles = 8; // the particles' occlusion volumes (two: 1024 x 257 atlas)
 const char* const kGiShader = R"(
 cbuffer GiConstants : register(b0)
@@ -1124,17 +1146,23 @@ float4 ConeTrace(float3 O, float3 dir, float halfTan, float start, float reach, 
             level++;
         if (!InGrid(level, X, diameter * 0.5))
             break;
-        if (level < 3 && frac(seed + i * 0.618034) > saturate(EdgeCells(level, X, diameter * 0.5) / 8) && InGrid(level + 1, X, diameter * 0.5))
-            level++;
+        // Within 8 cells of the level's edge the next level is blended in (it takes over at the edge).
+        float edge = level < 3 && InGrid(level + 1, X, diameter * 0.5) ? saturate(EdgeCells(level, X, diameter * 0.5) / 8) : 1;
         float mip = clamp(lod - level, 1, 4);
         float4 v = SampleGrid(level, X, mip);
         // Opacity per axis (CRYMT_GI_MIPOPACITY=4): a wall stops what crosses it. From a surface (Ps, Ns) the axis along
         // its normal counts only once the sample is clear of it by half its size: a coarse cell around a cone from the
         // ground holds the ground, opaque across, which darkened open ground; the far wall or the ceiling count fully.
+        float3 axes = surface ? lerp(1, saturate(2 * dot(X - Ps, Ns) / diameter - 1), Ns * Ns) : 1;
         if (((uint)options & 64) != 0)
+            v.a = dot(dir * dir * axes, SampleDir(level, X, mip));
+        if (edge < 1)
         {
-            float3 t = surface ? lerp(1, saturate(2 * dot(X - Ps, Ns) / diameter - 1), Ns * Ns) : 1;
-            v.a = dot(dir * dir * t, SampleDir(level, X, mip));
+            float mip1 = clamp(lod - level - 1, 1, 4);
+            float4 w = SampleGrid(level + 1, X, mip1);
+            if (((uint)options & 64) != 0)
+                w.a = dot(dir * dir * axes, SampleDir(level + 1, X, mip1));
+            v = lerp(w, v, edge);
         }
         float above = plane ? saturate((dot(X - Ps, Ns) - diameter * 0.5) / (diameter * 0.5)) : 1;
         light += (1 - blocked) * v.rgb * above;
@@ -1217,6 +1245,152 @@ float2 GiDepthUv(int2 gi)
         p = at;
     }
     return (p + 0.5) / fullSize;
+}
+
+// Environment maps from the voxel grid (CRYMT_ENVMAP=voxels), for the materials' envMapSamplerCUBE / envMapSampler and
+// fragLib's CryMT_EnvSampler. u0 an atlas of 26 squares of kEnvSize (13..25: what the materials get, below), t2 the
+// previous run's atlas: 0..5 the cube's faces
+// +X -X +Y -Y +Z -Z (D3D order, world axes: materials look it up by the world reflection vector), 6 the 2D map the
+// weapons' Metal reads by reflection.xy (wrapped: a texel stands for xy and xy - 1, both upward), 7..12 the sky per
+// direction, kept between runs: where the previous frame shows the far plane in a direction it moves toward that colour,
+// elsewhere it stays (a = 1 seen, 0.5 only the screen's average so far). Per direction a cone from the camera through
+// the grid; what it leaves unblocked sees that sky. The result is blended with the previous run's (no jumps when the
+// grid or the view changes) and brought to 0..1 as the game's own environment maps are (the materials multiply it by
+// the light at the surface).
+static const uint kEnvSize = 64;
+static const float kEnvExposure = 0.5;
+groupshared float4 envSky[64];
+
+float3 EnvFaceDir(uint face, float2 f)
+{
+    float u = f.x * 2 - 1, w = f.y * 2 - 1;
+    return face == 0 ? float3(1, -w, -u) : face == 1 ? float3(-1, -w, u) : face == 2 ? float3(u, 1, w) :
+           face == 3 ? float3(u, -1, -w) : face == 4 ? float3(u, -w, 1) : float3(-u, -w, -1);
+}
+
+// The texel of square `first` + face for a direction (the inverse of EnvFaceDir).
+int2 EnvTexel(float3 d, uint first)
+{
+    float3 a = abs(d);
+    uint face;
+    float2 uv;
+    if (a.x >= a.y && a.x >= a.z)
+    {
+        face = d.x > 0 ? 0 : 1;
+        uv = float2(d.x > 0 ? -d.z : d.z, -d.y) / a.x;
+    }
+    else if (a.y >= a.z)
+    {
+        face = d.y > 0 ? 2 : 3;
+        uv = float2(d.x, d.y > 0 ? d.z : -d.z) / a.y;
+    }
+    else
+    {
+        face = d.z > 0 ? 4 : 5;
+        uv = float2(d.z > 0 ? d.x : -d.x, -d.y) / a.z;
+    }
+    int2 t = clamp((int2)((uv * 0.5 + 0.5) * kEnvSize), 0, kEnvSize - 1);
+    return int2((first + face) * kEnvSize + t.x, t.y);
+}
+
+float4 EnvTrace(float3 O, float3 dir, float halfTan)
+{
+    float vs = voxParams.x;
+    float3 light = 0;
+    float blocked = 0, d = vs;
+    [loop] for (int i = 0; i < 48 && blocked < 0.97; i++)
+    {
+        float diameter = max(2 * d * halfTan, vs);
+        float3 X = O + dir * d;
+        float lod = log2(diameter / vs);
+        int level = 0;
+        [loop] while (level < 3 && (lod - level > 4 || !InGrid(level, X, diameter * 0.5)))
+            level++;
+        if (!InGrid(level, X, diameter * 0.5))
+            break;
+        float4 v = SampleGrid(level, X, clamp(lod - level, 0, 4));
+        light += (1 - blocked) * v.rgb;
+        blocked += (1 - blocked) * v.a;
+        d += diameter * 0.7;
+    }
+    return float4(light, blocked);
+}
+
+// The previous frame's colour where it shows the far plane in this world direction (a = 1), else a = 0.
+float4 EnvSkySeen(float3 dir)
+{
+    float3 v = float3(dot(dir, float3(toWorldX.x, toWorldY.x, toWorldZ.x)), dot(dir, float3(toWorldX.y, toWorldY.y, toWorldZ.y)),
+                      -dot(dir, float3(toWorldX.z, toWorldY.z, toWorldZ.z)));
+    if (v.z > 0.05)
+    {
+        float2 ndc = v.xy / (v.z * invProj);
+        float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        float farPlane = depthParams.y / (1 + depthParams.x);
+        if (all(uv > 0.002) && all(uv < 0.998) && Distance(uv) > farPlane * 0.9)
+        {
+            float4 c = srcTex.SampleLevel(linearClamp, uv, 0);
+            if (Finite(c))
+                return float4(c.rgb, 1);
+        }
+    }
+    return 0;
+}
+
+float3 EnvColour(float3 dir, float3 avg, float halfTan)
+{
+    float3 O = float3(toWorldX.w, toWorldY.w, toWorldZ.w);
+    dir = normalize(dir);
+    float4 t = EnvTrace(O, dir, halfTan);
+    float4 sky = historyTex.Load(int3(EnvTexel(dir, 7), 0));
+    return t.rgb * voxParams.w + (1 - t.a) * (sky.a > 0 ? sky.rgb : avg);
+}
+
+[numthreads(8, 8, 1)]
+void envmap(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    float2 suv = float2((gi % 8 + 0.5) / 8, (gi / 8 + 0.5) / 8 * 0.6);
+    float farPlane = depthParams.y / (1 + depthParams.x);
+    float4 sc = srcTex.SampleLevel(linearClamp, suv, 0);
+    envSky[gi] = Distance(suv) > farPlane * 0.9 && Finite(sc) ? float4(sc.rgb, 1) : 0;
+    GroupMemoryBarrierWithGroupSync();
+    float4 sum = 0;
+    for (uint k = 0; k < 64; k++)
+        sum += envSky[k];
+    uint square = id.x / kEnvSize;
+    if (square > 12 || id.y >= kEnvSize)
+        return;
+    float4 prev = historyTex.Load(int3(id.xy, 0));
+    if (!Finite(prev))
+        prev = 0;
+    float3 avg = sum.w > 0 ? sum.rgb / sum.w : prev.a > 0 && square >= 7 ? prev.rgb : float3(0.05, 0.05, 0.05);
+    float2 f = (float2(id.x % kEnvSize, id.y) + 0.5) / kEnvSize;
+    if (square >= 7)
+    {
+        float4 seen = EnvSkySeen(normalize(EnvFaceDir(square - 7, f)));
+        outTex[id.xy] = seen.a > 0 ? float4(prev.a >= 1 ? lerp(prev.rgb, seen.rgb, 0.25) : seen.rgb, 1)
+                        : prev.a >= 1 || sum.w == 0 ? prev : float4(avg, 0.5);
+        return;
+    }
+    float3 c;
+    if (square < 6)
+        c = EnvColour(EnvFaceDir(square, f), avg, 0.08);
+    else
+    {
+        c = 0;
+        [unroll] for (int k = 0; k < 4; k++)
+        {
+            float2 xy = f - float2(k & 1, k >> 1);
+            c += EnvColour(float3(xy, sqrt(saturate(1 - dot(xy, xy)))), avg, 0.25) * 0.25;
+        }
+    }
+    c = 1 - exp(-max(c, 0) * kEnvExposure);
+    float3 o = prev.a > 0 ? lerp(prev.rgb, c, 0.5) : c;
+    outTex[id.xy] = float4(o, 1);
+    // The textures the materials get, with the panel's strengths (reproj._11: the materials' own maps, ._12: every
+    // material's): squares 13..19 (cube and 2D map), 20..25 (the cube for every material).
+    outTex[uint2(id.x + 13 * kEnvSize, id.y)] = float4(o * reproj._11, 1);
+    if (square < 6)
+        outTex[uint2(id.x + 20 * kEnvSize, id.y)] = float4(o * reproj._12, 1);
 }
 
 [numthreads(8, 8, 1)]
@@ -1370,7 +1544,10 @@ void trace(uint3 id : SV_DispatchThreadID)
             float3 mean = toned / weights;
             indirect = mean / max(1 - max(mean.r, max(mean.g, mean.b)), 0.05) * weights;
         }
-        float fade = saturate(1 - P.z / maxDistance);
+        // Near the GI alone, then over 1.5 x that the engine's baked occlusion takes over (the shader patch's
+        // CryMT_GIBakedMix, the same window): full up to options >> 16 (5 bits) x 2 metres, none from 2.5 x that on.
+        float fadeStart = (float)(((uint)options >> 16) & 31u) * 2;
+        float fade = fadeStart > 0 ? saturate((fadeStart * 2.5 - P.z) / (fadeStart * 1.5)) : saturate(1 - P.z / maxDistance);
         float3 nearLight = indirect * (bounce / (dirs * (classic ? 2 : 1)));
         float nearOcc = occ / (dirs * 2);
         // With the GTAO passes (in place of the engine's SSAO) the near occlusion is theirs alone: this part keeps the
@@ -2050,6 +2227,7 @@ cbuffer VoxConstants : register(b0)
 Texture2D<float4> depthTex : register(t0);  // update: scene depth (r); view: the info panel
 Texture2D<float4> colourTex : register(t1);
 Texture2D<float4> sceneTex : register(t2);
+Texture2D<float> foliageTex : register(t2); // update: the z-prepass's foliage mask (1 on alpha-tested surfaces), null without
 RWTexture3D<float4> voxels : register(u0);
 RWTexture2D<float4> viewOut : register(u1);
 RWTexture3D<uint> occupancy : register(u1); // update: the voxelized geometry's frame stamps (levels 0-2)
@@ -2076,6 +2254,17 @@ static const float kWeaponDepth = 0.1;
 static const float kColourTrust = 48; // metres: screen colour taken at full weight up to here (update)
 bool Finite3(float3 v) { return all((asuint(v) & 0x7f800000) != 0x7f800000); }
 int3 Wrap(int3 cell) { int n = (int)gridMin.w; return (cell % n + n) % n; }
+
+// The visible surface at a pixel in the view space of worldToView (x, y, -distance); far plane: very far.
+float3 SurfaceAt(float2 uv)
+{
+    float d = depthTex.SampleLevel(pointClamp, uv, 0).r;
+    float z = d >= 0.99999 ? 1e9 : depthParams.y / (d + depthParams.x);
+    return float3(float2(uv.x * 2 - 1, 1 - uv.y * 2) * invProj * z, -z);
+}
+
+// Of two differences to the neighbours, the one across less depth (not over an edge).
+float3 Nearer(float3 a, float3 b) { return abs(a.z) < abs(b.z) ? a : b; }
 float3 Tone(float3 c) { return c / (1 + c); }
 
 [numthreads(4, 4, 4)]
@@ -2101,6 +2290,21 @@ void update(uint3 id : SV_DispatchThreadID)
         if ((occupancy[id] >> 8) != (uint)abs(mode))
             occupancy[id] = 0;
     }
+    // The z-prepass draws voxelized into this level (RunVoxelGeometry): the stamp of the last frame that drew into the
+    // cell; a recent one makes it solid, also where the screen never showed the surface (undersides, backs).
+    // Kept (mode < 0, CRYMT_GI_GEOMPERSIST): any stamp, until the screen shows the cell empty or it leaves the grid;
+    // else the last three voxelizations only (geometry the engine stopped drawing, a room seen through a portal once
+    // the camera left it, went from the grid: the GI jumped when entering).
+    uint geometry = prevGridMin.w > 0 && all(cell >= pg) && all(cell < pg + n) ? occupancy[id] : 0;
+    // A stamp at all (without voxel geometry prevGridMin.w is 0 and every empty cell passed the age test: all were taken
+    // for foliage and eased to opacity 0 - the user: Num3 off left no occlusion at all).
+    bool stamped = geometry != 0 && ((geometry >> 8) >= (uint)prevGridMin.w || (mode < 0 && (geometry >> 8) > 0));
+    float stampA = (geometry & 255) / 255.0; // solid 1, foliage CRYMT_GI_FOLIAGE (drawn without its alpha test)
+    // Foliage cells (a partly open stamp: the voxelized leaves, by their shape) take their opacity from the stamps alone,
+    // eased: the screen made them solid where it saw a leaf and halved them where it saw through a gap between leaves, so
+    // they changed every update as the leaves swayed and the camera moved, and the GI under trees flickered (the user:
+    // only turning the GI off stopped it). The screen still gives them their colour.
+    bool foliage = stamped && stampA < 0.98;
     float3 centre = (cell + 0.5) * voxelSize;
     float3 V = mul(float4(centre, 1), worldToView).xyz;
     float dist = -V.z;
@@ -2115,19 +2319,46 @@ void update(uint3 id : SV_DispatchThreadID)
             {
                 float surface = d >= 0.99999 ? 1e9 : depthParams.y / (d + depthParams.x);
                 float tolerance = voxelSize * 0.87;
-                if (dist < surface - tolerance)
+                // Where the cell is against the surface: along the ray it lay far in front of a surface seen at a
+                // grazing angle (a cell on a road a third of a cell above the asphalt, seen at 10 degrees: nearly two
+                // cells), and was carved out: stripes of holes across roads by the phase of their steps, dark spots,
+                // cells that came and went as the camera moved (the user). Near the surface it is measured along the
+                // surface's normal (from the depth of the neighbouring pixels); far in front along the ray as before.
+                float side = dist - surface; // < 0 in front of the surface, > 0 behind it
+                if (d < 0.99999 && side > -(tolerance + 24 * voxelSize) && side < tolerance + 3 * voxelSize)
                 {
-                    v.a *= 0.5; // seen through
+                    float2 px = 1 / fullSize;
+                    float3 P0 = SurfaceAt(uv);
+                    float3 tx = Nearer(SurfaceAt(uv + float2(px.x, 0)) - P0, P0 - SurfaceAt(uv - float2(px.x, 0)));
+                    float3 ty = Nearer(SurfaceAt(uv + float2(0, px.y)) - P0, P0 - SurfaceAt(uv - float2(0, px.y)));
+                    float3 N = cross(tx, ty);
+                    if (dot(N, N) > 1e-12)
+                    {
+                        N = normalize(N);
+                        if (dot(N, P0) > 0)
+                            N = -N; // towards the camera
+                        side = -dot(V - P0, N);
+                    }
+                }
+                if (side < -tolerance)
+                {
+                    // Seen through: halved, unless the voxelized geometry says something is there (thin things - a
+                    // fence, a pole, branches - the screen sees past: halved here, set again by the next voxelization,
+                    // they came and went as the camera moved). Stamps of things that went are cleared below.
+                    if (!foliage && !stamped)
+                        v.a *= 0.5;
                     if (track)
                     {
                         seen[id] = 0;
                         // Kept geometry (mode < 0) that the screen shows empty now goes (a moved object, a door);
-                        // this frame's voxelizations stay.
-                        if (mode < 0 && (occupancy[id] >> 8) < (uint)prevGridMin.w)
+                        // this frame's voxelizations stay. Not foliage: the screen sees through the gaps between leaves
+                        // from most places, and the kept leaves went and came back as the camera moved (the crowns
+                        // flickered while walking, less when standing).
+                        if (mode < 0 && !foliage && (occupancy[id] >> 8) < (uint)prevGridMin.w)
                             occupancy[id] = 0;
                     }
                 }
-                else if (dist < surface + tolerance)
+                else if (side < tolerance)
                 {
                     float4 pc = mul(float4(centre, 1), worldToPrevClip);
                     float2 puv = float2(pc.x, -pc.y) / pc.w * 0.5 + 0.5;
@@ -2140,6 +2371,26 @@ void update(uint3 id : SV_DispatchThreadID)
                         // kColourTrust metres, less beyond; a first sight from afar is dimmed likewise.
                         float trust = saturate(kColourTrust / dist);
                         v.rgb = v.a > 0.01 ? lerp(v.rgb, c, 0.25 * trust) : c * trust;
+                        // A leaf on screen (the foliage mask) is no wall: half open at most, as the stamps have it.
+                        if (!foliage)
+                            v.a = lerp(v.a, foliageTex.SampleLevel(pointClamp, uv, 0) >= 0.5 ? 0.5 : 1, 0.5);
+                        if (track)
+                            seen[id] = 1;
+                    }
+                }
+                else if (side < tolerance + 2 * voxelSize && !foliage && foliageTex.SampleLevel(pointClamp, uv, 0) < 0.5)
+                {
+                    // Just behind a solid visible surface: the inside of the ground, a wall, a rock, filled with the
+                    // surface's colour. The screen gave a surface one layer of cells, in steps along a slope with
+                    // nothing between them (the user: holes across a road in the Num2 view, dark spots that went with
+                    // the camera); behind foliage stays as it was (leaves are thin).
+                    float4 pc = mul(float4(centre, 1), worldToPrevClip);
+                    float2 puv = float2(pc.x, -pc.y) / pc.w * 0.5 + 0.5;
+                    float3 c = colourTex.SampleLevel(linearClamp, puv, 0).rgb;
+                    if (pc.w > 0 && all(puv >= 0) && all(puv <= 1) && Finite3(c))
+                    {
+                        float trust = saturate(kColourTrust / dist);
+                        v.rgb = v.a > 0.01 ? lerp(v.rgb, clamp(c, 0, 8), 0.25 * trust) : clamp(c, 0, 8) * trust;
                         v.a = lerp(v.a, 1, 0.5);
                         if (track)
                             seen[id] = 1;
@@ -2148,14 +2399,8 @@ void update(uint3 id : SV_DispatchThreadID)
             }
         }
     }
-    // The z-prepass draws voxelized into this level (RunVoxelGeometry): the stamp of the last frame that drew into the
-    // cell; a recent one makes it solid, also where the screen never showed the surface (undersides, backs).
-    // Kept (mode < 0, CRYMT_GI_GEOMPERSIST): any stamp, until the screen shows the cell empty or it leaves the grid;
-    // else the last three voxelizations only (geometry the engine stopped drawing, a room seen through a portal once
-    // the camera left it, went from the grid: the GI jumped when entering).
-    uint geometry = prevGridMin.w > 0 && all(cell >= pg) && all(cell < pg + n) ? occupancy[id] : 0;
-    if ((geometry >> 8) >= (uint)prevGridMin.w || (mode < 0 && (geometry >> 8) > 0))
-        v.a = max(v.a, (geometry & 255) / 255.0); // solid 1, foliage CRYMT_GI_FOLIAGE (drawn without its alpha test)
+    if (stamped)
+        v.a = foliage ? lerp(v.a, stampA, 0.3) : max(v.a, stampA);
     voxels[id] = v;
 }
 
@@ -3211,6 +3456,10 @@ public:
     };
     std::vector<Output> outputs;
     int firstTexture = -1;
+    int diffuseSlot = -1; // the texture diffuseMapSampler (the z-prepass's alpha test reads its alpha), -1 none
+    bool refractive = false; // reads envMapSamplerRefl / envMapSamplerRefr: water, glass, liquids (no CryMT reflection)
+    int envCubeSlot = -1, env2DSlot = -1; // envMapSamplerCUBE ($EnvironmentCubeMap) / envMapSampler ($Env): the material's env map
+    bool water = false; // a vertex shader with the constant WaterLevel (WaterOcean.cfx, its z-prepass too): not voxel geometry
     bool discards = false;
     bool writesTarget1 = false; // a pixel shader writing SV_Target1 (the patched z-prepass: the foliage mask)
 
@@ -3264,12 +3513,38 @@ public:
             if (b.Type == D3D10_SIT_TEXTURE && b.Dimension == D3D10_SRV_DIMENSION_TEXTURE2D &&
                 (firstTexture < 0 || static_cast<int>(b.BindPoint) < firstTexture))
                 firstTexture = static_cast<int>(b.BindPoint);
+            if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "diffuseMapSampler") == 0)
+                diffuseSlot = static_cast<int>(b.BindPoint);
+            if (b.Type == D3D10_SIT_TEXTURE && b.Name && (strcmp(b.Name, "envMapSamplerRefl") == 0 || strcmp(b.Name, "envMapSamplerRefr") == 0))
+                refractive = true;
+            if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "envMapSamplerCUBE") == 0)
+                envCubeSlot = static_cast<int>(b.BindPoint);
+            if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "envMapSampler") == 0)
+                env2DSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_CBUFFER)
                 cbMask |= ((1u << b.BindCount) - 1) << b.BindPoint;
             else if (b.Type == D3D10_SIT_SAMPLER)
                 samplerEnd = std::max(samplerEnd, end);
             else
                 srvEnd = std::max(srvEnd, end);
+        }
+        for (UINT i = 0; i < d.ConstantBuffers && !water; i++)
+            if (ID3D10ShaderReflectionConstantBuffer* cb = r->GetConstantBufferByIndex(i))
+            {
+                D3D10_SHADER_BUFFER_DESC bd{};
+                if (SUCCEEDED(cb->GetDesc(&bd)))
+                    for (UINT j = 0; j < bd.Variables && !water; j++)
+                    {
+                        D3D10_SHADER_VARIABLE_DESC vd{};
+                        ID3D10ShaderReflectionVariable* var = cb->GetVariableByIndex(j);
+                        water = var && SUCCEEDED(var->GetDesc(&vd)) && vd.Name && strcmp(vd.Name, "WaterLevel") == 0;
+                    }
+            }
+        if (water)
+        {
+            static int logged;
+            if (logged++ < 4)
+                Log("ocean vertex shader recognized (WaterLevel), %u bytes", static_cast<unsigned>(code.size()));
         }
         for (UINT i = 0; i < d.OutputParameters; i++)
         {
@@ -3563,6 +3838,9 @@ struct Stats
     uint64_t depthToSrv, rtClears, dsClears;
     uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, voxPasses, giLateReads, giOtherDepth;
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
+    uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
+    uint64_t voxClass[4]; // z-prepass draws recorded: discard x diffuse map (0 neither, 1 diffuse only, 2 discard only, 3 both = foliage)
+    uint64_t voxPatch[5]; // solid z-prepass draws by their camera matrix: none, absolute, absolute transposed, relative, relative transposed
     uint64_t voxGeomMaterial, voxMaterialShaders;
     uint64_t foliageFrames; // BindFoliageMask: frames whose z-prepass wrote the foliage mask
     uint64_t vertices; // indices/vertices drawn (all passes)
@@ -4154,6 +4432,115 @@ public:
             Bind(m_stage[s].cb[start + i], buffers ? static_cast<Buffer12*>(buffers[i]) : nullptr);
     }
 
+    uint64_t m_envBinds = 0; // environment cube maps bound (per frame in the heap line)
+    Srv12* m_envTestCube = nullptr;
+    Srv12* m_envTest2D = nullptr;
+    bool m_envTestTried = false;
+
+    // A 4x4 texture of the CRYMT_ENVTEST colour (a cube: 6 faces).
+    Srv12* EnvTestTexture(bool cube)
+    {
+        const uint32_t c = EnvTestColour();
+        uint32_t texels[4 * 4 * 6];
+        for (uint32_t& x : texels)
+            x = 0xFF000000u | (c >> 16 & 0xFF) | (c & 0xFF00) | (c & 0xFF) << 16; // R8G8B8A8: R in the low byte
+        D3D10_TEXTURE2D_DESC d{4, 4, 1, cube ? 6u : 1u, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D10_USAGE_IMMUTABLE, D3D10_BIND_SHADER_RESOURCE, 0,
+                               cube ? static_cast<UINT>(D3D10_RESOURCE_MISC_TEXTURECUBE) : 0u};
+        D3D10_SUBRESOURCE_DATA init[6];
+        for (int f = 0; f < 6; f++)
+            init[f] = {texels + f * 16, 16, 64};
+        ID3D10Texture2D* tex = nullptr;
+        ID3D10ShaderResourceView* view = nullptr;
+        Srv12* out = nullptr;
+        if (SUCCEEDED(CreateTexture2D(&d, init, &tex)) && SUCCEEDED(CreateShaderResourceView(tex, nullptr, &view)))
+            out = static_cast<Srv12*>(static_cast<ID3D10ShaderResourceView1*>(view));
+        if (tex)
+            tex->Release(); // the view keeps it
+        return out;
+    }
+
+    // CRYMT_ENVMAP=voxels: the materials' environment maps from the voxel grid (with the GI's voxel part on).
+    // ... or the panel's Num0 on its environment page (CRYMT_GI_KEYS).
+    static bool EnvOn()
+    {
+        static int on = -1;
+        if (on < 0)
+        {
+            char v[16] = {};
+            on = GetEnvironmentVariableA("CRYMT_ENVMAP", v, sizeof(v)) && _stricmp(v, "voxels") == 0;
+        }
+        const int key = g_giControl.env;
+        return g_giControl.active && key >= 0 ? key == 1 : on == 1;
+    }
+
+    bool EnsureEnvTargets()
+    {
+        if (m_envAtlas[0] || m_envFailed)
+            return m_envAtlas[0] != nullptr;
+        m_envFailed = true;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = kEnvSize * 26;
+        d.Height = kEnvSize;
+        d.DepthOrArraySize = d.MipLevels = 1;
+        d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        d.SampleDesc.Count = 1;
+        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        for (int k = 0; k < 2; k++)
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                      k ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_envAtlas[k]))))
+            {
+                Log("environment maps: no atlas");
+                if (m_envAtlas[0])
+                    m_envAtlas[0]->Release();
+                m_envAtlas[0] = nullptr;
+                return false;
+            }
+        for (int k = 0; k < 3; k++)
+        {
+            D3D10_TEXTURE2D_DESC td{kEnvSize, kEnvSize, 1, k == 1 ? 1u : 6u, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0}, D3D10_USAGE_DEFAULT, D3D10_BIND_SHADER_RESOURCE, 0,
+                                    k == 1 ? 0u : static_cast<UINT>(D3D10_RESOURCE_MISC_TEXTURECUBE)};
+            ID3D10Texture2D* tex = nullptr;
+            ID3D10ShaderResourceView* view = nullptr;
+            if (SUCCEEDED(CreateTexture2D(&td, nullptr, &tex)) && SUCCEEDED(CreateShaderResourceView(tex, nullptr, &view)))
+                (k == 2 ? m_envCubeAll : k ? m_env2D : m_envCube) = static_cast<Srv12*>(static_cast<ID3D10ShaderResourceView1*>(view));
+            if (tex)
+                tex->Release(); // the view keeps it
+        }
+        if (!m_envCube || !m_env2D || !m_envCubeAll)
+        {
+            m_envAtlas[0]->Release();
+            m_envAtlas[1]->Release();
+            m_envAtlas[0] = m_envAtlas[1] = nullptr;
+            Log("environment maps: no cube or 2D map");
+            return false;
+        }
+        m_envFailed = false;
+        Log("environment maps from the voxel grid: %ux%u cube and 2D map, every 4th frame", kEnvSize, kEnvSize);
+        return true;
+    }
+
+    // What the material's environment map in this slot of the pixel shader is replaced by (null: kept): the CRYMT_ENVTEST
+    // colour (stage 0), or the maps from the voxel grid once they have been made.
+    Srv12* EnvSubstitute(int slot)
+    {
+        if (!m_ps || (slot != m_ps->envCubeSlot && slot != m_ps->env2DSlot) || m_ps->refractive)
+            return nullptr; // water, glass: their maps stay (the user: the river came out overbright)
+        if (EnvTestColour() == 0xFFFFFFFFu)
+            return EnvOn() && m_envReady ? (slot == m_ps->envCubeSlot ? m_envCube : m_env2D) : nullptr;
+        if (!m_envTestTried)
+        {
+            m_envTestTried = true;
+            m_envTestCube = EnvTestTexture(true);
+            m_envTest2D = EnvTestTexture(false);
+            Log("environment test textures %06x: cube %s, 2D %s", EnvTestColour(), m_envTestCube ? "ready" : "failed", m_envTest2D ? "ready" : "failed");
+        }
+        return slot == m_ps->envCubeSlot ? m_envTestCube : m_envTest2D;
+    }
+
     void SetShaderResources(Stage s, UINT start, UINT n, ID3D10ShaderResourceView* const* views)
     {
         StageState& st = m_stage[s];
@@ -4162,6 +4549,7 @@ public:
             auto* v = views ? static_cast<Srv12*>(static_cast<ID3D10ShaderResourceView1*>(views[i])) : nullptr;
             if (v && v->info->outputBound) // D3D10: a resource bound for output cannot be an input
                 v = nullptr;
+
             if (st.srv[start + i] != v)
             {
                 Bind(st.srv[start + i], v);
@@ -4258,6 +4646,9 @@ public:
         auto* v = static_cast<PS12*>(s);
         if (v != m_ps)
         {
+            const auto env = [](const PS12* p) { return p && (p->envCubeSlot >= 0 || p->env2DSlot >= 0); };
+            if (env(v) || env(m_ps))
+                m_stage[kPS].srvDirty = true;
             Bind(m_ps, v);
             m_psoDirty = true;
         }
@@ -4424,8 +4815,19 @@ public:
     }
 
     // ---- draws
+    // Where the ocean's draws come (for leaving it out of the voxels): logged for one frame in 600.
+    void NoteWaterDraw()
+    {
+        if (!m_vs || !m_vs->water || (m_giFrame % 600) != 7)
+            return;
+        Log("ocean draw at GI frame %llu: GI ran %d, rt0 format %d, scene depth %d, depth write %d, z-prepass recording %d",
+            static_cast<unsigned long long>(m_giFrame), m_giLastRun == m_giFrame ? 1 : 0, m_rtv[0] ? static_cast<int>(m_rtv[0]->format) : -1,
+            m_dsv && m_dsv->info == m_giSceneDepth ? 1 : 0, m_depth ? static_cast<int>(m_depth->d12.DepthWriteMask) : -1, VoxRecording() ? 1 : 0);
+    }
+
     void STDMETHODCALLTYPE DrawIndexed(UINT count, UINT start, INT base) override
     {
+        NoteWaterDraw();
         if (Apply(true))
         {
             m_list->DrawIndexedInstanced(count, 1, start, base, 0); m_stats.vertices += count;
@@ -4439,6 +4841,7 @@ public:
 
     void STDMETHODCALLTYPE Draw(UINT count, UINT start) override
     {
+        NoteWaterDraw();
         if (Apply(false))
         {
             m_list->DrawInstanced(count, 1, start, 0); m_stats.vertices += count;
@@ -4452,6 +4855,7 @@ public:
 
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT count, UINT instances, UINT start, INT base, UINT startInstance) override
     {
+        NoteWaterDraw();
         if (Apply(true))
         {
             m_list->DrawIndexedInstanced(count, instances, start, base, startInstance); m_stats.vertices += count * instances;
@@ -4465,6 +4869,7 @@ public:
 
     void STDMETHODCALLTYPE DrawInstanced(UINT count, UINT instances, UINT start, UINT startInstance) override
     {
+        NoteWaterDraw();
         if (Apply(false))
         {
             m_list->DrawInstanced(count, instances, start, startInstance); m_stats.vertices += count * instances;
@@ -5262,7 +5667,8 @@ public:
         float nearOcclusion = 0;           // CRYMT_GI_NEAROCC: strength of the near occlusion cones (0 none; Num3 sets 1)
         float sunAlbedo = 0.3f;            // CRYMT_GI_SUNALBEDO: the albedo assumed for sunlit geometry cells (0: none)
         float skyFill = 0.15f;             // CRYMT_GI_SKYFILL: their light from the sky, a share of the sun's
-        bool shadowGeometry = true;        // CRYMT_GI_SHADOWGEOM=0: the geometry from the z-prepass only (what is in view)
+        bool shadowGeometry = false;       // CRYMT_GI_SHADOWGEOM=1: also the shadow maps' casters (off: their vertex shaders
+                                           // put the depth elsewhere, none of their draws landed in the grid - a capture)
         float lampLight = 1.0f;            // CRYMT_GI_LAMPS: the lamps' light on the geometry's cells (0 none)
         bool lampTest = false;             // CRYMT_GI_LAMPTEST=1: also on cells the screen coloured (to see it in the voxel view)
         int mipOpacity = 4;                // CRYMT_GI_MIPOPACITY: coarse cells' opacity, 0 the mean, 1/2/3 by rays through, 4 per axis (downsample)
@@ -5279,12 +5685,12 @@ public:
                                            // SSAO's 44.1/69.8/54.2%; creases darker than the SSAO, open walls not darkened)
         bool replaceSsao = true;           // CRYMT_GI_SSAO=1: keep the engine's SSAO (on top of the GI's occlusion: it doubled
                                            // it; without GTAO the creases came out light, the user saw light in the corners)
-        int bakedOff = 0;                  // the baked occlusion the GI replaces, bits 2 the objects' RAM, 4 their sky amount,
-                                           // 8 TerrainAO (under trees: near the camera only, terrainAoNear), 16 the terrain's
-                                           // vertex AO: CRYMT_GI_BAKED=0 all, or a list of what goes (ram,sky,terrainao,vertex);
-                                           // default all the engine's (the user), key 9 TerrainAO near the camera
-        float terrainAoNear = 30.0f;       // CRYMT_GI_TERRAINAONEAR: metres up to which the GI replaces TerrainAO (then over
-                                           // half that again the engine's; far trees are sprites, beyond the voxels)
+        int bakedOff = 30;                 // the baked occlusion the GI replaces near the camera, bits 2 the objects' RAM, 4 their
+                                           // sky amount, 8 TerrainAO (under trees), 16 the terrain's vertex AO: by default all
+                                           // (the user: our GI near, the baked further, in full far away); CRYMT_GI_BAKED=engine
+                                           // none (the engine's everywhere, under the GI), or a list (ram,sky,terrainao,vertex)
+        float terrainAoNear = 30.0f;       // CRYMT_GI_TERRAINAONEAR: metres up to which the GI alone works; over 1.5 x that
+                                           // the GI fades out and the baked terms in (far trees are sprites, beyond the voxels)
         bool gtaoFull = false;             // CRYMT_GI_GTAOFULL=1: GTAO at full size (island 5120x1440: 3.5 ms against 1.2)
         bool gtaoNoFoliage = false;        // CRYMT_GI_GTAOFOLIAGE=0: grass and leaves (the foliage mask) occlude nothing in GTAO
                                            // (the user: plants looked worse without their occlusion)
@@ -5352,7 +5758,7 @@ public:
             read(L"CRYMT_GI_NEAROCC", v.nearOcclusion);
             read(L"CRYMT_GI_SUNALBEDO", v.sunAlbedo);
             read(L"CRYMT_GI_SKYFILL", v.skyFill);
-            v.shadowGeometry = !(GetEnvironmentVariableW(L"CRYMT_GI_SHADOWGEOM", text, 32) && wcscmp(text, L"0") == 0);
+            v.shadowGeometry = GetEnvironmentVariableW(L"CRYMT_GI_SHADOWGEOM", text, 32) && wcscmp(text, L"0") != 0;
             read(L"CRYMT_GI_LAMPS", v.lampLight);
             v.lampTest = GetEnvironmentVariableW(L"CRYMT_GI_LAMPTEST", text, 32) && wcscmp(text, L"0") != 0;
             if (GetEnvironmentVariableW(L"CRYMT_GI_MIPOPACITY", text, 32))
@@ -5370,7 +5776,7 @@ public:
             if (GetEnvironmentVariableW(L"CRYMT_GI_BAKED", text, 32))
             {
                 _wcslwr_s(text);
-                v.bakedOff = wcscmp(text, L"0") == 0 ? 30
+                v.bakedOff = wcscmp(text, L"0") == 0 ? 30 : wcscmp(text, L"engine") == 0 ? 0
                                                      : (wcsstr(text, L"ram") ? 2 : 0) | (wcsstr(text, L"sky") ? 4 : 0) | (wcsstr(text, L"terrainao") ? 8 : 0) |
                                                            (wcsstr(text, L"vertex") ? 16 : 0);
             }
@@ -5621,8 +6027,18 @@ public:
         g_wantPassMatrices.store(Gi().on && Gi().geometry && Gi().shadowGeometry, std::memory_order_relaxed);
         GiCamera(info);
         m_giInScene = info->valid != 0;
-        m_voxDraws.clear(); // a frame whose GI pass did not run leaves its draws
-        m_voxCameraCopies.clear();
+        // A frame whose GI pass did not run leaves its draws: dropped with the first camera of the next frame. Not at
+        // every camera: the engine sets the main camera again within a frame (before the z-prepass, the general pass,
+        // after the water), and that dropped the z-prepass draws recorded before it - CryMT's own z-prepass draws the
+        // solid geometry first - so the GI's voxels got the alpha-tested ones (foliage) and almost no ground, walls or
+        // rocks (the user: holes across roads, steps; a capture: 1003 solid draws recorded a frame, 17 voxelized).
+        const uint64_t frame = g_presented.load(std::memory_order_relaxed);
+        if (frame != m_voxDrawsFrame)
+        {
+            m_voxDraws.clear();
+            m_voxCameraCopies.clear();
+            m_voxDrawsFrame = frame;
+        }
     }
 
     // The main camera of the frame being drawn (stream order: before its draws), for the GI pass.
@@ -5768,11 +6184,11 @@ public:
             Log("GI: no shader compiler");
             return false;
         }
-        ID3DBlob* code[12] = {};
+        ID3DBlob* code[13] = {};
         ID3DBlob* errors = nullptr;
-        const char* entries[12] = {"trace", "filter", "motion", "upsample", "camera", "exposure", "sanitize", "sanitizeOut", "gtao", "gtaoBlur", "gtaoApply",
-                                   "pvolume"};
-        for (int i = 0; i < 12; i++)
+        const char* entries[13] = {"trace", "filter", "motion", "upsample", "camera", "exposure", "sanitize", "sanitizeOut", "gtao", "gtaoBlur", "gtaoApply",
+                                   "pvolume", "envmap"};
+        for (int i = 0; i < 13; i++)
             if (FAILED(compile(kGiShader, strlen(kGiShader), "CryMT_GI", nullptr, nullptr, entries[i], "cs_5_0", 1 << 15 /* OPTIMIZATION_LEVEL3 */, 0,
                                &code[i], &errors)))
             {
@@ -5813,9 +6229,9 @@ public:
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = m_giRoot;
         HRESULT hr = S_OK;
-        ID3D12PipelineState** psos[12] = {&m_giPso, &m_giPsoFilter, &m_mvPso, &m_giPsoUpsample, &m_giPsoCamera, &m_expPso, &m_sanPso, &m_sanOutPso,
-                                          &m_aoPso, &m_aoBlurPso, &m_aoApplyPso, &m_pvolPso};
-        for (int i = 0; i < 12; i++)
+        ID3D12PipelineState** psos[13] = {&m_giPso, &m_giPsoFilter, &m_mvPso, &m_giPsoUpsample, &m_giPsoCamera, &m_expPso, &m_sanPso, &m_sanOutPso,
+                                          &m_aoPso, &m_aoBlurPso, &m_aoApplyPso, &m_pvolPso, &m_envPso};
+        for (int i = 0; i < 13; i++)
         {
             pd.CS = {code[i]->GetBufferPointer(), code[i]->GetBufferSize()};
             if (SUCCEEDED(hr))
@@ -5908,7 +6324,7 @@ public:
         // Three tables of 6: trace (depth, colour, -, raw out, -, -), filter (depth, raw, previous GI, new GI out,
         // distance out, previous distance) and upsample (depth, new GI, -, full-size out, distances, -).
         const UINT aoTables = 24 + 2 * kVoxLevels + 2; // then three tables of 6 for the GTAO passes
-        while (!m_srvRing.TryAlloc(aoTables + 24, cpu, gpu))
+        while (!m_srvRing.TryAlloc(aoTables + 30, cpu, gpu))
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -6020,6 +6436,14 @@ public:
                     g.dev->CreateUnorderedAccessView(m_pvol, nullptr, nullptr, at(b3 + i));
                 else
                     g.dev->CreateUnorderedAccessView(m_giFull, nullptr, nullptr, at(b3 + i));
+            // The environment maps: (depth, the previous frame's colour, -, atlas out, -, -).
+            const int b4 = b0 + 24;
+            g.dev->CreateShaderResourceView(depth->res, &sd, at(b4));
+            g.dev->CreateShaderResourceView(m_giColor, nullptr, at(b4 + 1));
+            const bool env = EnvOn() && EnsureEnvTargets();
+            g.dev->CreateShaderResourceView(env ? m_envAtlas[m_envCur ^ 1] : m_giHist[prev], nullptr, at(b4 + 2));
+            for (int i = 3; i < 6; i++)
+                g.dev->CreateUnorderedAccessView(env ? m_envAtlas[m_envCur] : m_giFull, nullptr, nullptr, at(b4 + i));
         }
         // History reprojection: this view to the world, then the previous view and projection. A camera cut has none.
         float toWorld[16], toPrevView[16], reproj[16];
@@ -6099,6 +6523,44 @@ public:
             m_list->Dispatch(1, 1, 1);
         }
         GiStamp(1);
+        // Environment maps from the grid, every 4th frame: the atlas into the cube's faces and the 2D map.
+        if (cones && EnvOn() && m_envPso && m_envAtlas[0] && (m_giFrame & 3) == 0)
+        {
+            ID3D12Resource* cur = m_envAtlas[m_envCur];
+            ID3D12Resource* other = m_envAtlas[m_envCur ^ 1];
+            m_list->SetPipelineState(m_envPso);
+            m_list->SetComputeRootDescriptorTable(1, {gpu.ptr + (aoTables + 24) * g.srvInc});
+            const bool keys = g_giControl.active;
+            const float scales[2] = {keys ? g_giControl.envOwnScale.load() : 1.0f, keys ? g_giControl.envAllScale.load() : 1.0f};
+            m_list->SetComputeRoot32BitConstants(0, 2, scales, 16);
+            m_list->Dispatch(kEnvSize * 13 / 8, kEnvSize / 8, 1);
+            m_list->SetComputeRoot32BitConstants(0, 2, c + 16, 16); // the reprojection the later passes read
+            D3D12_RESOURCE_BARRIER toCopy = Transition(cur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            m_list->ResourceBarrier(1, &toCopy);
+            Require(m_envCube->info, D3D12_RESOURCE_STATE_COPY_DEST);
+            Require(m_env2D->info, D3D12_RESOURCE_STATE_COPY_DEST);
+            Require(m_envCubeAll->info, D3D12_RESOURCE_STATE_COPY_DEST);
+            FlushBarriers();
+            // Squares 13..18 the materials' cube, 19 their 2D map, 20..25 the cube for every material (each with its
+            // strength; 0..12 are the pass's history).
+            for (UINT f = 0; f < 13; f++)
+            {
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                dst.pResource = f < 6 ? m_envCube->info->res : f == 6 ? m_env2D->info->res : m_envCubeAll->info->res;
+                dst.Type = src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = f < 6 ? f : f == 6 ? 0 : f - 7; // one mip
+                src.pResource = cur;
+                const UINT sq = 13 + f;
+                const D3D12_BOX box{sq * kEnvSize, 0, 0, (sq + 1) * kEnvSize, kEnvSize, 1};
+                m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+            }
+            // This run's atlas is read by the next; the previous one is written then.
+            D3D12_RESOURCE_BARRIER swap[2] = {Transition(cur, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                                              Transition(other, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+            m_list->ResourceBarrier(2, swap);
+            m_envCur ^= 1;
+            m_envReady = true;
+        }
         D3D12_RESOURCE_BARRIER rawRead = Transition(m_giRaw, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         m_list->ResourceBarrier(1, &rawRead);
         m_list->SetPipelineState(m_giPsoFilter);
@@ -6238,6 +6700,11 @@ public:
         }
         else
             GiStamp(4);
+        // Where the ocean comes in the z-prepass (decides how the voxels' depth can leave it out), now and then.
+        if (m_firstWaterZ > 0 && (m_giFrame % 600) == 0)
+            Log("z-prepass at frame %llu: %d draws recorded, the ocean's first is #%d", static_cast<unsigned long long>(m_giFrame), m_zDraws, m_firstWaterZ);
+        m_zDraws = 0;
+        m_firstWaterZ = -1;
         GiStamp(5);
         if (m_giStamps)
         {
@@ -6428,6 +6895,7 @@ public:
         INT base;
         D3D12_GPU_VIRTUAL_ADDRESS cb[kRootCbSlots[kVS]];
         bool foliage; // the z-prepass pixel shader discards (alpha test): leaves, grass
+        bool dissolve; // it discards for the LOD dissolve only (no diffuse map): solid
         const VS12* vs;                   // its outputs (the material pixel shader's input)
         int texture;                      // the z-prepass PS's first 2D texture slot, -1 none
         D3D12_GPU_DESCRIPTOR_HANDLE psSrv; // that PS's texture table as applied
@@ -6442,6 +6910,11 @@ public:
     {
         std::vector<uint8_t> bytes;
         std::vector<VoxCameraPatch> patches;
+        // Shadow maps: their vertex shader divides the depth row by the light frustum's far distance (cb5
+        // PER_SHADOWGEN, GS_VS_FrustrumInfo.y: o0.z = (row 2 . p) / y * w), so the orthographic depth row is multiplied
+        // by it. Without it every shadow draw landed in the first slice, which is left out: no geometry from the shadow
+        // maps at all (a capture's vertex shader showed it).
+        float zScale = 1.0f;
     };
 
     // A z-prepass draw of the scene: before this frame's GI pass, into the scene's depth with the R32F target.
@@ -6511,8 +6984,17 @@ public:
         return found;
     }
 
+    int m_zDraws = 0, m_firstWaterZ = -1; // this frame's z-prepass draws seen by RecordVoxDraw, the first ocean one among them
+    uint64_t m_voxDrawsFrame = ~0ull;     // the frame (g_presented) whose z-prepass draws m_voxDraws holds
+
     void RecordVoxDraw(bool shadow, bool indexed, UINT count, UINT instances, UINT start, INT base, UINT startInstance)
     {
+        if (!shadow && m_vs)
+        {
+            m_zDraws++;
+            if (m_vs->water && m_firstWaterZ < 0)
+                m_firstWaterZ = m_zDraws;
+        }
         // Draws that leave no depth are no geometry: the sky's z-prepass draw (Sky.cfx ZPass: no pixel shader, depth
         // writes off) is a box around the camera and stood in the voxels as one (the user: a cube like a sky dome in
         // the Num2 view once voxel geometry was on by default).
@@ -6526,13 +7008,27 @@ public:
             m_stats.voxGeomSkipped++;
             return;
         }
+        // The ocean's surface (its waves) is no geometry for the GI: the user saw voxels on the waves.
+        if (m_vs->water)
+        {
+            m_stats.voxGeomSkipped++;
+            return;
+        }
         auto& cameras = shadow ? m_shadowCamera : m_voxCamera;
         // Alpha-tested materials (the z-prepass pixel shader discards): leaves, grass. With their texture (the material
         // pass) they are voxelized by the shape of the leaves; CRYMT_GI_GEOMETRY=2 keeps them also without one.
-        const bool foliage = m_ps && m_ps->discards;
+        // Alpha-tested: the z-prepass discards by the diffuse map's alpha (CommonZPass.cfi %_RT_ALPHATEST). Its LOD
+        // dissolve (%_RT_DISSOLVE, on most objects: clip by a noise texture) discards too, and was taken for foliage:
+        // the ground and most solid objects went in half open and cut by their diffuse map's alpha (gloss there), the
+        // user's holes across roads and dark spots (the capture: every level-0 stamp had foliage's opacity).
+        const bool foliage = m_ps && m_ps->discards && m_ps->diffuseSlot >= 0;
+        if (!shadow)
+            m_stats.voxClass[(m_ps && m_ps->discards ? 2 : 0) + (m_ps && m_ps->diffuseSlot >= 0 ? 1 : 0)]++;
         auto it = cameras.find(m_vs->contentHash);
         if (it == cameras.end())
             it = cameras.emplace(m_vs->contentHash, shadow ? FindShadowMatrices() : FindCameraMatrices()).first;
+        if (!shadow && !foliage)
+            m_stats.voxPatch[it->second.empty() ? 0 : 1 + (it->second[0].zero ? 2 : 0) + (it->second[0].transposed ? 1 : 0)]++;
         if (it->second.empty())
         {
             (shadow ? m_stats.voxShadowNoCamera : m_stats.voxGeomNoCamera)++;
@@ -6553,8 +7049,10 @@ public:
         d.base = base;
         d.startInstance = startInstance;
         d.foliage = foliage;
+        d.dissolve = m_ps && m_ps->discards && !foliage;
         d.vs = m_vs;
-        d.texture = m_ps && m_ps->firstTexture >= 0 && m_stage[kPS].srvTable.ptr ? m_ps->firstTexture : -1;
+        // The material's colour from its diffuse map (the dissolve variant reads only its noise texture: none then).
+        d.texture = m_ps && m_ps->diffuseSlot >= 0 && m_stage[kPS].srvTable.ptr ? m_ps->diffuseSlot : -1;
         d.psSrv = m_stage[kPS].srvTable;
         const StageState& st = m_stage[kVS];
         memcpy(d.cb, st.cbApplied, sizeof(d.cb));
@@ -6569,7 +7067,16 @@ public:
             }
             VoxCameraCopy& copy = (shadow ? m_shadowCopies : m_voxCameraCopies)[d.cb[p.slot]];
             if (copy.bytes.empty())
+            {
                 copy.bytes.assign(b->slice.cpu, b->slice.cpu + b->desc.ByteWidth);
+                const Buffer12* frustum = st.cb[5];
+                if (shadow && (m_vs->cbMask >> 5 & 1) && frustum && frustum->Dynamic() && frustum->slice.cpu)
+                {
+                    const float lightFar = reinterpret_cast<const float*>(frustum->slice.cpu)[1];
+                    if (lightFar > 1.0f && lightFar < 1e9f)
+                        copy.zScale = lightFar;
+                }
+            }
             bool known = false;
             for (const VoxCameraPatch& q : copy.patches)
                 known = known || (q.offset == p.offset && q.zero == p.zero);
@@ -6964,6 +7471,14 @@ public:
                 for (const VoxCameraPatch& p : copy.patches)
                 {
                     const float* m = p.zero ? orthoZero : ortho;
+                    float scaled[16];
+                    if (copy.zScale != 1.0f)
+                    {
+                        memcpy(scaled, m, sizeof(scaled));
+                        for (int i = 0; i < 4; i++)
+                            scaled[i * 4 + 2] *= copy.zScale; // the depth output's column (row vectors)
+                        m = scaled;
+                    }
                     for (int r = 0; r < 4; r++)
                         for (int c = 0; c < 4; c++)
                             f[p.offset + r * 4 + c] = p.transposed ? m[c * 4 + r] : m[r * 4 + c];
@@ -6996,8 +7511,15 @@ public:
                                         static_cast<float>(kVoxN), static_cast<float>(job.axis), static_cast<float>(stamp), 0, 0};
             m_list->SetGraphicsRoot32BitConstants(kVoxGeomConstants, 8, constants, 0);
             m_list->SetGraphicsRootDescriptorTable(kVoxGeomUav, {gpu.ptr + 2 * l * g.srvInc});
+            // Solid geometry first, then foliage, each under its own name (captures tell them apart).
+            for (int part = 0; part < 2; part++)
+            {
+            PassName(job.shadow ? (part ? "CryMT GI geometry: shadow foliage" : "CryMT GI geometry: shadow solid")
+                                : (part ? "CryMT GI geometry: foliage" : "CryMT GI geometry: solid"));
             for (const VoxDraw& d : *job.draws)
             {
+                if (d.foliage != (part == 1))
+                    continue;
                 // The material shader where the z-prepass PS reads a texture; else the plain one, which alpha-tested
                 // materials only get with CRYMT_GI_GEOMETRY=2 (whole cards would fill the cells).
                 ID3DBlob* ps = d.texture >= 0 && Gi().materials ? MaterialPs(d.vs, d.texture, compiled) : nullptr;
@@ -7023,7 +7545,8 @@ public:
                     if (counted)
                         m_stats.voxGeomMaterial++;
                 }
-                const float job2[2] = {d.foliage ? Gi().foliageOpacity : 1.0f, d.foliage ? 1.0f : 0.0f};
+                // Opacity: foliage CRYMT_GI_FOLIAGE, solid 1 (254 / 255 with the LOD dissolve: a mark in captures).
+                const float job2[2] = {d.foliage ? Gi().foliageOpacity : d.dissolve ? 254.0f / 255.0f : 1.0f, d.foliage ? 1.0f : 0.0f};
                 m_list->SetGraphicsRoot32BitConstants(kVoxGeomConstants, 2, job2, 6);
                 m_list->IASetPrimitiveTopology(static_cast<D3D12_PRIMITIVE_TOPOLOGY>(d.topology));
                 m_list->IASetVertexBuffers(0, d.vbCount, d.vb);
@@ -7043,6 +7566,10 @@ public:
                     m_stats.voxGeomDraws++;
                 else if (job.shadow)
                     m_stats.voxShadowDraws++;
+                if (counted && !d.foliage)
+                    m_stats.voxGeomSolid++;
+            }
+            PassNameEnd();
             }
             D3D12_RESOURCE_BARRIER barrier{};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -7132,7 +7659,11 @@ public:
                     NullSrv(at(b));
                     NullSrv(at(b + 1));
                 }
-                NullSrv(at(b + 2));
+                // t2: the foliage mask for the update (leaves are not walls; nothing filled behind them), when it fits.
+                if (t == 0 && m_foliageSrv && m_foliageW == m_giFullW && m_foliageH == m_giFullH)
+                    g.dev->CreateShaderResourceView(m_foliageSrv->info->res, nullptr, at(b + 2));
+                else
+                    NullSrv(at(b + 2));
                 VoxUav(at(b + 3), t == 0 ? 0 : static_cast<int>(t) - 1, l);
                 if (t == 0)
                     OccupancyUav(at(b + 4), geometry && l < kVoxGeomLevels ? l : -1); // the update's u1 (a null 3D view without geometry)
@@ -7264,6 +7795,24 @@ public:
         };
         char buf[96];
         std::vector<Line> lines;
+        if (g_giControl.page == 1)
+        {
+            lines.push_back({"", "CryMT environment maps", "", value});
+            if (!b.on)
+                lines.push_back({"", "They need the GI on (GI=1)", "", off});
+            const bool envOn = EnvOn();
+            lines.push_back({"Num0", "Reflections", envOn ? "VOXEL CUBE" : "GAME'S MAPS", envOn ? on : off});
+            const bool all = g_giControl.envAll;
+            lines.push_back({"Num1", "On every material", all ? "ON" : "OFF", all ? on : off});
+            snprintf(buf, sizeof(buf), "x%.1f", g_giControl.envOwnScale.load());
+            lines.push_back({"Num4 Num7", "Materials with a map -/+", buf, value});
+            snprintf(buf, sizeof(buf), "x%.1f", g_giControl.envAllScale.load());
+            lines.push_back({"Num5 Num8", "Every material -/+", buf, value});
+            lines.push_back({"", "(not vegetation, terrain)", "", white});
+            lines.push_back({"Num*", "Reset   Num/ hide panel", "", white});
+        }
+        else
+        {
         lines.push_back({"", "CryMT GI", "", value});
         if (!b.on)
             lines.push_back({"", "GI is off in CryMT.ini (GI=1)", "", off});
@@ -7288,7 +7837,7 @@ public:
             for (int i = 0; i < 4; i++)
             {
                 const bool kept = (bakedOff & (2 << i)) == 0;
-                lines.push_back({keys[i], names[i], kept ? "ENGINE" : i == 2 ? "NEAR: GI" : "OFF", kept ? on : off});
+                lines.push_back({keys[i], names[i], kept ? "ENGINE" : "GI -> BAKED", kept ? off : on});
             }
         }
         snprintf(buf, sizeof(buf), "x%.1f", g_giControl.occlusionScale.load());
@@ -7308,7 +7857,8 @@ public:
         snprintf(buf, sizeof(buf), "Time %02d:%02d", start / 60, start % 60);
         lines.push_back({"Num6", buf, "", white});
         lines.push_back({"Num+ Num-", "Time +/- 1 hour", "", white});
-        lines.push_back({"Num*", "Reset   Num/ hide panel", "", white});
+        lines.push_back({"Num*", "Reset   Num/ reflections", "", white});
+        }
         std::string text;
         for (const Line& l : lines)
             text += l.keys + "|" + l.label + "|" + l.state + "\n";
@@ -8245,6 +8795,13 @@ private:
     ID3D12PipelineState* m_aoBlurPso = nullptr;
     ID3D12PipelineState* m_aoApplyPso = nullptr;
     ID3D12PipelineState* m_pvolPso = nullptr; // the particles' occlusion volume (pvolume)
+    ID3D12PipelineState* m_envPso = nullptr;  // environment maps from the voxel grid (envmap)
+    ID3D12Resource* m_envAtlas[2] = {};       // its output (13 squares of kEnvSize) and the previous run's: the one written
+    int m_envCur = 0;                         // next is UNORDERED_ACCESS, the other NON_PIXEL_SHADER_RESOURCE
+    Srv12* m_envCube = nullptr;               // the cube and the 2D map the materials get (EnvSubstitute)
+    Srv12* m_env2D = nullptr;
+    Srv12* m_envCubeAll = nullptr;            // the cube for fragLib's reflection on every material
+    bool m_envReady = false, m_envFailed = false;
     ID3D12Resource* m_pvol = nullptr;         // its atlas: 1024 x 513 RGBA32F (fine, coarse; shares, place row, tints), pvol.dds
     D3D12_CPU_DESCRIPTOR_HANDLE m_pvolCpu{};  // its view for the pixel shaders
     bool m_pvolBuilt = false;                 // written by a GI pass (else the placeholder: no change)
@@ -8886,6 +9443,19 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
         }
     if (s == kPS && m_giSrv)
         Require(m_giSrv->info, kSrvState);
+    Srv12* envSub[2] = {};
+    Srv12* envAll = s == kPS && EnvOn() && m_envReady && (!g_giControl.active || g_giControl.envAll) && m_ps && !m_ps->refractive
+                        ? m_envCubeAll : nullptr; // fragLib's, every material but water and glass (black placeholder there)
+    if (envAll && st.srvDirty)
+        Require(envAll->info, kSrvState);
+    if (s == kPS && m_ps && st.srvDirty)
+        for (int k = 0; k < 2; k++)
+            if (const int slot = k ? m_ps->env2DSlot : m_ps->envCubeSlot; slot >= 0 && slot < static_cast<int>(kTableSrvs) && st.srv[slot])
+                if ((envSub[k] = EnvSubstitute(slot)))
+                {
+                    Require(envSub[k]->info, kSrvState);
+                    m_envBinds++;
+                }
     // The table always holds all bound views (and the GI slot), so a later shader reading further slots finds them.
     if (srvEnd && st.srvDirty)
     {
@@ -8909,6 +9479,12 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = m_giCpu; // not a pass of long ago (frames without a main camera: the binoculars' frozen GTAO)
             if (v && s == kPS && m_jitterCpu.ptr && v->info == g_jitterPlaceholder)
                 src[i] = m_jitterCpu;
+            if (v && envSub[0] && static_cast<int>(i) == m_ps->envCubeSlot)
+                src[i] = envSub[0]->cpu;
+            if (v && envAll && v->info == g_envPlaceholder)
+                src[i] = envAll->cpu;
+            if (v && envSub[1] && static_cast<int>(i) == m_ps->env2DSlot)
+                src[i] = envSub[1]->cpu;
             if (v && s == kPS && m_foliageSrv && v->info == g_foliagePlaceholder)
                 src[i] = m_foliageSrv->cpu;
             if (v && s == kPS && m_pvolBuilt && m_pvolCpu.ptr && v->info == g_pvolPlaceholder && Gi().on && Gi().particlesGi)
@@ -9094,6 +9670,8 @@ HRESULT Device::CreateBuffer(const D3D10_BUFFER_DESC* desc, const D3D10_SUBRESOU
         b->slice = g_slices.Alloc(desc->ByteWidth);
         if (!b->slice.cpu)
         {
+            Log("CreateBuffer: no upload memory for a dynamic buffer of %u bytes (pages %llu), device removed reason %08lx", desc->ByteWidth,
+                static_cast<unsigned long long>(g_slices.pages), static_cast<unsigned long>(g.dev->GetDeviceRemovedReason()));
             b->Release();
             return E_OUTOFMEMORY;
         }
@@ -9119,6 +9697,8 @@ HRESULT Device::CreateBuffer(const D3D10_BUFFER_DESC* desc, const D3D10_SUBRESOU
         b->block = g_blocks.Alloc(desc->ByteWidth);
         if (!b->block.page)
         {
+            Log("CreateBuffer: no default buffer memory for %u bytes (pages %llu), device removed reason %08lx", desc->ByteWidth,
+                static_cast<unsigned long long>(g_blocks.pages), static_cast<unsigned long>(g.dev->GetDeviceRemovedReason()));
             b->Release();
             return E_OUTOFMEMORY;
         }
@@ -9298,6 +9878,37 @@ HRESULT Device::CreateTexture1D(const D3D10_TEXTURE1D_DESC* desc, const D3D10_SU
 // Textures/CryMT/gi.dds: CryMT's own 4x1 all-zero placeholder, the texture of the GI sampler in the patched fragLib.cfi
 // and terrain.cfx (CryMT_GIAmbient: ambient * (1 - a) + rgb). The engine loads and binds it like any texture; pixel
 // shaders see CryMT's GI texture in its place, and without CryMT's back end its zeros leave the ambient as it was.
+// The materials' environment cube maps (envMapSamplerCUBE = $EnvironmentCubeMap in the game's shaders: all 1824
+// Environment slots of the shipped .mtl files are files such as textures/cubemaps/beach_blur.dds): cube textures created
+// with data and only read by shaders. Render-target cubes (the engine's own dynamic ones, light cubes) are not.
+bool IsEnvCube(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
+{
+    return (d.MiscFlags & D3D10_RESOURCE_MISC_TEXTURECUBE) && init && init->pSysMem && d.BindFlags == D3D10_BIND_SHADER_RESOURCE &&
+           d.Usage != D3D10_USAGE_DYNAMIC && d.Width >= 8;
+}
+
+// Stage 0 of the dynamic environment maps, a test: CRYMT_ENVTEST=RRGGBB replaces every environment cube map with one
+// cube of that colour, so which materials read them shows on screen.
+uint32_t EnvTestColour()
+{
+    static int colour = -2;
+    if (colour == -2)
+    {
+        char v[16] = {};
+        colour = GetEnvironmentVariableA("CRYMT_ENVTEST", v, sizeof(v)) ? static_cast<int>(strtoul(v, nullptr, 16) & 0xFFFFFF) : -1;
+    }
+    return static_cast<uint32_t>(colour);
+}
+
+// Textures/CryMT/env.dds (CryMTSettings): a 4x4 cube, black, face 0's second texel E7000000 (the mark, alpha only).
+bool IsEnvPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
+{
+    if (!init || !init->pSysMem || !(d.MiscFlags & D3D10_RESOURCE_MISC_TEXTURECUBE) || d.Width != 4 || d.Height != 4 || d.ArraySize != 6)
+        return false;
+    const auto* p = static_cast<const uint32_t*>(init->pSysMem);
+    return p[0] == 0 && p[1] == 0xE7000000u;
+}
+
 bool IsGiPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
 {
     if (!init || !init->pSysMem || d.Width != 4 || d.Height != 1 || d.ArraySize != 1 ||
@@ -9369,6 +9980,25 @@ HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SU
     {
         t->Release();
         return hr;
+    }
+    if (IsEnvPlaceholder(*desc, init))
+    {
+        g_envPlaceholder = Info(t);
+        Log("environment placeholder texture recognized");
+    }
+    else if (IsEnvCube(*desc, init))
+    {
+        Info(t)->envCube = true;
+        static int logged;
+        if (logged++ < 64)
+            Log("environment cube %u: %ux%u, %u mips, format %d", logged, desc->Width, desc->Height, desc->MipLevels, static_cast<int>(desc->Format));
+    }
+    else if (desc->MiscFlags & D3D10_RESOURCE_MISC_TEXTURECUBE)
+    {
+        static int logged;
+        if (logged++ < 32)
+            Log("other cube texture: %ux%u, %u mips, format %d, bind 0x%x, usage %d, data %d", desc->Width, desc->Height, desc->MipLevels,
+                static_cast<int>(desc->Format), desc->BindFlags, static_cast<int>(desc->Usage), init && init->pSysMem ? 1 : 0);
     }
     if (IsGiPlaceholder(*desc, init))
     {
@@ -10275,6 +10905,29 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
     m_frame++;
     m_stats.frames++;
     g_presented++;
+    // Buffer memory over a long session (a heap that only grows ends in the engine's "Pipeline buffer overflow. Current
+    // geometry cannot fit in video memory" when a page can no longer be created).
+    if (m_frame % 3600 == 0)
+    {
+        // With the video memory the process uses against the budget Windows gives it (DXGI, local = the card's own).
+        static IDXGIAdapter3* a3;
+        if (!a3)
+            g.factory->EnumAdapterByLuid(g.dev->GetAdapterLuid(), __uuidof(IDXGIAdapter3), reinterpret_cast<void**>(&a3));
+        DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+        if (a3)
+        {
+            a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
+            a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared);
+        }
+        static uint64_t envBindsBefore;
+        Log("environment cube binds per frame: %.1f", (g_device->m_envBinds - envBindsBefore) / 3600.0);
+        envBindsBefore = g_device->m_envBinds;
+        Log("heaps at frame %llu: video memory %.0f of %.0f MB, shared %.0f MB; upload pages %llu (+%llu dedicated), %.1f MB in free lists; "
+            "default pages %llu (+%llu dedicated), %.1f MB in free lists",
+            static_cast<unsigned long long>(m_frame), local.CurrentUsage / 1048576.0, local.Budget / 1048576.0, shared.CurrentUsage / 1048576.0,
+            static_cast<unsigned long long>(g_slices.pages), static_cast<unsigned long long>(g_slices.dedicated), g_slices.FreeBytes() / 1048576.0,
+            static_cast<unsigned long long>(g_blocks.pages), static_cast<unsigned long long>(g_blocks.dedicated), g_blocks.FreeBytes() / 1048576.0);
+    }
     WaitFence(m_frameFences[m_frame % kFramesInFlight]);
     if (GetTickCount() - g_pipes.savedAt > 5000)
     {
@@ -10812,6 +11465,11 @@ void Dx12WriteStats(FILE* f, double frames)
             static_cast<unsigned long long>(s.giOtherDepth));
     fprintf(f, "  GI geometry: z-prepass draws voxelized %.1f per frame (with their material %.1f), foliage left out %.1f, skipped without the camera matrix %.1f, other %.1f, without a pipeline %.1f; pipelines %llu\n",
             s.voxGeomDraws / frames, s.voxGeomMaterial / frames, s.voxGeomFoliage / frames, s.voxGeomNoCamera / frames, s.voxGeomSkipped / frames, s.voxGeomNoPso / frames, static_cast<unsigned long long>(s.voxGeomPsos));
+    fprintf(f, "  GI geometry, z-prepass draws by their pixel shader: plain %.1f, diffuse map only %.1f, discard only (LOD dissolve) %.1f, discard and diffuse map (alpha test: foliage) %.1f per frame\n",
+            s.voxClass[0] / frames, s.voxClass[1] / frames, s.voxClass[2] / frames, s.voxClass[3] / frames);
+    fprintf(f, "  GI geometry: solid draws voxelized into level 0 %.1f per frame\n", s.voxGeomSolid / frames);
+    fprintf(f, "  GI geometry, solid z-prepass draws by their camera matrix: none %.1f, absolute %.1f, absolute transposed %.1f, relative %.1f, relative transposed %.1f per frame\n",
+            s.voxPatch[0] / frames, s.voxPatch[1] / frames, s.voxPatch[2] / frames, s.voxPatch[3] / frames, s.voxPatch[4] / frames);
     fprintf(f, "  drawn: %.2f M vertices/indices per frame (all passes; triangle lists: / 3)\n", s.vertices / frames / 1e6);
     fprintf(f, "  foliage mask: written in %llu frames; R32F draws with depth %.1f per frame, with SV_Target1 %.1f\n", static_cast<unsigned long long>(s.foliageFrames),
             s.zpassDraws / frames, s.zpassTarget1 / frames);

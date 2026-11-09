@@ -116,6 +116,20 @@ void Poll(bool focus)
 {
     if (!g_api)
         return;
+    // CRYMT_RENDERDOC_AT=<seconds>: one capture that long after the first frame (tests without a key press).
+    static ULONGLONG first, at = ~0ull;
+    if (!first)
+    {
+        first = GetTickCount64();
+        wchar_t value[16] = {};
+        if (GetEnvironmentVariableW(L"CRYMT_RENDERDOC_AT", value, 16))
+            at = first + static_cast<ULONGLONG>(_wtof(value) * 1000.0);
+    }
+    if (GetTickCount64() >= at)
+    {
+        at = ~0ull;
+        Trigger();
+    }
     const bool down = focus && (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
     if (down && !g_keyDown)
         Trigger();

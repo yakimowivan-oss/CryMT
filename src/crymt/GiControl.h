@@ -22,5 +22,10 @@ struct GiControl
     std::atomic<float> occlusionScale{1.0f}, bounceScale{1.0f};
     std::atomic<float> timeOfDay{-1.0f}; // the time of day as main last read it (hours), -1 unknown
     std::atomic<float> startTime{11.5f}; // Num6 goes back to it (CRYMT_GI_STARTTIME, else 11:30)
+    // Num/ pages: 0 GI, 1 environment maps (the numpad's switches below while it shows; the time keys on both).
+    std::atomic<int> page{0};
+    std::atomic<int> env{-1};          // Num0: environment maps 1 from the voxel grid, 0 the game's; -1 as CRYMT_ENVMAP says
+    std::atomic<bool> envAll{true};    // Num1: the reflection on every material (fragLib), not only those with their own map
+    std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // Num4/Num7, Num5/Num8: their strengths
 };
 extern GiControl g_giControl;
