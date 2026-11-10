@@ -1485,6 +1485,11 @@ PresentFn g_presentOriginal;
 const void* g_presentVtable;
 bool g_asyncPresent = true;
 uint64_t g_lastPresentPos, g_presentsAsync;
+// CRYMT_PRESENTQUEUE (1-3, default 1): how many recorded presents may wait for the stream thread before the render
+// thread waits for the oldest (more lets the render thread run ahead by up to that many frames: higher latency).
+int g_presentQueue = 1;
+uint64_t g_presentPos[4];
+uint64_t g_presentIndex;
 std::atomic<HRESULT> g_presentResult{S_OK};
 
 HRESULT STDMETHODCALLTYPE StreamPresent(IDXGISwapChain* self, UINT sync, UINT flags)
@@ -1494,7 +1499,7 @@ HRESULT STDMETHODCALLTYPE StreamPresent(IDXGISwapChain* self, UINT sync, UINT fl
         StreamSync(kSyncPresent);
         return g_presentOriginal(self, sync, flags);
     }
-    StreamWaitFor(g_lastPresentPos, kSyncPresent);
+    StreamWaitFor(g_presentIndex >= static_cast<uint64_t>(g_presentQueue) ? g_presentPos[(g_presentIndex - g_presentQueue) % 4] : 0, kSyncPresent);
     NoteRecorder();
     Recorder r = Begin(kOpPresent, 24);
     Hold(self);
@@ -1503,6 +1508,7 @@ HRESULT STDMETHODCALLTYPE StreamPresent(IDXGISwapChain* self, UINT sync, UINT fl
     r.Word(flags);
     End(r);
     g_lastPresentPos = g_recordPos.load(std::memory_order_relaxed);
+    g_presentPos[g_presentIndex++ % 4] = g_lastPresentPos;
     g_presentsAsync++;
     StreamPublish();
     return g_presentResult.load(std::memory_order_acquire);
@@ -2143,6 +2149,8 @@ void StartStream(ID3D10Device1* device)
     {
         wchar_t v[8] = {};
         g_asyncPresent = !(GetEnvironmentVariableW(L"CRYMT_ASYNCPRESENT", v, 8) && wcscmp(v, L"0") == 0);
+        if (GetEnvironmentVariableW(L"CRYMT_PRESENTQUEUE", v, 8))
+            g_presentQueue = std::clamp(_wtoi(v), 1, 3);
     }
     g_stream = static_cast<uint8_t*>(VirtualAlloc(nullptr, kStreamBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     g_data = static_cast<uint8_t*>(VirtualAlloc(nullptr, kDataBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
