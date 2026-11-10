@@ -174,6 +174,7 @@ SlotStats g_slots[kMaxSlots];
 SyncStats g_sync[kMaxSyncReasons];
 int g_slotCount;
 DWORD g_mainThread;
+uint64_t g_loadSectionsSkipped; // level-loading profiler sections opened off the loading thread (HookLoadSectionStart)
 int g_depth;
 int g_mode;
 bool g_inWindow;
@@ -927,6 +928,7 @@ void WriteStats()
             fprintf(f, "shadow recording: casters recorded=%llu replays=%llu fallbacks=%llu parameter mismatches=%llu\n",
                     static_cast<unsigned long long>(g_recCasters), static_cast<unsigned long long>(g_recReplays),
                     static_cast<unsigned long long>(g_recFallbacks), static_cast<unsigned long long>(g_recParamMismatch));
+        fprintf(f, "level-loading profiler sections skipped off the loading thread=%llu\n", static_cast<unsigned long long>(g_loadSectionsSkipped));
         if (g_terrainOwn)
             fprintf(f, "terrain ownership: rebuilds=%llu surfaces=%llu meshes created on main=%llu direct calls=%llu handoffs=%llu pooled REs used=%llu pool empty=%llu\n",
                     static_cast<unsigned long long>(g_terrainRebuilds), static_cast<unsigned long long>(g_surfacesRecreated),
@@ -5511,6 +5513,35 @@ bool __fastcall HookLoadLevel(void* engine, const char* folder, const char* miss
     return g_origLoadLevel(engine, folder, mission);
 }
 
+// The level-loading profiler (e_profile_level_loading, default 1): C3DEngine slot 173 opens a section (pushes it
+// on one global stack, count 0x3022B944, entries 0x3022B950) and slot 174 closes it (pops, charges the parent).
+// Nothing else touches that stack, and both are reached only through the vtable. The renderer opens sections around
+// texture loads (CryRenderD3D10+0xFD5B0), which with CryMT run on the render thread while main opens its own: the
+// stack has no lock, and main's top entry was read as null (crash at Cry3DEngine+0xFC180 / +0xF501B, frame 144,
+// reports crash_20261107_225147 and crash_20261110_034114). Only the thread that loaded Cry3DEngine (main) keeps
+// profiling; other threads get the profiler's own "off" answer (start returns 0, end does nothing).
+using LoadSectionStartFn = uintptr_t(__fastcall*)(void*, void*, const char*);
+using LoadSectionEndFn = void(__fastcall*)(void*, void*);
+LoadSectionStartFn g_origLoadSectionStart;
+LoadSectionEndFn g_origLoadSectionEnd;
+DWORD g_loadProfileThread;
+
+uintptr_t __fastcall HookLoadSectionStart(void* engine, void* section, const char* name)
+{
+    if (GetCurrentThreadId() != g_loadProfileThread)
+    {
+        g_loadSectionsSkipped++;
+        return 0;
+    }
+    return g_origLoadSectionStart(engine, section, name);
+}
+
+void __fastcall HookLoadSectionEnd(void* engine, void* section)
+{
+    if (GetCurrentThreadId() == g_loadProfileThread)
+        g_origLoadSectionEnd(engine, section);
+}
+
 void __fastcall HookPostLoadLevel(void* engine)
 {
     g_origPostLoadLevel(engine);
@@ -7653,6 +7684,37 @@ void PatchSkinRelease()
     SetupLog("character Release, deleting destructor and model clear patched");
 }
 
+// Stock CryPhysics bug (build 6156, not CryMT's): a triangle-list builder (CryPhysics+0x10D8xx) starts on a static
+// pool (0x353C0C20) and, when it runs out, copies the items to a bigger heap block and moves their pointers by
+// (new - old). The registers get the 64-bit difference, but the items' own pointers (+0x00, +0x08, +0x40..+0x50) get
+// it sign-extended from 32 bits (movsxd r8, r11d). With the heap block more than 2 GB away from the pool, every item
+// pointer is off by a multiple of 4 GB and the next walk of the list reads garbage: crashes at CryPhysics+0x10DD65
+// (user 2026-11-10, island, read 0x58; a tester in the Editor on a voxel object, read -1). One byte makes it a
+// 64-bit move (mov r8, r11).
+void PatchPhysicsRelocation(uintptr_t base)
+{
+    static bool done;
+    if (done || base != 0x35000000)
+        return;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    static const unsigned char expect[] = {0x4C, 0x8B, 0xD8, 0x4D, 0x2B, 0xDA, 0x85, 0xFF, 0x0F, 0x8E, 0xB4, 0x00,
+                                           0x00, 0x00, 0x4D, 0x63, 0xC3, 0x48, 0x8D, 0x50, 0x40};
+    auto* site = reinterpret_cast<unsigned char*>(0x3510DE01);
+    if (nt->FileHeader.TimeDateStamp != 0x47D6E2DF || nt->OptionalHeader.SizeOfImage != 0x451000 ||
+        memcmp(site, expect, sizeof(expect)) != 0)
+    {
+        SetupLog("CryPhysics differs from build 6156, pointer relocation not patched");
+        return;
+    }
+    DWORD old;
+    VirtualProtect(site + 15, 1, PAGE_EXECUTE_READWRITE, &old);
+    site[15] = 0x8B; // 4D 63 C3 movsxd r8, r11d -> 4D 8B C3 mov r8, r11
+    VirtualProtect(site + 15, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site + 15, 1);
+    done = true;
+    SetupLog("CryPhysics pointer relocation made 64-bit");
+}
+
 // Particles: the flush builds vertices from containers (IParticleVertexCreator::SetVertices, 3D+0x84AE0, which
 // runs CParticleContainer::UpdateParticles under the container's lock), while main destroys emitters and
 // containers, e.g. dead emitters in CPartManager::Update (FUN_3007CFA0) at the start of RenderWorld. Both are
@@ -7877,6 +7939,8 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
     }
     if (!ModuleMatches(n, reinterpret_cast<uintptr_t>(data->base)))
         return;
+    if (NameIs(n, L"CryPhysics.dll"))
+        PatchPhysicsRelocation(reinterpret_cast<uintptr_t>(data->base));
     // CryAction (framework: pause on focus loss, test commands, the async save's LoadGame wait; the async save itself) and
     // CryInput hooks; each one is inert when its feature is off.
     InstallPauseOnFocus(n, reinterpret_cast<uintptr_t>(data->base));
@@ -7922,6 +7986,14 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
             PatchVtableSlot(k3DEngineVtable, 7, reinterpret_cast<uintptr_t*>(&g_origLoadLevel), reinterpret_cast<const void*>(&HookLoadLevel));
             PatchVtableSlot(k3DEngineVtable, 9, reinterpret_cast<uintptr_t*>(&g_origUnloadLevel), reinterpret_cast<const void*>(&HookUnloadLevel));
             PatchVtableSlot(k3DEngineVtable, 10, reinterpret_cast<uintptr_t*>(&g_origPostLoadLevel), reinterpret_cast<const void*>(&HookPostLoadLevel));
+            const auto* slots = reinterpret_cast<const uintptr_t*>(k3DEngineVtable);
+            if (slots[173] == 0x300FC0C0 && slots[174] == 0x300F4F50)
+            {
+                g_loadProfileThread = GetCurrentThreadId();
+                PatchVtableSlot(k3DEngineVtable, 173, reinterpret_cast<uintptr_t*>(&g_origLoadSectionStart), reinterpret_cast<const void*>(&HookLoadSectionStart));
+                PatchVtableSlot(k3DEngineVtable, 174, reinterpret_cast<uintptr_t*>(&g_origLoadSectionEnd), reinterpret_cast<const void*>(&HookLoadSectionEnd));
+                SetupLog("level-loading profiler kept to the loading thread");
+            }
         }
         PatchRenderSceneVtable(reinterpret_cast<uintptr_t>(data->base));
         // RenderWorld's inner render (FUN_3010AAC0) starts with CPartManager::Update (FUN_3007CFA0), which releases
@@ -8143,6 +8215,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         void* cookie = nullptr;
         if (reg)
             reg(0, reinterpret_cast<void*>(&OnDll), nullptr, &cookie);
+        if (const HMODULE physics = GetModuleHandleW(L"CryPhysics.dll"); physics && !g_off)
+            PatchPhysicsRelocation(reinterpret_cast<uintptr_t>(physics));
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
