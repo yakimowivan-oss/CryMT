@@ -31,5 +31,20 @@ void Dx12DrawPacket(const uint8_t* packet);
 void Dx12PassMatrices(const float* matrices);
 // GI wants them (it voxelizes the shadow map draws); read on the render thread.
 bool Dx12WantsPassMatrices();
+// Direct dynamic-buffer maps (D3D11-driver style), for the stream's producer (the recording thread):
+// Map(WRITE_DISCARD) of one of our dynamic buffers takes fresh upload memory at once and returns it in `cpu` (null: out
+// of memory); the buffer switches to it when the stream thread reaches Dx12ApplyDiscard with the same words. False for
+// buffers that are not ours or not dynamic.
+struct Dx12Discard
+{
+    uint64_t words[5];
+    void* cpu;
+};
+bool Dx12DiscardNow(ID3D10Buffer* buffer, Dx12Discard* out);
+// Producer side: the memory a Map(NO_OVERWRITE) of one of our dynamic buffers writes (its last DISCARD's); null for others.
+void* Dx12ProducerMemory(ID3D10Buffer* buffer);
+// Context thread: the switch recorded with Dx12DiscardNow's words.
+void Dx12ApplyDiscard(ID3D10Buffer* buffer, const uint64_t* words);
+void Dx12DirectMapStats(uint64_t* discards, uint64_t* bytes);
 // Context thread: a pass name for frame debuggers (RenderDoc, PIX) begins; null or "" ends the innermost one.
 void Dx12PassName(const char* text);

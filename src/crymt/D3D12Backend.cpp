@@ -2844,7 +2844,8 @@ class Buffer12 final : public Child<ID3D10Buffer>, public ResourceInfo
 public:
     D3D10_BUFFER_DESC desc{};
     Block block{}; // default and immutable
-    Slice slice{}; // dynamic: the current contents
+    Slice slice{}; // dynamic: the current contents, in stream order (what draws bind)
+    Slice prod{};  // dynamic: the producer's current memory (Dx12DiscardNow); equals `slice` once the stream caught up
     struct Retired
     {
         Slice slice;
@@ -2953,6 +2954,23 @@ public:
         generation++;
     }
 
+    // Stream thread: the memory the producer took at Map(DISCARD) becomes the contents; the old one goes back to the
+    // heap once the list being recorded has completed (retired slices the GPU is done with go back now).
+    void ApplySlice(const Slice& s)
+    {
+        const int kind = (desc.BindFlags & D3D10_BIND_CONSTANT_BUFFER) ? 0 : (desc.BindFlags & (D3D10_BIND_VERTEX_BUFFER | D3D10_BIND_INDEX_BUFFER)) ? 1 : 2;
+        g_renames[kind]++;
+        g_renameBytes[kind] += desc.ByteWidth;
+        retired.push_back({slice, g_mainSerial});
+        slice = s;
+        generation++;
+        while (!retired.empty() && SerialDone(retired.front().serial))
+        {
+            g_slices.Free(retired.front().slice);
+            retired.pop_front();
+        }
+    }
+
 protected:
     bool Supports(REFIID riid) const override
     {
@@ -2966,6 +2984,13 @@ protected:
             std::vector<Slice> slices{slice};
             for (const Retired& r : retired)
                 slices.push_back(r.slice);
+            // Memory the producer took that the stream never applied is in neither list (without the producer path
+            // prod stays the creation slice, which is in one of them).
+            bool known = prod.cpu == slice.cpu;
+            for (const Retired& r : retired)
+                known = known || r.slice.cpu == prod.cpu;
+            if (!known)
+                slices.push_back(prod);
             DeferCall([slices] {
                 for (const Slice& s : slices)
                     g_slices.Free(s);
@@ -2981,6 +3006,62 @@ protected:
         Child::Destroy();
     }
 };
+
+// Direct dynamic-buffer maps (see D3D12Backend.h). The buffer's vtable tells ours from others (the stream patches its
+// Map/Unmap entries in place, the pointer stays).
+const void* g_buffer12Vtable;
+uint64_t g_directDiscards, g_directDiscardBytes; // producer side
+
+Buffer12* OurDynamicBuffer(ID3D10Buffer* buffer)
+{
+    if (!buffer || !g_buffer12Vtable || *reinterpret_cast<void* const*>(buffer) != g_buffer12Vtable)
+        return nullptr;
+    auto* b = static_cast<Buffer12*>(buffer);
+    return b->Dynamic() ? b : nullptr;
+}
+
+bool DiscardNow(ID3D10Buffer* buffer, Dx12Discard* out)
+{
+    Buffer12* b = OurDynamicBuffer(buffer);
+    if (!b)
+        return false;
+    const Slice s = g_slices.Alloc(b->desc.ByteWidth);
+    out->cpu = s.cpu;
+    if (!s.cpu)
+        return true;
+    b->prod = s;
+    out->words[0] = reinterpret_cast<uint64_t>(s.res);
+    out->words[1] = s.offset;
+    out->words[2] = reinterpret_cast<uint64_t>(s.cpu);
+    out->words[3] = s.gpu;
+    out->words[4] = static_cast<uint64_t>(static_cast<int64_t>(s.cls));
+    g_directDiscards++;
+    g_directDiscardBytes += b->desc.ByteWidth;
+    return true;
+}
+
+void* ProducerMemory(ID3D10Buffer* buffer)
+{
+    Buffer12* b = OurDynamicBuffer(buffer);
+    return b ? b->prod.cpu : nullptr;
+}
+
+void ApplyDiscard(ID3D10Buffer* buffer, const uint64_t* w)
+{
+    Slice s;
+    s.res = reinterpret_cast<ID3D12Resource*>(w[0]);
+    s.offset = w[1];
+    s.cpu = reinterpret_cast<uint8_t*>(w[2]);
+    s.gpu = w[3];
+    s.cls = static_cast<int>(static_cast<int64_t>(w[4]));
+    static_cast<Buffer12*>(buffer)->ApplySlice(s);
+}
+
+void DirectMapStats(uint64_t* discards, uint64_t* bytes)
+{
+    *discards = g_directDiscards;
+    *bytes = g_directDiscardBytes;
+}
 
 // The format a depth buffer's views use, for a depth resource described typed or typeless.
 DXGI_FORMAT DepthViewFormat(DXGI_FORMAT f)
@@ -9858,6 +9939,8 @@ HRESULT Device::CreateBuffer(const D3D10_BUFFER_DESC* desc, const D3D10_SUBRESOU
     if (desc->Usage == D3D10_USAGE_DYNAMIC)
     {
         b->slice = g_slices.Alloc(desc->ByteWidth);
+        b->prod = b->slice;
+        g_buffer12Vtable = *reinterpret_cast<void* const*>(static_cast<ID3D10Buffer*>(b));
         if (!b->slice.cpu)
         {
             Log("CreateBuffer: no upload memory for a dynamic buffer of %u bytes (pages %llu), device removed reason %08lx", desc->ByteWidth,
@@ -11481,6 +11564,26 @@ bool InitCore(IDXGIAdapter* engineAdapter)
 }
 } // namespace
 } // namespace dx12
+
+bool Dx12DiscardNow(ID3D10Buffer* buffer, Dx12Discard* out)
+{
+    return dx12::DiscardNow(buffer, out);
+}
+
+void* Dx12ProducerMemory(ID3D10Buffer* buffer)
+{
+    return dx12::ProducerMemory(buffer);
+}
+
+void Dx12ApplyDiscard(ID3D10Buffer* buffer, const uint64_t* words)
+{
+    dx12::ApplyDiscard(buffer, words);
+}
+
+void Dx12DirectMapStats(uint64_t* discards, uint64_t* bytes)
+{
+    dx12::DirectMapStats(discards, bytes);
+}
 
 ID3D10Device* Dx12CreateDevice(IDXGIAdapter* adapter, UINT flags)
 {

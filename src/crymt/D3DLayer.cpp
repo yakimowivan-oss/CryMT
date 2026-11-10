@@ -430,6 +430,7 @@ constexpr uint32_t kOpPassName = 0x106;   // a pass name for frame debuggers beg
 constexpr uint32_t kOpMatrices = 0x105;   // the renderer's modelview and projection changed: GI's shadow map geometry
 constexpr uint32_t kOpUpdate = 0x107;     // UpdateSubresource with its source data copied into the data ring
 constexpr uint32_t kOpPresent = 0x108;    // the swap chain's Present, made by the stream thread in order
+constexpr uint32_t kOpDiscard = 0x109;    // a D3D12 dynamic buffer switches to the memory its producer Map(DISCARD) took
 constexpr uint32_t kOpWrap = 0xFFFF;
 
 // Recording is meant to come from one thread at a time (the render thread, or main while it is idle); thread changes
@@ -963,8 +964,45 @@ const BufferVtable& BufferOriginals(ID3D10Buffer* buffer)
     return g_bufferVtables[count - 1];
 }
 
+// Direct maps on the D3D12 back end (CRYMT_DIRECTMAPS=0: the data ring as before). Map(DISCARD) takes the buffer's new
+// upload memory on the producer, like a D3D11 driver, and records the switch; Map(NO_OVERWRITE) writes the producer's
+// current memory at once. Before, NO_OVERWRITE waited for the stream thread to perform the buffer's last ring upload
+// (harbor with GI: 2.3 ms a frame), and every DISCARD was copied twice (ring, then upload memory).
+bool g_directMaps;
+uint64_t g_directNoOverwrite;
+
 HRESULT STDMETHODCALLTYPE StreamBufferMap(ID3D10Buffer* buffer, D3D10_MAP type, UINT flags, void** data)
 {
+    if (g_directMaps && data)
+    {
+        if (type == D3D10_MAP_WRITE_DISCARD)
+        {
+            Dx12Discard dd;
+            if (Dx12DiscardNow(buffer, &dd))
+            {
+                *data = dd.cpu;
+                if (!dd.cpu)
+                    return E_OUTOFMEMORY;
+                Recorder r = Begin(kOpDiscard, 48);
+                Hold(buffer);
+                r.Word(reinterpret_cast<uint64_t>(buffer));
+                for (int k = 0; k < 5; k++)
+                    r.Word(dd.words[k]);
+                End(r);
+                return S_OK;
+            }
+        }
+        else if (type == D3D10_MAP_WRITE_NO_OVERWRITE)
+        {
+            if (void* p = Dx12ProducerMemory(buffer))
+            {
+                NoteRecorder();
+                g_directNoOverwrite++;
+                *data = p;
+                return S_OK;
+            }
+        }
+    }
     if (type == D3D10_MAP_WRITE_DISCARD && data && g_ringMapCount < kMaxRingMaps)
     {
         NoteRecorder();
@@ -1284,6 +1322,9 @@ void Execute(const CmdHeader* h)
         break;
     case kOpPresent:
         ExecutePresent(w);
+        break;
+    case kOpDiscard:
+        Dx12ApplyDiscard(reinterpret_cast<ID3D10Buffer*>(w[0]), w + 1);
         break;
     case kOpScene:
         Dx12SceneDone(reinterpret_cast<const DlssSceneInfo*>(w));
@@ -1973,7 +2014,12 @@ HRESULT WINAPI HookD3D10CreateDevice(IDXGIAdapter* adapter, D3D10_DRIVER_TYPE ty
         {
             // With the stream as well, the renderer records and the stream thread translates to D3D12.
             if (g_streamOn)
+            {
                 device = WrapDeviceOf(device, true);
+                wchar_t v[8];
+                g_directMaps = !(GetEnvironmentVariableW(L"CRYMT_DIRECTMAPS", v, 8) && wcscmp(v, L"0") == 0);
+                Trace(g_directMaps ? "stream: dynamic buffers map directly (D3D12 upload memory)" : "stream: dynamic buffers map through the data ring");
+            }
             g_d3d12Device = device;
             *out = device;
             HookFactoryOfAdapter(adapter);
@@ -2192,6 +2238,11 @@ void D3DLayerWriteStats()
                 g_streamCommands / frames, g_streamBusyTicks * ms / frames, g_recorderSwitches / frames);
         fprintf(f, "data ring: %.1f uploads/frame, %.1f KB/frame; publishes %.1f/frame; holds %.1f/frame, objects held and released %.1f/frame\n",
                 g_ringUploads / frames, g_ringBytes / 1024.0 / frames, g_streamPublishes / frames, g_holds / frames, g_heldTotal / frames);
+        uint64_t directDiscards = 0, directBytes = 0;
+        if (g_directMaps)
+            Dx12DirectMapStats(&directDiscards, &directBytes);
+        fprintf(f, "direct maps: DISCARD %.1f/frame (%.1f KB/frame), NO_OVERWRITE %.1f/frame\n", directDiscards / frames,
+                directBytes / 1024.0 / frames, g_directNoOverwrite / frames);
         fprintf(f, "UpdateSubresource: through the data ring %.2f/frame, synced %.2f/frame; presents through the stream %.2f/frame\n",
                 g_updatesAsync / frames, g_updatesSynced / frames, g_presentsAsync / frames);
         fprintf(f, "highest slot set (start + count):");
