@@ -1441,6 +1441,7 @@ void trace(uint3 id : SV_DispatchThreadID)
         // them), each both ways; steps by the radius on screen: one per 1.5 GI texels, 2 to 6 (distant points have a
         // small radius in pixels; the trace was 0.57 ms of screen part at 5120x1440).
         int dirs = ((uint)options & 32) ? 2 : 4;
+        int traced = voxParams.y == 2 ? 0 : dirs; // the cones' part only: the screen part is not used
         int steps = clamp((int)ceil(length(radiusUv * fullSize) / (1.5 * GiScale())), 2, 6);
         // Visibility bitmask (Therrien et al. 2023): per slice 32 sectors of the hemisphere around the normal, spaced
         // by the projected cosine (each one the same share of irradiance); a sample occupies the sectors between its
@@ -1451,7 +1452,7 @@ void trace(uint3 id : SV_DispatchThreadID)
         float3 Vc = normalize(-P);
         float thickness = max(radius, 0.5);
         float sinMax = sin(1.5707963 - kBias);
-        [loop] for (int k = 0; k < dirs; k++)
+        [loop] for (int k = 0; k < traced; k++)
         {
             float a = (k + noise) * (3.14159265 / dirs);
             float2 dir = float2(cos(a), sin(a));
@@ -2072,12 +2073,19 @@ void gtaoApply(uint3 id : SV_DispatchThreadID)
     float4 g = outTex[id.xy];
     float flags = floor(g.a * 0.5);
     float share = g.a - 2 * flags;
-    // Grass and leaves (t2, the foliage mask): the GI's occlusion and bounce times motionParams.z (set for this pass:
-    // CRYMT_GI_FOLIAGEGI), the share kept under 0.9 (the ambient floor).
-    if (historyTex.Load(int3(id.xy, 0)).x > 0.5)
+    // Leaves (t2, the foliage mask 1): the GI's occlusion and bounce times CRYMT_GI_FOLIAGEGI, the share kept under 0.9
+    // (the ambient floor). Grass (the mask 0.6): times CRYMT_GI_GRASSGI and no GTAO - the engine's SSAO stays on it (its
+    // blend with the terrain's colour takes only that; with GTAO in its place and the leaves' 1.5 it came out flat and too
+    // bright, the user). motionParams.z for this pass: the leaves' factor + 4 x floor(the grass's x 100).
+    float mask = historyTex.Load(int3(id.xy, 0)).x;
+    if (mask > 0.5)
     {
-        g.rgb *= motionParams.z;
-        share = min(share * motionParams.z, max(share, 0.9));
+        float packed = floor(motionParams.z / 4);
+        float k = mask < 0.8 ? packed / 100 : motionParams.z - packed * 4;
+        if (mask < 0.8)
+            ao = 0;
+        g.rgb *= k;
+        share = min(share * k, max(share, 0.9));
     }
     outTex[id.xy] = float4(g.rgb * (1 - ao), 1 - (1 - share) * (1 - ao) + 2 * flags);
 }
@@ -2305,6 +2313,9 @@ void update(uint3 id : SV_DispatchThreadID)
     // they changed every update as the leaves swayed and the camera moved, and the GI under trees flickered (the user:
     // only turning the GI off stopped it). The screen still gives them their colour.
     bool foliage = stamped && stampA < 0.98;
+    // CRYMT_GI_OCCUPANCY=geometry (voxels page Num0): the opacity from the stamps alone, the screen gives the colour; what
+    // the screen saw is not made solid or open (it depends on where the camera is: cells came and went as it moved).
+    bool geomOnly = track && frac(abs(mode)) > 0.25;
     float3 centre = (cell + 0.5) * voxelSize;
     float3 V = mul(float4(centre, 1), worldToView).xyz;
     float dist = -V.z;
@@ -2345,7 +2356,7 @@ void update(uint3 id : SV_DispatchThreadID)
                     // Seen through: halved, unless the voxelized geometry says something is there (thin things - a
                     // fence, a pole, branches - the screen sees past: halved here, set again by the next voxelization,
                     // they came and went as the camera moved). Stamps of things that went are cleared below.
-                    if (!foliage && !stamped)
+                    if (!foliage && !stamped && !geomOnly)
                         v.a *= 0.5;
                     if (track)
                     {
@@ -2372,13 +2383,13 @@ void update(uint3 id : SV_DispatchThreadID)
                         float trust = saturate(kColourTrust / dist);
                         v.rgb = v.a > 0.01 ? lerp(v.rgb, c, 0.25 * trust) : c * trust;
                         // A leaf on screen (the foliage mask) is no wall: half open at most, as the stamps have it.
-                        if (!foliage)
+                        if (!foliage && !geomOnly)
                             v.a = lerp(v.a, foliageTex.SampleLevel(pointClamp, uv, 0) >= 0.5 ? 0.5 : 1, 0.5);
                         if (track)
                             seen[id] = 1;
                     }
                 }
-                else if (side < tolerance + 2 * voxelSize && !foliage && foliageTex.SampleLevel(pointClamp, uv, 0) < 0.5)
+                else if (side < tolerance + 2 * voxelSize && !foliage && !geomOnly && foliageTex.SampleLevel(pointClamp, uv, 0) < 0.5)
                 {
                     // Just behind a solid visible surface: the inside of the ground, a wall, a rock, filled with the
                     // surface's colour. The screen gave a surface one layer of cells, in steps along a slope with
@@ -2399,7 +2410,9 @@ void update(uint3 id : SV_DispatchThreadID)
             }
         }
     }
-    if (stamped)
+    if (geomOnly)
+        v.a = stamped ? (foliage ? lerp(v.a, stampA, 0.3) : stampA) : v.a * 0.5; // no stamp: gone within a few updates
+    else if (stamped)
         v.a = foliage ? lerp(v.a, stampA, 0.3) : max(v.a, stampA);
     voxels[id] = v;
 }
@@ -2839,6 +2852,10 @@ public:
     };
     std::deque<Retired> retired;
     uint32_t generation = 0; // dynamic renames, for buffer views
+    // Default constant buffers: their first 12 floats as last written (creation, UpdateSubresource), in stream order
+    // like the draws - the object matrix (PI_ObjMatrix at c0) the GI geometry's cache keys on.
+    float head[12] = {};
+    bool headKnown = false;
 
     Buffer12()
     {
@@ -3423,7 +3440,26 @@ public:
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
     std::deque<std::string> names; // stable storage for the semantic names
     UINT slotEnd = 0;              // highest input slot + 1
+    bool animated = false;         // bone weights or indices (skinned), or a per-instance stream: the GI geometry
+                                   // voxelizes its draws every time (RunVoxelGeometry)
 };
+
+// A fast 64-bit hash, 8 bytes a step (GI geometry keys: ~2300 draws a frame; byte-wise FNV and the CRT's lrintf
+// there cost ~1.3 ms a frame on the stream thread, the sampler showed).
+uint64_t HashWords(const void* data, size_t bytes, uint64_t h)
+{
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (; bytes >= 8; bytes -= 8, p += 8)
+    {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    for (; bytes; bytes--, p++)
+        h = (h ^ *p) * 0x100000001B3ull;
+    return h;
+}
 
 // Shaders keep their bytecode for pipeline state creation and what reflection says they bind.
 uint64_t HashBytes(const void* data, size_t bytes, uint64_t h = 1469598103934665603ull)
@@ -3839,6 +3875,8 @@ struct Stats
     uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, voxPasses, giLateReads, giOtherDepth;
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
     uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
+    uint64_t voxGeomAnimated, voxGeomFresh, voxGeomInTurn; // the cache: draws every time, new ones, level draws left to their turn
+    uint64_t voxAnimatedWhy[4]; // recorded draws taken as animated: layout (bones, per-instance), a dynamic vertex buffer, no object matrix
     uint64_t voxClass[4]; // z-prepass draws recorded: discard x diffuse map (0 neither, 1 diffuse only, 2 discard only, 3 both = foliage)
     uint64_t voxPatch[5]; // solid z-prepass draws by their camera matrix: none, absolute, absolute transposed, relative, relative transposed
     uint64_t voxGeomMaterial, voxMaterialShaders;
@@ -5661,6 +5699,14 @@ public:
                                      // (default on since 2026-11-06, the user's choice: ~5-7 FPS)
         bool geometryFoliage = false; // CRYMT_GI_GEOMETRY=2: foliage too (mostly open cells)
         bool geometryPersist = true;  // CRYMT_GI_GEOMPERSIST=0: voxelized geometry only from the last three voxelizations
+        bool geometryCache = true;    // CRYMT_GI_GEOMCACHE=0: every draw voxelized each time its level updates; on: an object
+                                      // drawn unchanged (same buffers, same place in the world) every 4th frame, moved, new or
+                                      // animated ones every time (with kept geometry only)
+        bool opacityGeometry = true;  // the cells' opacity from the voxelized geometry only, the screen gives only their colour
+                                      // (levels with geometry; the coarsest keeps the screen); CRYMT_GI_OCCUPANCY=screen: also
+                                      // from the screen (before 2026-11-10: 12 x the cells coming and going on a still camera)
+        bool screenPart = false;      // CRYMT_GI_SCREEN=1: the screen part (bounce and occlusion traced on screen) with the
+                                      // cones; off by default since 2026-11-10 (the user), it is not traced then
         float foliageOpacity = 0.5f;  // CRYMT_GI_FOLIAGE: an alpha-tested material's cell opacity (by leaf shape with materials)
         bool materials = true;        // CRYMT_GI_MATERIALS=0: geometry without textures (no albedo, no alpha test)
         float coneLift = 0.5f, coneStart = 1; // CRYMT_GI_CONELIFT, CRYMT_GI_CONESTART: the near cones', cells of level 0
@@ -5679,7 +5725,7 @@ public:
         float gtaoRadius = 0.5f;           // CRYMT_GI_GTAORADIUS, metres
         bool contactShadows = true;        // CRYMT_CONTACTSHADOWS=0: no screen-space contact shadows in the sun's shadow mask
         float contactLength = 0.35f;       // CRYMT_CONTACTLENGTH: the march's length at 10 m (metres; scales with distance)
-        bool contactFoliage = false;       // CRYMT_CONTACTFOLIAGE=1: foliage (the z-prepass's mask) casts contact shadows too
+        bool contactFoliage = true;        // CRYMT_CONTACTFOLIAGE=0: foliage (the z-prepass mask) casts no contact shadows (default on since 2026-11-10, the user)
         float gtao = 1.5f;                 // CRYMT_GI_GTAO=<strength>: GTAO in place of the engine's SSAO, a factor on the GI's
                                            // result as the SSAO was (village rooms: darkening 41.8/68.7/48.2% at 1.5 against the
                                            // SSAO's 44.1/69.8/54.2%; creases darker than the SSAO, open walls not darkened)
@@ -5694,6 +5740,8 @@ public:
         bool gtaoFull = false;             // CRYMT_GI_GTAOFULL=1: GTAO at full size (island 5120x1440: 3.5 ms against 1.2)
         bool gtaoNoFoliage = false;        // CRYMT_GI_GTAOFOLIAGE=0: grass and leaves (the foliage mask) occlude nothing in GTAO
                                            // (the user: plants looked worse without their occlusion)
+        float grassGi = 1.0f;              // CRYMT_GI_GRASSGI: the same for grass (marked apart by the z-prepass), which keeps
+                                           // the engine's SSAO in place of GTAO (2026-11-10, the user: grass flat, too bright)
         float foliageGi = 1.5f;            // CRYMT_GI_FOLIAGEGI: the GI's occlusion and bounce on grass and leaves (the foliage
                                            // mask) times this (the user: more of the voxel GI on grass); 1 as everything else
         bool particlesGi = true;           // CRYMT_GI_PARTICLES=0 (key "-"): blended particles (smoke, dust) without the GI
@@ -5751,7 +5799,12 @@ public:
             v.geometry = v.voxels && !(geometryVar && wcscmp(text, L"0") == 0);
             v.geometryFoliage = v.geometry && geometryVar && wcscmp(text, L"2") == 0;
             v.geometryPersist = !(GetEnvironmentVariableW(L"CRYMT_GI_GEOMPERSIST", text, 32) && wcscmp(text, L"0") == 0);
+            v.geometryCache = !(GetEnvironmentVariableW(L"CRYMT_GI_GEOMCACHE", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_GI_FOLIAGE", v.foliageOpacity);
+            v.opacityGeometry = !(GetEnvironmentVariableW(L"CRYMT_GI_OCCUPANCY", text, 32) && _wcsicmp(text, L"screen") == 0);
+            v.screenPart = GetEnvironmentVariableW(L"CRYMT_GI_SCREEN", text, 32) && wcscmp(text, L"0") != 0;
+            if (v.voxelMix == 1 && !v.screenPart)
+                v.voxelMix = 2; // the cones' part only
             v.materials = !(GetEnvironmentVariableW(L"CRYMT_GI_MATERIALS", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_GI_CONELIFT", v.coneLift);
             read(L"CRYMT_GI_CONESTART", v.coneStart);
@@ -5772,7 +5825,7 @@ public:
             read(L"CRYMT_GI_GTAORADIUS", v.gtaoRadius);
             v.contactShadows = !(GetEnvironmentVariableW(L"CRYMT_CONTACTSHADOWS", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_CONTACTLENGTH", v.contactLength);
-            v.contactFoliage = GetEnvironmentVariableW(L"CRYMT_CONTACTFOLIAGE", text, 32) && wcscmp(text, L"0") != 0;
+            v.contactFoliage = !(GetEnvironmentVariableW(L"CRYMT_CONTACTFOLIAGE", text, 32) && wcscmp(text, L"0") == 0);
             if (GetEnvironmentVariableW(L"CRYMT_GI_BAKED", text, 32))
             {
                 _wcslwr_s(text);
@@ -5785,6 +5838,7 @@ public:
             v.gtaoHistory = GetEnvironmentVariableW(L"CRYMT_GI_GTAOHISTORY", text, 32) && wcscmp(text, L"0") != 0;
             v.gtaoNoFoliage = GetEnvironmentVariableW(L"CRYMT_GI_GTAOFOLIAGE", text, 32) && wcscmp(text, L"0") == 0;
             read(L"CRYMT_GI_FOLIAGEGI", v.foliageGi);
+            read(L"CRYMT_GI_GRASSGI", v.grassGi);
             v.particlesGi = !(GetEnvironmentVariableW(L"CRYMT_GI_PARTICLES", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_GI_PARTICLECELL", v.particleCell);
             v.particleCell = v.particleCell > 0.25f ? v.particleCell : 1.5f;
@@ -5831,8 +5885,10 @@ public:
         g.bounce = b.bounce * bounce;
         g.voxelStrength = b.voxelStrength * bounce;
         g.voxels = b.on; // the grid keeps up, so the cones and the view switch on at once
+        if (g_giControl.parts < 0)
+            g_giControl.parts = b.voxelMix == 2 ? 1 : 0;
         const int parts = g_giControl.parts; // Num1: both parts, the cones only
-        g.voxelMix = parts == 1 ? 2.0f : (b.voxelMix > 0 && b.voxelMix < 4 ? b.voxelMix : 1.0f);
+        g.voxelMix = parts == 1 ? 2.0f : (b.voxelMix > 0 && b.voxelMix < 4 && b.voxelMix != 2 ? b.voxelMix : 1.0f);
         g.weaponGi = b.weaponGi && g_giControl.weapon;
         g.voxelView = static_cast<float>(g_giControl.view.load());
         // Num3: the voxel geometry with the near occlusion cones; off gives the ini's settings exactly.
@@ -5842,6 +5898,14 @@ public:
         g.geometry = b.voxels && geometry > 0;
         g.geometryFoliage = geometry == 2;
         g.nearOcclusion = geometry > 0 ? (b.nearOcclusion > 0 ? b.nearOcclusion : 1.0f) : 0.0f;
+        // Voxels page Num0: where the cells' opacity comes from.
+        if (g_giControl.voxOpacity < 0)
+            g_giControl.voxOpacity = b.opacityGeometry ? 1 : 0;
+        g.opacityGeometry = g_giControl.voxOpacity == 1 && g.geometry;
+        // Voxels page Num1: unchanged objects every 4th frame or every frame.
+        if (g_giControl.geomCache < 0)
+            g_giControl.geomCache = b.geometryCache ? 1 : 0;
+        g.geometryCache = g_giControl.geomCache == 1;
         // PgDn: GTAO in place of the engine's SSAO, or the SSAO; Home: contact shadows.
         if (g_giControl.gtao < 0)
             g_giControl.gtao = b.replaceSsao ? 1 : 0;
@@ -6627,8 +6691,9 @@ public:
                 m_aoHistState[aoCur] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 m_list->SetPipelineState(m_aoApplyPso);
                 m_list->SetComputeRootDescriptorTable(1, {gpu.ptr + (aoTables + 12) * g.srvInc});
-                const float foliageGi = s.foliageGi;
-                m_list->SetComputeRoot32BitConstants(0, 1, &foliageGi, 34); // motionParams.z for this pass: the foliage GI factor
+                // motionParams.z for this pass: the leaves' factor (< 4) + 4 x floor(the grass's x 100)
+                const float foliageGi = std::min(s.foliageGi, 3.99f) + 4.0f * std::floor(std::max(s.grassGi, 0.0f) * 100.0f + 0.5f);
+                m_list->SetComputeRoot32BitConstants(0, 1, &foliageGi, 34);
                 m_list->Dispatch((m_giFullW + 7) / 8, (m_giFullH + 7) / 8, 1);
                 m_barriers.push_back(Transition(m_aoRaw, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
                 m_aoCur = aoCur;
@@ -6896,6 +6961,8 @@ public:
         D3D12_GPU_VIRTUAL_ADDRESS cb[kRootCbSlots[kVS]];
         bool foliage; // the z-prepass pixel shader discards (alpha test): leaves, grass
         bool dissolve; // it discards for the LOD dissolve only (no diffuse map): solid
+        bool animated; // skinned, per-instance streams, vertices written by the CPU, an unreadable object matrix: every time
+        uint64_t key;  // what it puts into the grid: shader, buffers, range, the object's matrix in the world
         const VS12* vs;                   // its outputs (the material pixel shader's input)
         int texture;                      // the z-prepass PS's first 2D texture slot, -1 none
         D3D12_GPU_DESCRIPTOR_HANDLE psSrv; // that PS's texture table as applied
@@ -7056,6 +7123,57 @@ public:
         d.psSrv = m_stage[kPS].srvTable;
         const StageState& st = m_stage[kVS];
         memcpy(d.cb, st.cbApplied, sizeof(d.cb));
+        // Its identity, for voxelizing unchanged objects only now and then: the shader, the buffers and the range, and the
+        // object's matrix (PI_ObjMatrix, 3x4 at c0 of VS slot 3) with the translation in the world (the camera-relative
+        // matrices moved back by the eye), 2 cm / 0.001 steps. A spinning radar, a door, a falling piece: a new matrix every
+        // frame, a new key. Skinned characters, foliage the player bends, cloth: bones, per-instance or CPU-written vertex
+        // streams, so animated (every time).
+        d.animated = m_layout->animated;
+        if (d.animated)
+            m_stats.voxAnimatedWhy[0]++;
+        for (UINT i = 0; i < d.vbCount && !d.animated; i++)
+            if (m_vb[i].buffer && m_vb[i].buffer->Dynamic())
+            {
+                d.animated = true;
+                m_stats.voxAnimatedWhy[1]++;
+            }
+        uint64_t key = HashWords(&d.vsHash, sizeof(d.vsHash), 1469598103934665603ull);
+        key = HashWords(d.vb, d.vbCount * sizeof(D3D12_VERTEX_BUFFER_VIEW), key);
+        if (indexed)
+            key = HashWords(&d.ib, sizeof(d.ib), key);
+        const UINT range[6] = {count, instances, start, static_cast<UINT>(base), startInstance, 0};
+        key = HashWords(range, sizeof(range), key);
+        if (m_vs->cbMask >> 3 & 1)
+        {
+            const Buffer12* object = st.cb[3];
+            const bool dyn = object && object->Dynamic() && object->slice.cpu && object->desc.ByteWidth >= 48;
+            if (dyn || (object && object->headKnown))
+            {
+                float m[12];
+                memcpy(m, dyn ? static_cast<const void*>(object->slice.cpu) : static_cast<const void*>(object->head), sizeof(m));
+                if (it->second[0].zero)
+                {
+                    float eye[16];
+                    RigidInverse(m_giView, eye);
+                    m[3] += eye[12];
+                    m[7] += eye[13];
+                    m[11] += eye[14];
+                }
+                int32_t q[12];
+                for (int i = 0; i < 12; i++)
+                {
+                    const float x = m[i] * ((i & 3) == 3 ? 50.0f : 1000.0f);
+                    q[i] = x > -2e9f && x < 2e9f ? static_cast<int32_t>(x + (x >= 0 ? 0.5f : -0.5f)) : 0x7FFFFFFF;
+                }
+                key = HashWords(q, sizeof(q), key);
+            }
+            else if (!d.animated)
+            {
+                d.animated = true;
+                m_stats.voxAnimatedWhy[object ? 3 : 2]++;
+            }
+        }
+        d.key = key;
         // The camera buffers' contents now (the replay patches the matrices in): once per buffer and frame.
         for (const VoxCameraPatch& p : it->second)
         {
@@ -7486,6 +7604,38 @@ public:
                 job.patched[address] = up.res->GetGPUVirtualAddress() + up.offset;
             }
         }
+        // Unchanged objects (kept geometry only: their stamps stay): each level takes them in turns, every 4th frame
+        // (level 0 every 4th of its updates, level 1 every 2nd, level 2 each one), by the key's phase so the work spreads
+        // evenly; 4 against 3 axes, so each turn comes along the next axis. New ones (first seen, or seen again after a
+        // gap) the first three frames: all three axes at once. Moved or animated ones every time, as all were before.
+        const bool cache = Gi().geometryCache && Gi().geometryPersist && m_voxValid;
+        std::vector<uint8_t> due(m_voxDraws.size(), 1);
+        if (cache)
+        {
+            const uint64_t now = m_giFrame + 1;
+            for (size_t i = 0; i < m_voxDraws.size(); i++)
+            {
+                const VoxDraw& d = m_voxDraws[i];
+                if (d.animated)
+                {
+                    m_stats.voxGeomAnimated++;
+                    continue;
+                }
+                VoxSeen& s = m_voxKeys[d.key];
+                if (s.last + 2 < now)
+                    s.first = now; // new, or back after a gap
+                s.last = now;
+                if (now - s.first < 3)
+                {
+                    m_stats.voxGeomFresh++;
+                    continue;
+                }
+                due[i] = 0; // in turns, per level below
+            }
+            if ((m_giFrame & 255) == 0)
+                for (auto it = m_voxKeys.begin(); it != m_voxKeys.end();)
+                    it = it->second.last + 64 < now ? m_voxKeys.erase(it) : std::next(it);
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
         VoxTable(cpu, gpu);
@@ -7516,10 +7666,18 @@ public:
             {
             PassName(job.shadow ? (part ? "CryMT GI geometry: shadow foliage" : "CryMT GI geometry: shadow solid")
                                 : (part ? "CryMT GI geometry: foliage" : "CryMT GI geometry: solid"));
-            for (const VoxDraw& d : *job.draws)
+            const uint64_t turn = job.shadow ? 0 : m_giFrame / kVoxPeriod[l]; // this level's update count
+            const uint64_t turns = job.shadow ? 1 : std::max(1, 4 / kVoxPeriod[l]);
+            for (size_t di = 0; di < job.draws->size(); di++)
             {
+                const VoxDraw& d = (*job.draws)[di];
                 if (d.foliage != (part == 1))
                     continue;
+                if (!job.shadow && !due[di] && (turn + (d.key >> 32)) % turns != 0)
+                {
+                    m_stats.voxGeomInTurn++;
+                    continue;
+                }
                 // The material shader where the z-prepass PS reads a texture; else the plain one, which alpha-tested
                 // materials only get with CRYMT_GI_GEOMETRY=2 (whole cards would fill the cells).
                 ID3DBlob* ps = d.texture >= 0 && Gi().materials ? MaterialPs(d.vs, d.texture, compiled) : nullptr;
@@ -7694,8 +7852,11 @@ public:
             MatMul(m_giView, reproj, c + 16); // world -> this view -> the previous clip space
             if (geometry && l < kVoxGeomLevels) // prevGridMin.w: the oldest stamp taken, the level's last three voxelizations
             {
-                c[59] = static_cast<float>(stamp > static_cast<uint32_t>(3 * kVoxPeriod[l] - 1) ? stamp - (3 * kVoxPeriod[l] - 1) : 1);
-                c[51] = static_cast<float>(stamp) * (Gi().geometryPersist ? -1.0f : 1.0f); // mode: this frame's stamp
+                // With the cache unchanged objects come every 4th frame: the window at least two of their turns.
+                const uint32_t window = static_cast<uint32_t>(std::max(3 * kVoxPeriod[l], Gi().geometryCache ? 8 : 0) - 1);
+                c[59] = static_cast<float>(stamp > window ? stamp - window : 1);
+                c[51] = (static_cast<float>(stamp) + (Gi().opacityGeometry && Gi().geometry ? 0.5f : 0.0f)) * (Gi().geometryPersist ? -1.0f : 1.0f); // mode: this
+                // frame's stamp, a half: the opacity from the geometry only
                                                                                              // (entered cells keep only it);
                                                                                              // negative: geometry kept
             }
@@ -7797,6 +7958,20 @@ public:
         std::vector<Line> lines;
         if (g_giControl.page == 1)
         {
+            lines.push_back({"", "CryMT voxels", "", value});
+            const bool geomOnly = g_giControl.voxOpacity == 1;
+            lines.push_back({"Num0", "Opacity from", geomOnly ? "GEOMETRY" : "SCREEN+GEOMETRY", geomOnly ? on : value});
+            const bool cache = g_giControl.geomCache == 1;
+            lines.push_back({"Num1", "Unchanged objects", cache ? "EVERY 4TH FRAME" : "EVERY FRAME", cache ? on : value});
+            const int view = g_giControl.view;
+            lines.push_back({"Num2", "Voxel view", view == 0 ? "OFF" : view == 1 ? "WIRE" : "SOLID", view ? on : off});
+            const int geometry = g_giControl.geometry;
+            lines.push_back({"Num3", "Voxel geometry", geometry > 0 ? "ON" : "OFF", geometry > 0 ? on : off});
+            lines.push_back({"", "(GEOMETRY: the screen gives the colour only)", "", white});
+            lines.push_back({"Num/", "reflections", "", white});
+        }
+        else if (g_giControl.page == 2)
+        {
             lines.push_back({"", "CryMT environment maps", "", value});
             if (!b.on)
                 lines.push_back({"", "They need the GI on (GI=1)", "", off});
@@ -7857,7 +8032,7 @@ public:
         snprintf(buf, sizeof(buf), "Time %02d:%02d", start / 60, start % 60);
         lines.push_back({"Num6", buf, "", white});
         lines.push_back({"Num+ Num-", "Time +/- 1 hour", "", white});
-        lines.push_back({"Num*", "Reset   Num/ reflections", "", white});
+        lines.push_back({"Num*", "Reset   Num/ voxels", "", white});
         }
         std::string text;
         for (const Line& l : lines)
@@ -8752,6 +8927,11 @@ private:
     std::vector<VoxDraw> m_voxDraws;
     std::unordered_map<uint64_t, std::vector<VoxCameraPatch>> m_voxCamera;  // by vertex shader content hash
     std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, VoxCameraCopy> m_voxCameraCopies; // this frame's, by address
+    struct VoxSeen
+    {
+        uint64_t first = 0, last = 0; // frames + 1: since when seen without a gap, last seen
+    };
+    std::unordered_map<uint64_t, VoxSeen> m_voxKeys; // GI geometry draws by key (RunVoxelGeometry's turns)
     // The same for the shadow map draws (PassMatrices: the frame's job), their own matrices by vertex shader.
     std::vector<VoxDraw> m_shadowDraws;
     std::unordered_map<uint64_t, std::vector<VoxCameraPatch>> m_shadowCamera;
@@ -9560,6 +9740,16 @@ void Device::UpdateSubresource(ID3D10Resource* dst, UINT sub, const D3D10_BOX* b
         if (!up.cpu)
             return;
         memcpy(up.cpu, data, bytes);
+        if (b->desc.BindFlags & D3D10_BIND_CONSTANT_BUFFER)
+        {
+            if (from == 0 && bytes >= sizeof(b->head))
+            {
+                memcpy(b->head, data, sizeof(b->head));
+                b->headKnown = true;
+            }
+            else if (from < sizeof(b->head))
+                b->headKnown = false;
+        }
         PrepareCopyDest(b->Page());
         FlushBarriers();
         m_list->CopyBufferRegion(b->Res(), b->Offset() + from, up.res, up.offset, bytes);
@@ -9694,6 +9884,11 @@ HRESULT Device::CreateBuffer(const D3D10_BUFFER_DESC* desc, const D3D10_SUBRESOU
     }
     else
     {
+        if (initData && (desc->BindFlags & D3D10_BIND_CONSTANT_BUFFER) && desc->ByteWidth >= sizeof(b->head))
+        {
+            memcpy(b->head, initData, sizeof(b->head));
+            b->headKnown = true;
+        }
         b->block = g_blocks.Alloc(desc->ByteWidth);
         if (!b->block.page)
         {
@@ -10309,6 +10504,7 @@ HRESULT Device::CreateInputLayout(const D3D10_INPUT_ELEMENT_DESC* elements, UINT
         l->elements.push_back({l->names.back().c_str(), e.SemanticIndex, e.Format, e.InputSlot, e.AlignedByteOffset,
                                static_cast<D3D12_INPUT_CLASSIFICATION>(e.InputSlotClass), e.InstanceDataStepRate});
         l->slotEnd = std::max(l->slotEnd, std::min(e.InputSlot + 1, 16u));
+        l->animated = l->animated || e.InputSlotClass == D3D10_INPUT_PER_INSTANCE_DATA || _strnicmp(l->names.back().c_str(), "BLEND", 5) == 0;
         l->contentHash = HashBytes(l->names.back().data(), l->names.back().size(), l->contentHash ? l->contentHash : 1469598103934665603ull);
         const UINT fields[6] = {e.SemanticIndex, static_cast<UINT>(e.Format), e.InputSlot, e.AlignedByteOffset, static_cast<UINT>(e.InputSlotClass),
                                 e.InstanceDataStepRate};
@@ -11468,6 +11664,10 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  GI geometry, z-prepass draws by their pixel shader: plain %.1f, diffuse map only %.1f, discard only (LOD dissolve) %.1f, discard and diffuse map (alpha test: foliage) %.1f per frame\n",
             s.voxClass[0] / frames, s.voxClass[1] / frames, s.voxClass[2] / frames, s.voxClass[3] / frames);
     fprintf(f, "  GI geometry: solid draws voxelized into level 0 %.1f per frame\n", s.voxGeomSolid / frames);
+    fprintf(f, "  GI geometry cache: animated %.1f, new %.1f per frame; level draws left to their turn %.1f per frame\n",
+            s.voxGeomAnimated / frames, s.voxGeomFresh / frames, s.voxGeomInTurn / frames);
+    fprintf(f, "  GI geometry cache, animated because: layout (bones or per-instance) %.1f, dynamic vertex buffer %.1f, no object buffer %.1f, its matrix not known %.1f per frame\n",
+            s.voxAnimatedWhy[0] / frames, s.voxAnimatedWhy[1] / frames, s.voxAnimatedWhy[2] / frames, s.voxAnimatedWhy[3] / frames);
     fprintf(f, "  GI geometry, solid z-prepass draws by their camera matrix: none %.1f, absolute %.1f, absolute transposed %.1f, relative %.1f, relative transposed %.1f per frame\n",
             s.voxPatch[0] / frames, s.voxPatch[1] / frames, s.voxPatch[2] / frames, s.voxPatch[3] / frames, s.voxPatch[4] / frames);
     fprintf(f, "  drawn: %.2f M vertices/indices per frame (all passes; triangle lists: / 3)\n", s.vertices / frames / 1e6);

@@ -428,6 +428,8 @@ constexpr uint32_t kOpCamera = 0x103;     // the main camera was set: GI reproje
 constexpr uint32_t kOpDrawGroup = 0x104;  // draws of one mesh range by a group of objects, constants computed here (ZPass)
 constexpr uint32_t kOpPassName = 0x106;   // a pass name for frame debuggers begins (text) or ends (empty)
 constexpr uint32_t kOpMatrices = 0x105;   // the renderer's modelview and projection changed: GI's shadow map geometry
+constexpr uint32_t kOpUpdate = 0x107;     // UpdateSubresource with its source data copied into the data ring
+constexpr uint32_t kOpPresent = 0x108;    // the swap chain's Present, made by the stream thread in order
 constexpr uint32_t kOpWrap = 0xFFFF;
 
 // Recording is meant to come from one thread at a time (the render thread, or main while it is idle); thread changes
@@ -1018,6 +1020,134 @@ void STDMETHODCALLTYPE StreamBufferUnmap(ID3D10Buffer* buffer)
     BufferOriginals(buffer).unmap(buffer);
 }
 
+// UpdateSubresource without a sync: it waited for the whole stream before (the stream thread may sit in Present waiting
+// for the GPU): harbor 0.1 waits a frame of ~16 ms each, 1.66 ms a frame on average and a hitch every ~10 frames. The
+// source data the call reads (box, pitches, format) is copied into the data ring now; the stream thread makes the call
+// in order. Formats it cannot size, and more than 8 MB, still sync.
+bool FormatElement(DXGI_FORMAT f, UINT& bytes, bool& block)
+{
+    const int v = f;
+    block = (v >= 70 && v <= 84) || (v >= 94 && v <= 99);
+    if (block)
+    {
+        bytes = (v >= 70 && v <= 72) || (v >= 79 && v <= 81) ? 8 : 16;
+        return true;
+    }
+    bytes = v >= 1 && v <= 4 ? 16 : v >= 5 && v <= 8 ? 12 : v >= 9 && v <= 22 ? 8 : (v >= 23 && v <= 47) || v == 67 || (v >= 87 && v <= 93) ? 4
+          : (v >= 48 && v <= 59) || v == 85 || v == 86 ? 2 : v >= 60 && v <= 65 ? 1 : 0;
+    return bytes != 0;
+}
+
+size_t UpdateSourceBytes(ID3D10Resource* dst, UINT sub, const D3D10_BOX* box, UINT rowPitch, UINT depthPitch)
+{
+    D3D10_RESOURCE_DIMENSION dim = D3D10_RESOURCE_DIMENSION_UNKNOWN;
+    dst->GetType(&dim);
+    if (dim == D3D10_RESOURCE_DIMENSION_BUFFER)
+    {
+        D3D10_BUFFER_DESC b{};
+        static_cast<ID3D10Buffer*>(dst)->GetDesc(&b);
+        return box ? (box->right > box->left ? box->right - box->left : 0) : b.ByteWidth;
+    }
+    UINT w = 1, h = 1, depth = 1, mips = 1;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE1D)
+    {
+        D3D10_TEXTURE1D_DESC t{};
+        static_cast<ID3D10Texture1D*>(dst)->GetDesc(&t);
+        w = t.Width, mips = t.MipLevels, format = t.Format;
+    }
+    else if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        D3D10_TEXTURE2D_DESC t{};
+        static_cast<ID3D10Texture2D*>(dst)->GetDesc(&t);
+        w = t.Width, h = t.Height, mips = t.MipLevels, format = t.Format;
+    }
+    else if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE3D)
+    {
+        D3D10_TEXTURE3D_DESC t{};
+        static_cast<ID3D10Texture3D*>(dst)->GetDesc(&t);
+        w = t.Width, h = t.Height, depth = t.Depth, mips = t.MipLevels, format = t.Format;
+    }
+    else
+        return SIZE_MAX;
+    const UINT mip = mips ? sub % mips : 0;
+    w = std::max(1u, w >> mip), h = std::max(1u, h >> mip), depth = std::max(1u, depth >> mip);
+    if (box)
+    {
+        w = box->right > box->left ? box->right - box->left : 0;
+        h = box->bottom > box->top ? box->bottom - box->top : 0;
+        depth = box->back > box->front ? box->back - box->front : 0;
+    }
+    if (!w || !h || !depth)
+        return 0;
+    UINT element = 0;
+    bool block = false;
+    if (!FormatElement(format, element, block))
+        return SIZE_MAX;
+    const size_t rows = block ? (h + 3) / 4 : h, rowBytes = static_cast<size_t>(block ? (w + 3) / 4 : w) * element;
+    if (rows > 1 && rowPitch < rowBytes)
+        return SIZE_MAX;
+    return static_cast<size_t>(depthPitch) * (depth - 1) + static_cast<size_t>(rowPitch) * (rows - 1) + rowBytes;
+}
+
+uint64_t g_updatesAsync, g_updatesSynced;
+
+void STDMETHODCALLTYPE R_UpdateSubresource(ID3D10Device1* self, ID3D10Resource* dst, UINT sub, const D3D10_BOX* box, const void* data, UINT rowPitch,
+                                           UINT depthPitch)
+{
+    const size_t bytes = dst && data ? UpdateSourceBytes(dst, sub, box, rowPitch, depthPitch) : SIZE_MAX;
+    if (bytes == SIZE_MAX || bytes > (8u << 20))
+    {
+        g_updatesSynced++;
+        using Fn = void(STDMETHODCALLTYPE*)(ID3D10Device1*, ID3D10Resource*, UINT, const D3D10_BOX*, const void*, UINT, UINT);
+        reinterpret_cast<Fn>(const_cast<void*>(static_cast<const void*>(kWrapVtable[34])))(self, dst, sub, box, data, rowPitch, depthPitch); // counts, syncs, calls
+        return;
+    }
+    g_wrapCalls[34]++;
+    g_updatesAsync++;
+    NoteRecorder();
+    const uint32_t size = static_cast<uint32_t>((bytes + 15) & ~size_t{15});
+    uint64_t start = g_dataWrite;
+    if (size)
+    {
+        if (start % kDataBytes + size > kDataBytes)
+            start += kDataBytes - start % kDataBytes;
+        while (start + size - g_dataReadSeen > kDataBytes)
+        {
+            g_dataReadSeen = g_dataRead.load(std::memory_order_acquire);
+            if (start + size - g_dataReadSeen > kDataBytes)
+            {
+                StreamPublish();
+                _mm_pause();
+            }
+        }
+        g_dataWrite = start + size;
+        memcpy(g_data + start % kDataBytes, data, bytes);
+    }
+    const uint64_t freeTo = g_ringMapCount ? g_ringMaps[0].start : g_dataWrite;
+    Recorder r = Begin(kOpUpdate, 48 + sizeof(D3D10_BOX));
+    Hold(dst);
+    r.Word(reinterpret_cast<uint64_t>(dst));
+    r.Word(sub);
+    r.Word(box != nullptr);
+    r.Word(start);
+    r.Word(rowPitch | static_cast<uint64_t>(depthPitch) << 32);
+    r.Word(freeTo);
+    const D3D10_BOX none{};
+    r.Bytes(box ? box : &none, sizeof(D3D10_BOX));
+    End(r);
+}
+
+void ExecuteUpdate(const uint64_t* w)
+{
+    using Fn = void(STDMETHODCALLTYPE*)(ID3D10Device1*, ID3D10Resource*, UINT, const D3D10_BOX*, const void*, UINT, UINT);
+    const auto* box = w[2] ? reinterpret_cast<const D3D10_BOX*>(w + 6) : nullptr;
+    const Fn fn = reinterpret_cast<Fn>((*reinterpret_cast<void* const* const*>(g_streamDevice))[34]);
+    fn(g_streamDevice, reinterpret_cast<ID3D10Resource*>(w[0]), static_cast<UINT>(w[1]), box, g_data + w[3] % kDataBytes, static_cast<UINT>(w[4]),
+       static_cast<UINT>(w[4] >> 32));
+    g_dataRead.store(w[5], std::memory_order_release);
+}
+
 void ExecuteUpload(const uint64_t* w)
 {
     auto* buffer = reinterpret_cast<ID3D10Buffer*>(w[0]);
@@ -1030,6 +1160,8 @@ void ExecuteUpload(const uint64_t* w)
     }
     g_dataRead.store(w[3], std::memory_order_release);
 }
+
+void ExecutePresent(const uint64_t* w); // below, with the swap chain hooks
 
 // Execution on the stream thread: calls the real device's current vtable.
 template <typename Fn>
@@ -1146,6 +1278,12 @@ void Execute(const CmdHeader* h)
         break;
     case kOpUpload:
         ExecuteUpload(w);
+        break;
+    case kOpUpdate:
+        ExecuteUpdate(w);
+        break;
+    case kOpPresent:
+        ExecutePresent(w);
         break;
     case kOpScene:
         Dx12SceneDone(reinterpret_cast<const DlssSceneInfo*>(w));
@@ -1272,6 +1410,46 @@ const SyncSlot kTextureSyncs[] = {{10, kSyncTextureMap}, {11, kSyncTextureUnmap}
 const SyncSlot kAsyncSyncs[] = {{7, kSyncAsyncBegin}, {8, kSyncAsyncEnd}, {9, kSyncAsyncGetData}};
 const SyncSlot kSwapChainSyncs[] = {{8, kSyncPresent}, {10, kSyncSetFullscreen}, {13, kSyncResizeBuffers}, {14, kSyncResizeTarget}};
 
+// Present without a full sync (CRYMT_ASYNCPRESENT=0: synced as before). It synced the whole stream and presented on the
+// render thread, the stream thread idle meanwhile: harbor 1.9 ms a frame of the render thread waiting there once
+// UpdateSubresource no longer synced. Now the render thread records the present and starts the next frame; the stream
+// thread presents in order (on the D3D12 back end PresentFrame - the frame's submit, the swap chain - is its work anyway).
+// At most one present is pending: the next one waits until the previous has been made. The result returned is the last
+// one made (a lost device shows one frame later).
+using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
+PresentFn g_presentOriginal;
+const void* g_presentVtable;
+bool g_asyncPresent = true;
+uint64_t g_lastPresentPos, g_presentsAsync;
+std::atomic<HRESULT> g_presentResult{S_OK};
+
+HRESULT STDMETHODCALLTYPE StreamPresent(IDXGISwapChain* self, UINT sync, UINT flags)
+{
+    if (!g_asyncPresent || (flags & DXGI_PRESENT_TEST) || *reinterpret_cast<const void* const*>(self) != g_presentVtable)
+    {
+        StreamSync(kSyncPresent);
+        return g_presentOriginal(self, sync, flags);
+    }
+    StreamWaitFor(g_lastPresentPos, kSyncPresent);
+    NoteRecorder();
+    Recorder r = Begin(kOpPresent, 24);
+    Hold(self);
+    r.Word(reinterpret_cast<uint64_t>(self));
+    r.Word(sync);
+    r.Word(flags);
+    End(r);
+    g_lastPresentPos = g_recordPos.load(std::memory_order_relaxed);
+    g_presentsAsync++;
+    StreamPublish();
+    return g_presentResult.load(std::memory_order_acquire);
+}
+
+void ExecutePresent(const uint64_t* w)
+{
+    const HRESULT hr = g_presentOriginal(reinterpret_cast<IDXGISwapChain*>(w[0]), static_cast<UINT>(w[1]), static_cast<UINT>(w[2]));
+    g_presentResult.store(hr == DXGI_STATUS_OCCLUDED ? S_OK : hr, std::memory_order_release);
+}
+
 constexpr int kMaxHookedVtables = 32;
 const void* g_hookedVtables[kMaxHookedVtables];
 std::atomic<int> g_hookedCount{0};
@@ -1313,8 +1491,18 @@ void HookObject(const void* object, HookKind kind)
                                               : std::size(kSwapChainSyncs);
         auto* table = const_cast<uintptr_t*>(reinterpret_cast<const uintptr_t*>(vtable));
         for (size_t i = 0; i < n; i++)
+        {
+            // The first swap chain's Present goes through the stream (one original kept); others sync.
+            if (kind == kHookSwapChain && slots[i].slot == 8 && !g_presentOriginal)
+            {
+                g_presentOriginal = reinterpret_cast<PresentFn>(table[8]);
+                g_presentVtable = vtable;
+                PatchSlot(table, 8, reinterpret_cast<uintptr_t>(&StreamPresent));
+                continue;
+            }
             if (const void* stub = EmitSyncStub(slots[i].reason, table[slots[i].slot]))
                 PatchSlot(table, slots[i].slot, reinterpret_cast<uintptr_t>(stub));
+        }
         g_hookedVtables[count] = vtable;
         g_hookedCount.store(count + 1, std::memory_order_release);
         const auto offset = reinterpret_cast<const uint8_t*>(vtable) - static_cast<const uint8_t*>(object);
@@ -1562,6 +1750,7 @@ void BuildStreamVtable()
     set(31, &R_RSSetScissorRects);
     set(32, &R_CopySubresourceRegion);
     set(33, &R_CopyResource);
+    set(34, &R_UpdateSubresource);
     set(35, &R_ClearRenderTargetView);
     set(36, &R_ClearDepthStencilView);
     set(37, &R_GenerateMips);
@@ -1588,6 +1777,10 @@ void BuildStreamVtable()
 
 void StartStream(ID3D10Device1* device)
 {
+    {
+        wchar_t v[8] = {};
+        g_asyncPresent = !(GetEnvironmentVariableW(L"CRYMT_ASYNCPRESENT", v, 8) && wcscmp(v, L"0") == 0);
+    }
     g_stream = static_cast<uint8_t*>(VirtualAlloc(nullptr, kStreamBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     g_data = static_cast<uint8_t*>(VirtualAlloc(nullptr, kDataBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     g_syncStubs = static_cast<uint8_t*>(VirtualAlloc(nullptr, kSyncStubs * kSyncStubBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
@@ -1999,6 +2192,8 @@ void D3DLayerWriteStats()
                 g_streamCommands / frames, g_streamBusyTicks * ms / frames, g_recorderSwitches / frames);
         fprintf(f, "data ring: %.1f uploads/frame, %.1f KB/frame; publishes %.1f/frame; holds %.1f/frame, objects held and released %.1f/frame\n",
                 g_ringUploads / frames, g_ringBytes / 1024.0 / frames, g_streamPublishes / frames, g_holds / frames, g_heldTotal / frames);
+        fprintf(f, "UpdateSubresource: through the data ring %.2f/frame, synced %.2f/frame; presents through the stream %.2f/frame\n",
+                g_updatesAsync / frames, g_updatesSynced / frames, g_presentsAsync / frames);
         fprintf(f, "highest slot set (start + count):");
         for (int s = 0; s < kWrapSlots; s++)
             if (g_setEnd[s])

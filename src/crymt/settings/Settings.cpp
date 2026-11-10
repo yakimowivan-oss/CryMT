@@ -537,7 +537,7 @@ std::wstring InstallGi()
                     Replace(frag, "    amb.xyz *= GetSkyAmount(", "    amb.xyz *= CryMT_GIBakedMix(pPass.IN.screenProj, GetSkyAmount(") &&
                     Replace(frag, "    pPass.IN.screenProj.xyzw);\n #else", "    pPass.IN.screenProj.xyzw), 4);\n #else") &&
                     Replace(frag, "    pPass.cAOMapVal = vAO.x*vAO.y*vAO.w;",
-                            "    pPass.cAOMapVal = CryMT_GISSAOMix(pPass.IN.screenProj, vAO.x) * CryMT_GITerrainAOMix(pPass.IN.screenProj, vAO.y) * vAO.w; // CryMT GI") &&
+                            "  #if %GRASS\n    pPass.cAOMapVal = vAO.x * CryMT_GITerrainAOMix(pPass.IN.screenProj, vAO.y) * vAO.w; // CryMT GI: grass keeps the engine's SSAO\n  #else\n    pPass.cAOMapVal = CryMT_GISSAOMix(pPass.IN.screenProj, vAO.x) * CryMT_GITerrainAOMix(pPass.IN.screenProj, vAO.y) * vAO.w; // CryMT GI\n  #endif") &&
                     Replace(terrain, "AmbientOp.xyz * IN.Color.a * (vAO.x * vAO.y * vAO.w)); // ambient",
                             "CryMT_GIAmbient(AmbientOp.xyz * CryMT_GIBakedMix(IN.screenProj, IN.Color.a, 16), IN.screenProj) * "
                             "(CryMT_GISSAOMix(IN.screenProj, vAO.x) * CryMT_GITerrainAOMix(IN.screenProj, vAO.y) * vAO.w)); // ambient (CryMT GI)") &&
@@ -562,7 +562,7 @@ std::wstring InstallGi()
                     Replace(zpass, "pixout Common_ZPassPS(vert2fragZ IN)\n{\n\tpixout OUT = (pixout)0;\n",
                             "// CryMT: the z-prepass also marks alpha-tested surfaces (leaves, grass, nets) in a second target that CryMT's back\n// end binds (without it the output goes nowhere): contact shadows and GTAO leave them out as occluders.\n#if D3D10\nstruct pixout_cryzpass\n{\n  float4 Color : COLOR0;\n  float4 Foliage : COLOR1;\n};\n#else\nstruct pixout_cryzpass\n{\n  float4 Color : COLOR0;\n};\n#endif\n\npixout_cryzpass CryMT_ZPassPS(vert2fragZ IN)\n{\n\tpixout_cryzpass OUT = (pixout_cryzpass)0;\n") &&
                     Replace(zpass, "\t\t#if %_RT_ALPHATEST\n\t\t\tfloat baseColor = tex2D(diffuseMapSampler, IN.baseTC.xy).w;\n",
-                            "\t\t#if %_RT_ALPHATEST\n\t\t\tfloat baseColor = tex2D(diffuseMapSampler, IN.baseTC.xy).w;\n#if D3D10\n\t\t\tOUT.Foliage = 1; // CryMT\n#endif\n") &&
+                            "\t\t#if %_RT_ALPHATEST\n\t\t\tfloat baseColor = tex2D(diffuseMapSampler, IN.baseTC.xy).w;\n#if D3D10\n  #if %GRASS\n\t\t\tOUT.Foliage = 0.6; // CryMT: grass (keeps the engine's SSAO, see fragLib)\n  #else\n\t\t\tOUT.Foliage = 1; // CryMT\n  #endif\n#endif\n") &&
                     Replace(zpass, "//////////////////////////////// technique ////////////////\n\ntechnique ZPass",
                             "// The engine's own z-prepass pixel shader (Methagen.cfx names it): CryMT_ZPassPS without the foliage mask. The ZPass\n// technique below uses CryMT_ZPassPS: the precompiled shared cache (ShaderCache.pak) holds Common_ZPassPS by name\n// and kept the unpatched one.\npixout Common_ZPassPS(vert2fragZ IN)\n{\n  pixout OUT;\n  OUT.Color = CryMT_ZPassPS(IN).Color;\n  return OUT;\n}\n\n//////////////////////////////// technique ////////////////\n\ntechnique ZPass") &&
                     Replace(zpass, "compile ps_3_0 Common_ZPassPS() ZPS;",

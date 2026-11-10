@@ -8,7 +8,7 @@ struct GiControl
 {
     std::atomic<bool> active{false};
     std::atomic<bool> enabled{true}, panel{true}, fastTime{false};
-    std::atomic<int> parts{0};          // Num1: 0 both GI parts, 1 the voxel cones only
+    std::atomic<int> parts{-1};         // Num1: 0 both GI parts, 1 the voxel cones only; -1 as CRYMT_GI_SCREEN says
     std::atomic<bool> weapon{true};     // Num.: GI on the first-person view (weapon, hands, held objects)
     std::atomic<int> view{0}; // voxel debug view: 0 off, 1 wire, 2 solid
     std::atomic<int> geometry{-1}; // Num3, voxel geometry: 0 off, 1 on (2 with foliage as partly open, ini only); -1 until set
@@ -22,8 +22,12 @@ struct GiControl
     std::atomic<float> occlusionScale{1.0f}, bounceScale{1.0f};
     std::atomic<float> timeOfDay{-1.0f}; // the time of day as main last read it (hours), -1 unknown
     std::atomic<float> startTime{11.5f}; // Num6 goes back to it (CRYMT_GI_STARTTIME, else 11:30)
-    // Num/ pages: 0 GI, 1 environment maps (the numpad's switches below while it shows; the time keys on both).
+    // Num/ pages: 0 GI, 1 voxels, 2 environment maps (the numpad's switches below while it shows; the time keys on all).
     std::atomic<int> page{0};
+    std::atomic<int> voxOpacity{-1};   // voxels page Num0: the cells' opacity 1 from the voxelized geometry only (the screen
+                                       // gives their colour), 0 also from the screen; -1 as CRYMT_GI_OCCUPANCY says
+    std::atomic<int> geomCache{-1};    // voxels page Num1: unchanged objects voxelized every 4th frame 1, every frame 0; -1 as
+                                       // CRYMT_GI_GEOMCACHE says
     std::atomic<int> env{-1};          // Num0: environment maps 1 from the voxel grid, 0 the game's; -1 as CRYMT_ENVMAP says
     std::atomic<bool> envAll{true};    // Num1: the reflection on every material (fragLib), not only those with their own map
     std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // Num4/Num7, Num5/Num8: their strengths

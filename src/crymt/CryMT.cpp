@@ -6983,6 +6983,24 @@ void GiHotkeys()
         // The environment maps' page: its own numpad switches (the time keys stay).
         if (g_giControl.panel && g_giControl.page == 1)
         {
+            // The voxels page.
+            bool done = true;
+            switch (kKeys[i])
+            {
+            case VK_NUMPAD0: g_giControl.voxOpacity = g_giControl.voxOpacity == 1 ? 0 : 1; break;
+            case VK_NUMPAD1: g_giControl.geomCache = g_giControl.geomCache == 1 ? 0 : 1; break;
+            case VK_NUMPAD2: g_giControl.view = (g_giControl.view + 1) % 3; break;
+            case VK_NUMPAD3: g_giControl.geometry = g_giControl.geometry > 0 ? 0 : 1; break;
+            default: done = false; break;
+            }
+            if (done)
+            {
+                FocusLog("frame %llu: voxels key %d", static_cast<unsigned long long>(g_frame), kKeys[i]);
+                continue;
+            }
+        }
+        if (g_giControl.panel && g_giControl.page == 2)
+        {
             bool done = true;
             switch (kKeys[i])
             {
@@ -7007,7 +7025,7 @@ void GiHotkeys()
         switch (kKeys[i])
         {
         case VK_NUMPAD0: g_giControl.enabled = !g_giControl.enabled; break;
-        case VK_NUMPAD1: g_giControl.parts = g_giControl.parts ? 0 : 1; break;
+        case VK_NUMPAD1: g_giControl.parts = g_giControl.parts == 1 ? 0 : 1; break;
         case VK_DECIMAL: g_giControl.weapon = !g_giControl.weapon; break;
         case VK_NUMPAD2: g_giControl.view = (g_giControl.view + 1) % 3; break;
         case VK_NUMPAD3: g_giControl.geometry = g_giControl.geometry > 0 ? 0 : 1; break;
@@ -7038,8 +7056,8 @@ void GiHotkeys()
                 g_giControl.page = 0;
                 g_giControl.panel = true;
             }
-            else if (g_giControl.page == 0)
-                g_giControl.page = 1;
+            else if (g_giControl.page < 2)
+                g_giControl.page = g_giControl.page + 1;
             else
                 g_giControl.panel = false;
             break;
