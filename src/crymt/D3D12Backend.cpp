@@ -5780,7 +5780,9 @@ public:
                                      // (default on since 2026-11-06, the user's choice: ~5-7 FPS)
         bool geometryFoliage = false; // CRYMT_GI_GEOMETRY=2: foliage too (mostly open cells)
         bool geometryPersist = true;  // CRYMT_GI_GEOMPERSIST=0: voxelized geometry only from the last three voxelizations
-        bool geometryCache = true;    // CRYMT_GI_GEOMCACHE=0: every draw voxelized each time its level updates; on: an object
+        bool geometryCache = false;   // CRYMT_GI_GEOMCACHE=1 (off by default since 2026-11-11: the user saw the shading flicker
+                                      // with it - a cell shared with foliage or a moving object takes the newest stamp, so the
+                                      // cached object won only one frame in four); on: an object
                                       // drawn unchanged (same buffers, same place in the world) every 4th frame, moved, new or
                                       // animated ones every time (with kept geometry only)
         bool opacityGeometry = true;  // the cells' opacity from the voxelized geometry only, the screen gives only their colour
@@ -5880,7 +5882,7 @@ public:
             v.geometry = v.voxels && !(geometryVar && wcscmp(text, L"0") == 0);
             v.geometryFoliage = v.geometry && geometryVar && wcscmp(text, L"2") == 0;
             v.geometryPersist = !(GetEnvironmentVariableW(L"CRYMT_GI_GEOMPERSIST", text, 32) && wcscmp(text, L"0") == 0);
-            v.geometryCache = !(GetEnvironmentVariableW(L"CRYMT_GI_GEOMCACHE", text, 32) && wcscmp(text, L"0") == 0);
+            v.geometryCache = GetEnvironmentVariableW(L"CRYMT_GI_GEOMCACHE", text, 32) && wcscmp(text, L"0") != 0;
             read(L"CRYMT_GI_FOLIAGE", v.foliageOpacity);
             v.opacityGeometry = !(GetEnvironmentVariableW(L"CRYMT_GI_OCCUPANCY", text, 32) && _wcsicmp(text, L"screen") == 0);
             v.screenPart = GetEnvironmentVariableW(L"CRYMT_GI_SCREEN", text, 32) && wcscmp(text, L"0") != 0;
