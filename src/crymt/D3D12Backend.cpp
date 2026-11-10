@@ -979,6 +979,31 @@ SerializeRootSignatureFn g_serializeRoot;
 constexpr UINT kGiConstants = 62; // with the two tables 64 DWORDs, the root signature's limit
 constexpr UINT kEnvSize = 64; // the environment maps' size (kGiShader envmap)
 constexpr UINT kPvolX = 64, kPvolY = 64, kPvolZ = 32, kPvolTiles = 8; // the particles' occlusion volumes (two: 1024 x 257 atlas)
+// The editor draws a viewport's scene into a colour target smaller than its depth target (the window's): the GI takes
+// that viewport's depth resampled to the colour's size (SceneDepth). After a contributor's patch (support editor.patch,
+// 2026-11-08).
+const char* const kDepthAlignShader = R"(
+cbuffer DepthConstants : register(b0)
+{
+    float2 outputSize;
+    float2 sourceOrigin;
+    float2 sourceSize;
+};
+Texture2D<float> sourceDepth : register(t0);
+RWTexture2D<float> outputDepth : register(u0);
+[numthreads(8, 8, 1)]
+void AlignDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)outputSize.x || id.y >= (uint)outputSize.y)
+        return;
+    uint width, height;
+    sourceDepth.GetDimensions(width, height);
+    float2 p = sourceOrigin + (id.xy + 0.5) * sourceSize / outputSize;
+    int2 pixel = clamp((int2)floor(p), int2(0, 0), int2(width - 1, height - 1));
+    outputDepth[id.xy] = sourceDepth.Load(int3(pixel, 0));
+}
+)";
+
 const char* const kGiShader = R"(
 cbuffer GiConstants : register(b0)
 {
@@ -6038,7 +6063,8 @@ public:
             return;
         auto* color = static_cast<TextureCore*>(m_rtv[0]->info);
         auto* depth = static_cast<TextureCore*>(m_dsv->info);
-        if (color->width != depth->width || color->height != depth->height || color->samples != 1 || !EnsureGi(color->width, color->height, color->format))
+        if (depth->width < color->width || depth->height < color->height || color->samples != 1 || depth->samples != 1 ||
+            !EnsureGi(color->width, color->height, color->format))
             return;
         m_giSceneDepth = m_dsv->info;
         memcpy(m_giSun, info->sun, sizeof(m_giSun));
@@ -6343,6 +6369,151 @@ public:
         return true;
     }
 
+    bool EnsureDepthAlignPipeline()
+    {
+        if (m_depthAlignPso || m_depthAlignFailed)
+            return m_depthAlignPso != nullptr;
+        m_depthAlignFailed = true;
+        using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+        auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+        if (!compile || !g_serializeRoot)
+            return false;
+        ID3DBlob* code = nullptr;
+        ID3DBlob* errors = nullptr;
+        HRESULT hr = compile(kDepthAlignShader, strlen(kDepthAlignShader), "CryMT_DepthAlign", nullptr, nullptr, "AlignDepth", "cs_5_0",
+                             1 << 15 /* OPTIMIZATION_LEVEL3 */, 0, &code, &errors);
+        if (FAILED(hr))
+        {
+            Log("depth align shader: %s", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
+            if (code)
+                code->Release();
+            if (errors)
+                errors->Release();
+            return false;
+        }
+        if (errors)
+            errors->Release();
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1}};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.Num32BitValues = 6;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {2, ranges};
+        D3D12_ROOT_SIGNATURE_DESC rd{};
+        rd.NumParameters = 2;
+        rd.pParameters = params;
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* rootErrors = nullptr;
+        hr = g_serializeRoot(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rootErrors);
+        if (SUCCEEDED(hr))
+            hr = g.dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                            reinterpret_cast<void**>(&m_depthAlignRoot));
+        if (blob)
+            blob->Release();
+        if (rootErrors)
+            rootErrors->Release();
+        if (SUCCEEDED(hr))
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = m_depthAlignRoot;
+            pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+            hr = g.dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&m_depthAlignPso));
+        }
+        code->Release();
+        m_depthAlignFailed = FAILED(hr);
+        Log("depth align pipeline: %s", SUCCEEDED(hr) ? "ready" : "failed");
+        return SUCCEEDED(hr);
+    }
+
+    // The scene's depth at width x height for the GI: the depth target itself when it has that size (the game); the
+    // editor's viewport (viewport 0 when it lies in the target, else the top-left corner) copied into an R32F texture of
+    // that size when the depth target is the window's.
+    TextureCore* SceneDepth(TextureCore* depth, UINT width, UINT height)
+    {
+        if (!depth || depth->samples != 1 || !width || !height || depth->width < width || depth->height < height)
+            return nullptr;
+        if (depth->width == width && depth->height == height)
+            return depth;
+        if (!EnsureDepthAlignPipeline())
+            return nullptr;
+        float rect[4] = {0, 0, static_cast<float>(width), static_cast<float>(height)};
+        if (m_numViewports)
+        {
+            const D3D10_VIEWPORT& vp = m_vp10[0];
+            if (vp.Width && vp.Height && vp.TopLeftX + vp.Width <= depth->width && vp.TopLeftY + vp.Height <= depth->height)
+            {
+                rect[0] = static_cast<float>(vp.TopLeftX);
+                rect[1] = static_cast<float>(vp.TopLeftY);
+                rect[2] = static_cast<float>(vp.Width);
+                rect[3] = static_cast<float>(vp.Height);
+            }
+        }
+        if (!m_depthAligned.res || m_depthAligned.width != width || m_depthAligned.height != height)
+        {
+            DeferRelease(m_depthAligned.res);
+            m_depthAligned.res = nullptr;
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = width;
+            d.Height = height;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = DXGI_FORMAT_R32_FLOAT;
+            d.SampleDesc.Count = 1;
+            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_depthAligned.res))))
+            {
+                m_depthAligned.res = nullptr;
+                return nullptr;
+            }
+            m_depthAligned.width = width;
+            m_depthAligned.height = height;
+            m_depthAligned.format = DXGI_FORMAT_R32_FLOAT;
+            m_depthAligned.samples = 1;
+            m_depthAligned.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        if (memcmp(m_depthAlignRect, rect, sizeof(rect)) != 0)
+        {
+            memcpy(m_depthAlignRect, rect, sizeof(rect));
+            Log("scene depth for the GI: viewport %.0f,%.0f %.0fx%.0f of the %ux%u depth target -> %ux%u", rect[0], rect[1], rect[2], rect[3],
+                depth->width, depth->height, width, height);
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+        while (!m_srvRing.TryAlloc(2, cpu, gpu))
+        {
+            Submit();
+            WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
+            PollFence();
+            m_srvRing.Reclaim();
+        }
+        Require(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Require(&m_depthAligned, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        FlushBarriers();
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = DepthSrvFormat(depth->format);
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        g.dev->CreateShaderResourceView(depth->res, &sd, cpu);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R32_FLOAT;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        g.dev->CreateUnorderedAccessView(m_depthAligned.res, nullptr, &ud, {cpu.ptr + g.srvInc});
+        const float constants[6] = {static_cast<float>(width), static_cast<float>(height), rect[0], rect[1], rect[2], rect[3]};
+        m_list->SetComputeRootSignature(m_depthAlignRoot);
+        m_list->SetComputeRoot32BitConstants(0, 6, constants, 0);
+        m_list->SetComputeRootDescriptorTable(1, gpu);
+        m_list->SetPipelineState(m_depthAlignPso);
+        m_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+        RestoreListState();
+        return &m_depthAligned;
+    }
+
     bool EnsureGiPipeline()
     {
         if (m_giPso || m_giFailed)
@@ -6464,8 +6635,8 @@ public:
         m_note.gi = 1;
         if (!m_dsv || !m_giHaveCamera || !EnsureGiPipeline())
             return;
-        auto* depth = static_cast<TextureCore*>(m_dsv->info);
-        if (depth->width != m_giFullW || depth->height != m_giFullH || depth->samples != 1)
+        TextureCore* depth = SceneDepth(static_cast<TextureCore*>(m_dsv->info), m_giFullW, m_giFullH);
+        if (!depth)
             return;
         const int prev = m_giCur, cur = m_giCur ^ 1;
         Require(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -9000,6 +9171,11 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE m_giHistSrv[2] = {};
     D3D12_RESOURCE_STATES m_giHistState[2] = {};
     ID3D12RootSignature* m_giRoot = nullptr;
+    ID3D12RootSignature* m_depthAlignRoot = nullptr; // SceneDepth (the editor's viewports)
+    ID3D12PipelineState* m_depthAlignPso = nullptr;
+    bool m_depthAlignFailed = false;
+    TextureCore m_depthAligned{};
+    float m_depthAlignRect[4] = {};
     ID3D12PipelineState* m_giPso = nullptr;       // trace
     ID3D12PipelineState* m_giPsoFilter = nullptr; // blur + temporal blend
     ID3D12Resource* m_giRaw = nullptr;            // traced result before the filter (unordered access between passes)

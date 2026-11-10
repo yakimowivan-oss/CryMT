@@ -84,7 +84,9 @@ void LoadCryMT(HMODULE self)
         SetEnvironmentVariableW(L"CRYMT_D3D12", L"1");
         SetEnvironmentVariableW(L"CRYMT_D3DSTREAM", L"1");
     }
-    if (mode == L"dlaa")
+    // Not in the editor: its viewports are not the swap chain's size, DLSS was skipped there and the camera jitter alone
+    // shook the picture (the user, 2026-11-11).
+    if (mode == L"dlaa" && !editor)
         SetEnvironmentVariableW(L"CRYMT_DLSS", L"1");
     wchar_t borderless[8] = {};
     GetPrivateProfileStringW(L"CryMT", L"Borderless", L"1", borderless, 8, ini.c_str());
@@ -97,7 +99,7 @@ void LoadCryMT(HMODULE self)
     // Console commands CryMT runs on the first frame (CRYMT_TESTCMD, one per frame): what the .cmd launchers pass on the
     // command line, plus the [CVars] lines of the ini ("r_Something=value"), so a plain start of Crysis.exe is the same.
     std::wstring commands = L"r_DynTexMaxSize 256";
-    if (mode == L"dlaa")
+    if (mode == L"dlaa" && !editor)
         commands += L";r_UseEdgeAA 0";
     wchar_t cvars[2048] = {};
     GetPrivateProfileSectionW(L"CVars", cvars, 2048, ini.c_str());
