@@ -104,8 +104,10 @@
     }
     // The chosen mod ({name, dll, dll32, shaders, gi} from the window), if its folder is still there.
     const modOf = vals => (vals.mod && (C.STATUS.mods || []).find(m => m.name === vals.mod)) || null;
-    // A mod with its own versions of the shaders CryMT's GI patches: the game reads the mod's, so the GI is off for it.
-    const modGiOff = vals => { const m = modOf(vals); return !!(m && m.gi); };
+    // A mod with its own versions of the shaders CryMT's GI patches: the game reads the mod's, so the GI is off for it,
+    // unless the player turned on modShaders (GI at their own risk); modGiRisk: that case.
+    const modGiOff = vals => { const m = modOf(vals); return !!(m && m.gi && !vals.modShaders); };
+    const modGiRisk = vals => { const m = modOf(vals); return !!(m && m.gi && vals.modShaders && MODES.dx12Mode(vals) && vals.gi); };
     const featureOn = (id, vals) => !blocker(byId[id], vals) && isOn(byId[id], vals[id]);
     function loadMs(vals) {
         let ms = 0;
@@ -116,13 +118,13 @@
     function launchArgs(vals) {
         const m = modOf(vals);
         return '-dx10' + (vals.devmode ? ' -DEVMODE' : '') + (m ? ' -mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : '') +
-            (m && m.gi ? ' -crymt-gi=0' : '');
+            (modGiOff(vals) ? ' -crymt-gi=0' : '');
     }
     // The editor with CryMT (option editorCryMT, a CryMT mode): its GI as the game's, -crymt-gi=0 for a mod with its own shaders.
     const editorCryMT = vals => !!vals.editorCryMT && MODES.mtMode(vals);
     const editorArgs = vals => {
         const m = modOf(vals);
-        return (m ? '-mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : '') + (m && m.gi && editorCryMT(vals) ? ' -crymt-gi=0' : '');
+        return (m ? '-mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : '') + (modGiOff(vals) && editorCryMT(vals) ? ' -crymt-gi=0' : '');
     };
     // DLAA on the home page: mode dx12 <-> dlaa, when the mode has DirectX 12 and the card can (NVIDIA RTX).
     const dlaaWhyNot = vals => (!MODES.dx12Mode(vals) ? tt('нужен режим с DirectX 12', 'needs a DirectX 12 mode') :
@@ -619,8 +621,10 @@
         if (mod) {
             notes.push(tt('Мод «', 'Mod «') + mod.name + tt('»: игра запускается с -mod ', '»: the game starts with -mod ') + mod.name +
                 (mod.dll ? tt('. У мода своя DLL игры — CryMT с ней работает.', '. It has its own game DLL; CryMT works with it.') : '.'));
-            if (mod.gi && MODES.dx12Mode(vals) && vals.gi)
-                notes.push(tt('Мод меняет шейдеры, которые правит GI: с ним GI выключается (-crymt-gi=0), остальное работает.', 'The mod changes the shaders the GI patches: with it the GI is off (-crymt-gi=0), the rest works.'));
+            if (modGiRisk(vals))
+                notes.push(tt('Мод меняет шейдеры, которые правит GI, а GI включён на ваш риск («GI с модом, у которого свои шейдеры GI»): GI виден только там, где мод не заменил шейдеры, возможны ошибки картинки.', 'The mod changes the shaders the GI patches and the GI is on at your own risk ("GI with a mod that has its own GI shaders"): the GI shows only where the mod kept the shaders, the picture can break.'));
+            else if (mod.gi && MODES.dx12Mode(vals) && vals.gi)
+                notes.push(tt('Мод меняет шейдеры, которые правит GI: с ним GI выключается (-crymt-gi=0), остальное работает. Запустить с GI на свой риск: «GI с модом, у которого свои шейдеры GI».', 'The mod changes the shaders the GI patches: with it the GI is off (-crymt-gi=0), the rest works. To start it with the GI at your own risk: "GI with a mod that has its own GI shaders".'));
             else if (mod.shaders && featureOn('gi', vals))
                 notes.push(tt('Мод меняет шейдеры (не те, что правит GI). Если картинка сломается — «MT + DLAA».', 'The mod changes shaders (not the ones the GI patches). If the image breaks, use «MT + DLAA».'));
             if (mod.dll32) notes.push(tt('У мода только 32-битная DLL (Bin32): в 64-битной игре его код не загрузится.', 'The mod has only a 32-bit DLL (Bin32): its code does not load in the 64-bit game.'));
@@ -944,7 +948,7 @@
             (st.proxy === false ? '<span>' + dot('bad') + tt('Нет Bin64\\dbghelp.dll</span>', 'No Bin64\\dbghelp.dll</span>') : '') +
             '<span>' + shd + '</span>' +
             (modOf(vals) ? '<span' + (modOf(vals).gi && MODES.dx12Mode(vals) && vals.gi ? ' class="warn"' : '') + '>' + dot(modOf(vals).gi && MODES.dx12Mode(vals) && vals.gi ? 'warn' : 'acc') +
-                tt('Мод: ', 'Mod: ') + esc(modOf(vals).name) + (modOf(vals).gi && MODES.dx12Mode(vals) && vals.gi ? tt(' · GI выкл', ' · GI off') : '') + '</span>' : '') +
+                tt('Мод: ', 'Mod: ') + esc(modOf(vals).name) + (modOf(vals).gi && MODES.dx12Mode(vals) && vals.gi ? (modGiRisk(vals) ? tt(' · GI на свой риск', ' · GI at own risk') : tt(' · GI выкл', ' · GI off')) : '') + '</span>' : '') +
             (msaaOff(vals) ? '<span class="warn" title="' + esc(tt('MSAA из настроек игры с CryMT выключается (пока не поддерживается)', 'The game\'s MSAA is turned off with CryMT (not supported yet)')) + '">' +
                 dot('warn') + tt('MSAA выключен', 'MSAA off') + '</span>' : '') +
             (st.lastOff ? '<span class="warn" title="' + esc(st.lastOff) + '">' + dot('warn') + tt('Прошлый запуск: CryMT был выключен</span>', 'Last start: CryMT was off</span>') : '') +
