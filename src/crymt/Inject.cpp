@@ -1,5 +1,6 @@
 // Starts Bin64\Crysis.exe suspended, loads CryMT.dll into it, resumes it, and prints its PID.
-// Usage: Inject [--wait] [--native] <path to CryMT.dll | none> <game dir> [game args...]
+// Usage: Inject [--wait] [--native] [--exe <name in Bin64>] <path to CryMT.dll | none> <game dir> [game args...]
+// --exe: another program of Bin64 instead of Crysis.exe (EditorLauncher.exe: the editor tests).
 // --wait: return only when the game has exited (for the benchmark scripts). Relative paths are resolved here.
 // --native: fullscreen at the primary monitor's current mode (added before the game args, so they can override it).
 // "none" instead of the DLL starts the unmodified game the same way (benchmark comparisons).
@@ -19,12 +20,15 @@ int wmain(int argc, wchar_t** argv)
 {
     int a = 1;
     bool wait = false, native = false;
+    std::wstring exeName = L"Crysis.exe";
     for (; a < argc && wcsncmp(argv[a], L"--", 2) == 0; a++)
     {
         if (wcscmp(argv[a], L"--wait") == 0)
             wait = true;
         else if (wcscmp(argv[a], L"--native") == 0)
             native = true;
+        else if (wcscmp(argv[a], L"--exe") == 0 && a + 1 < argc)
+            exeName = argv[++a];
         else
             break;
     }
@@ -44,12 +48,12 @@ int wmain(int argc, wchar_t** argv)
         fprintf(stderr, "CryMT.dll not found: %ls\n", dll.c_str());
         return 1;
     }
-    if (GetFileAttributesW((bin + L"\\Crysis.exe").c_str()) == INVALID_FILE_ATTRIBUTES)
+    if (GetFileAttributesW((bin + L"\\" + exeName).c_str()) == INVALID_FILE_ATTRIBUTES)
     {
-        fprintf(stderr, "Bin64\\Crysis.exe not found in %ls\n", game.c_str());
+        fprintf(stderr, "Bin64\\%ls not found in %ls\n", exeName.c_str(), game.c_str());
         return 1;
     }
-    std::wstring cmd = L"\"" + bin + L"\\Crysis.exe\"";
+    std::wstring cmd = L"\"" + bin + L"\\" + exeName + L"\"";
     if (native)
     {
         DEVMODEW mode{};

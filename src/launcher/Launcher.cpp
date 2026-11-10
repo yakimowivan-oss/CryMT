@@ -2,7 +2,7 @@
 // minimise / close buttons and moves the window by its header) holding the HTML UI (ui\index.html) in WebView2.
 // Lives in <game>\CryMT; the page does the settings, this file only touches files and processes for it:
 //   page -> window (strings): load | save\n<CryMT.ini text> | play\n<gi 0|1>\n<arguments>\n<minimize|close|stay> |
-//                             editor\n<arguments>\n<minimize|close|stay> |
+//                             editor\n<gi 0|1>\n<crymt 0|1>\n<arguments>\n<minimize|close|stay> |
 //                             drag | min | max | close | resize\n<n|s|e|w|ne|nw|se|sw> | open\n<game|crymt|logs|mods>
 //                             fetch\n<id>\n<url> | update-manifest\n<url>\n<signature url> | update-install\n<zip url> |
 //                             rollback | verify | restart
@@ -473,24 +473,112 @@ void Play(bool gi, const std::wstring& args, const std::wstring& after)
     }).detach();
 }
 
-// The Sandbox Editor of the Mod SDK (Bin64\Editor.exe), through c1-launcher's EditorLauncher.exe when it is there (its
-// memory fixes), with the chosen mod. Without CryMT: the loader only starts it in Crysis.exe, its render thread and
-// DX12 back end expect one game window, the editor draws several viewports.
-void Editor(const std::wstring& args, const std::wstring& after)
+// This process's environment plus one variable, as a block for CreateProcess (CREATE_UNICODE_ENVIRONMENT): the marker
+// reaches only that child. After a contributor's patch (support editor.patch, 2026-11-08).
+std::vector<wchar_t> ChildEnvironment(const std::wstring& name, const std::wstring& value)
 {
-    std::wstring error;
-    const std::wstring bin = g_game + L"Bin64";
-    const std::wstring exe = bin + (Exists(bin + L"\\EditorLauncher.exe") ? L"\\EditorLauncher.exe" : L"\\Editor.exe");
-    if (!Exists(bin + L"\\Editor.exe"))
-        error = T(L"нет Bin64\\Editor.exe (редактор ставится с Crysis Mod SDK)", L"no Bin64\\Editor.exe (the editor comes with the Crysis Mod SDK)");
-    else
+    std::vector<std::wstring> entries;
+    if (LPWCH current = GetEnvironmentStringsW())
     {
-        const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", exe.c_str(), args.c_str(), bin.c_str(), SW_SHOWNORMAL));
-        if (r <= 32)
-            error = exe.substr(g_game.size()) + T(L" не запустился (", L" did not start (") + std::to_wstring(r) + L")";
+        for (const wchar_t* p = current; *p; p += wcslen(p) + 1)
+        {
+            const std::wstring entry = p;
+            const size_t eq = entry.find(L'=', 1); // entries like "=C:=C:\" start with '='
+            if (eq == std::wstring::npos || _wcsicmp(entry.substr(0, eq).c_str(), name.c_str()) != 0)
+                entries.push_back(entry);
+        }
+        FreeEnvironmentStringsW(current);
     }
-    SendLater(L"{\"type\":\"played\",\"ok\":" + std::wstring(Bool(error.empty())) + L",\"error\":" + Json(error) + L",\"after\":" +
-              Json(error.empty() ? after : L"stay") + L",\"editor\":true}");
+    entries.push_back(name + L"=" + value);
+    std::sort(entries.begin(), entries.end(), [](const std::wstring& a, const std::wstring& b) { return _wcsicmp(a.c_str(), b.c_str()) < 0; });
+    std::vector<wchar_t> block;
+    for (const std::wstring& e : entries)
+    {
+        block.insert(block.end(), e.begin(), e.end());
+        block.push_back(0);
+    }
+    block.push_back(0);
+    return block;
+}
+
+// LoadLibraryW(path) in a suspended child, before its own code runs.
+bool LoadInto(HANDLE process, const std::wstring& path, std::wstring& error)
+{
+    const SIZE_T bytes = (path.size() + 1) * sizeof(wchar_t);
+    void* remote = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    SIZE_T written = 0;
+    if (!remote || !WriteProcessMemory(process, remote, path.c_str(), bytes, &written) || written != bytes)
+    {
+        error = T(L"не удалось передать редактору путь к загрузчику CryMT (", L"could not pass the CryMT loader's path to the editor (") + std::to_wstring(GetLastError()) + L")";
+        if (remote)
+            VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+        return false;
+    }
+    const auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
+    HANDLE thread = CreateRemoteThread(process, nullptr, 0, loadLibrary, remote, 0, nullptr);
+    DWORD loaded = 0;
+    if (thread)
+    {
+        WaitForSingleObject(thread, 30000);
+        GetExitCodeThread(thread, &loaded);
+        CloseHandle(thread);
+    }
+    VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+    if (!loaded)
+        error = T(L"редактор не загрузил Bin64\\dbghelp.dll (загрузчик CryMT)", L"the editor did not load Bin64\\dbghelp.dll (the CryMT loader)");
+    return loaded != 0;
+}
+
+// The Sandbox Editor of the Mod SDK (Bin64\Editor.exe), through c1-launcher's EditorLauncher.exe when it is there (its
+// memory fixes), with the chosen mod. With CryMT (the "Editor with CryMT" option and a CryMT mode): shaders as for the
+// game, then the editor starts suspended with CRYMT_EDITOR=1 in its environment and gets Bin64\dbghelp.dll loaded
+// before it runs (EditorLauncher does not load it from Bin64 itself); the loader then starts CryMT with the editor's
+// settings (no pause on focus loss, no save hooks, no borderless window). Ordinary starts of the editor stay stock.
+void Editor(bool gi, bool crymt, const std::wstring& args, const std::wstring& after)
+{
+    std::thread([gi, crymt, args, after] {
+        std::wstring error;
+        const std::wstring bin = g_game + L"Bin64";
+        const std::wstring exe = bin + (Exists(bin + L"\\EditorLauncher.exe") ? L"\\EditorLauncher.exe" : L"\\Editor.exe");
+        const std::wstring settings = g_dir + L"CryMTSettings.exe";
+        if (!Exists(bin + L"\\Editor.exe"))
+            error = T(L"нет Bin64\\Editor.exe (редактор ставится с Crysis Mod SDK)", L"no Bin64\\Editor.exe (the editor comes with the Crysis Mod SDK)");
+        else if (crymt && !Exists(bin + L"\\dbghelp.dll"))
+            error = T(L"нет Bin64\\dbghelp.dll (загрузчик CryMT)", L"no Bin64\\dbghelp.dll (the CryMT loader)");
+        else if (!Exists(settings))
+            error = T(L"нет ", L"missing: ") + settings;
+        else if (const DWORD code = RunWait(L"\"" + settings + L"\" " + (gi ? L"--gi-install" : L"--gi-remove")))
+            error = std::wstring(gi ? T(L"шейдеры GI не установились", L"the GI shaders were not installed") : T(L"шейдеры GI не удалились", L"the GI shaders were not removed")) + T(L" (код ", L" (code ") + std::to_wstring(code) + L")";
+        else if (!crymt)
+        {
+            const auto r = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", exe.c_str(), args.c_str(), bin.c_str(), SW_SHOWNORMAL));
+            if (r <= 32)
+                error = exe.substr(g_game.size()) + T(L" не запустился (", L" did not start (") + std::to_wstring(r) + L")";
+        }
+        else
+        {
+            std::wstring command = L"\"" + exe + L"\"" + (args.empty() ? L"" : L" " + args);
+            std::vector<wchar_t> environment = ChildEnvironment(L"CRYMT_EDITOR", L"1");
+            STARTUPINFOW si{sizeof(si)};
+            PROCESS_INFORMATION pi{};
+            if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT, environment.data(),
+                                bin.c_str(), &si, &pi))
+                error = exe.substr(g_game.size()) + T(L" не запустился (", L" did not start (") + std::to_wstring(GetLastError()) + L")";
+            else
+            {
+                if (!LoadInto(pi.hProcess, bin + L"\\dbghelp.dll", error) || ResumeThread(pi.hThread) == static_cast<DWORD>(-1))
+                {
+                    if (error.empty())
+                        error = exe.substr(g_game.size()) + T(L" не продолжил запуск (", L" did not resume (") + std::to_wstring(GetLastError()) + L")";
+                    TerminateProcess(pi.hProcess, 1);
+                }
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+        }
+        SendLater(L"{\"type\":\"played\",\"ok\":" + std::wstring(Bool(error.empty())) + L",\"error\":" + Json(error) + L",\"after\":" +
+                  Json(error.empty() ? after : L"stay") + L",\"editor\":true}");
+    }).detach();
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1128,8 +1216,17 @@ void OnMessage(const std::wstring& m)
     }
     else if (cmd == L"editor")
     {
-        const size_t nl2 = rest.find(L'\n');
-        Editor(rest.substr(0, nl2), nl2 == std::wstring::npos ? L"stay" : rest.substr(nl2 + 1));
+        std::vector<std::wstring> part; // gi, crymt, arguments, after
+        for (size_t at = 0;;)
+        {
+            const size_t nl2 = rest.find(L'\n', at);
+            part.push_back(rest.substr(at, nl2 == std::wstring::npos ? std::wstring::npos : nl2 - at));
+            if (nl2 == std::wstring::npos)
+                break;
+            at = nl2 + 1;
+        }
+        part.resize(4);
+        Editor(part[0] == L"1", part[1] == L"1", part[2], part[3].empty() ? L"stay" : part[3]);
     }
     else if (cmd == L"fetch")
     {

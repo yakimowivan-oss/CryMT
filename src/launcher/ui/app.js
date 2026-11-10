@@ -1,6 +1,6 @@
 // CryMT launcher UI. Everything shown comes from options.js, CryMT.ini goes through ini.js; this file draws and talks to
 // the window (CryMTLauncher.exe, WebView2): messages 'load', 'save\n<ini>', 'play\n<gi>\n<args>\n<after>',
-// 'editor\n<args>\n<after>', 'drag', 'min', 'max', 'resize\n<edge>', 'close', 'open\n<what>'; replies {type: 'state' |
+// 'editor\n<gi>\n<crymt>\n<args>\n<after>', 'drag', 'min', 'max', 'resize\n<edge>', 'close', 'open\n<what>'; replies {type: 'state' |
 // 'saved' | 'played' | 'window' | 'error'}. Opened as a plain page in a
 // browser it works on localStorage and shows what the window would do.
 (function () {
@@ -118,7 +118,12 @@
         return '-dx10' + (vals.devmode ? ' -DEVMODE' : '') + (m ? ' -mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : '') +
             (m && m.gi ? ' -crymt-gi=0' : '');
     }
-    const editorArgs = vals => { const m = modOf(vals); return m ? '-mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : ''; };
+    // The editor with CryMT (option editorCryMT, a CryMT mode): its GI as the game's, -crymt-gi=0 for a mod with its own shaders.
+    const editorCryMT = vals => !!vals.editorCryMT && MODES.mtMode(vals);
+    const editorArgs = vals => {
+        const m = modOf(vals);
+        return (m ? '-mod ' + (/\s/.test(m.name) ? '"' + m.name + '"' : m.name) : '') + (m && m.gi && editorCryMT(vals) ? ' -crymt-gi=0' : '');
+    };
     // DLAA on the home page: mode dx12 <-> dlaa, when the mode has DirectX 12 and the card can (NVIDIA RTX).
     const dlaaWhyNot = vals => (!MODES.dx12Mode(vals) ? tt('нужен режим с DirectX 12', 'needs a DirectX 12 mode') :
         C.STATUS.gpu && !C.STATUS.dlss ? tt('нужна NVIDIA RTX, у вас ', 'needs an NVIDIA RTX card, yours: ') + C.STATUS.gpu : null);
@@ -183,7 +188,8 @@
             host.save();
             S.busy = true;
             syncFooter();
-            send('editor\n' + editorArgs(S.values) + '\n' + S.values.afterStart);
+            send('editor\n' + (editorCryMT(S.values) && shadersNeeded(S.values) ? '1' : '0') + '\n' + (editorCryMT(S.values) ? '1' : '0') + '\n' +
+                 editorArgs(S.values) + '\n' + S.values.afterStart);
         },
         drag: () => send('drag'),
         min: () => send('min'),
@@ -202,7 +208,7 @@
         saveSoon: () => {},
         play: () => toast(tt('В окне лаунчера: записать CryMT.ini → ', 'In the launcher window: write CryMT.ini → ') + (shadersNeeded(S.values) ? tt('поставить шейдеры GI → ', 'install the GI shaders → ') : tt('убрать шейдеры GI → ', 'remove the GI shaders → ')) +
             tt('запустить Bin64\\Crysis.exe ', 'start Bin64\\Crysis.exe ') + launchArgs(S.values)),
-        editor: () => toast(tt('В окне лаунчера: запустить редактор ', 'In the launcher window: start the editor ') + editorArgs(S.values)),
+        editor: () => toast(tt('В окне лаунчера: запустить редактор ', 'In the launcher window: start the editor ') + (editorCryMT(S.values) ? tt('с CryMT ', 'with CryMT ') : '') + editorArgs(S.values)),
         drag: () => {},
         max: () => {},
         resize: () => {},

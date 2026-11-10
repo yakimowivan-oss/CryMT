@@ -59,7 +59,12 @@ void LoadCryMT(HMODULE self)
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const wchar_t* name = wcsrchr(exe, L'\\');
-    if (!name || _wcsicmp(name + 1, L"Crysis.exe") != 0) // not the dedicated server or tools
+    // The Sandbox Editor only when CryMT's launcher started it with CRYMT_EDITOR=1 in its environment (it loads this
+    // proxy into the suspended editor): a plain start of the editor stays stock.
+    wchar_t editorMark[4] = {};
+    const bool editor = name && (_wcsicmp(name + 1, L"EditorLauncher.exe") == 0 || _wcsicmp(name + 1, L"Editor.exe") == 0) &&
+                        GetEnvironmentVariableW(L"CRYMT_EDITOR", editorMark, 4) && wcscmp(editorMark, L"1") == 0;
+    if (!name || (!editor && _wcsicmp(name + 1, L"Crysis.exe") != 0)) // not the dedicated server or tools
         return;
     if (GetEnvironmentVariableW(L"CRYMT_MODE", nullptr, 0))
         return;
@@ -83,10 +88,12 @@ void LoadCryMT(HMODULE self)
         SetEnvironmentVariableW(L"CRYMT_DLSS", L"1");
     wchar_t borderless[8] = {};
     GetPrivateProfileStringW(L"CryMT", L"Borderless", L"1", borderless, 8, ini.c_str());
-    SetEnvironmentVariableW(L"CRYMT_BORDERLESS", borderless);
+    SetEnvironmentVariableW(L"CRYMT_BORDERLESS", editor ? L"0" : borderless); // the editor keeps its own windows
     wchar_t pause[8] = {};
     GetPrivateProfileStringW(L"CryMT", L"PauseOnFocusLoss", L"1", pause, 8, ini.c_str());
-    SetEnvironmentVariableW(L"CRYMT_PAUSEONFOCUS", pause);
+    SetEnvironmentVariableW(L"CRYMT_PAUSEONFOCUS", editor ? L"0" : pause); // focus moves between the editor's panels
+    if (editor)
+        SetEnvironmentVariableW(L"CRYMT_ASYNCSAVE", L"0"); // the game's save hooks do not cover the editor's saves
     // Console commands CryMT runs on the first frame (CRYMT_TESTCMD, one per frame): what the .cmd launchers pass on the
     // command line, plus the [CVars] lines of the ini ("r_Something=value"), so a plain start of Crysis.exe is the same.
     std::wstring commands = L"r_DynTexMaxSize 256";
