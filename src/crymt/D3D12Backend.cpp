@@ -950,6 +950,22 @@ struct ResourceInfo
 
 ResourceInfo* Info(ID3D10Resource* r);
 uint32_t EnvTestColour(); // CRYMT_ENVTEST (see IsEnvCube)
+
+// Resources only water and see-through surfaces read: their environment maps stay the game's. Water.cfx, WaterOcean.cfx
+// and WaterVortex.cfx read envMapSamplerRefl/Refr, but the compiled WaterSurface.cfx / WaterVols.cfx variants of some
+// rivers (river_village.mtl, river_harbor.mtl) bind only envMapSamplerCUBE next to the screen, foam or gloss maps, and
+// took CryMT's voxel cube (the user, 2026-11-11: the rivers of village and harbor overbright). screenMapSampler (the
+// screen behind) is also read by glass, ice and Methagen, which keep their maps as well.
+bool IsRefractiveResource(const char* name)
+{
+    static const char* const kNames[] = {"envMapSamplerRefl", "envMapSamplerRefr", "screenMapSampler", "foamSampler", "foamSamplerSec",
+                                         "waterGlossMapSampler", "waterVolumeHeightSampler", "waveSampler", "waveBumpSampler",
+                                         "fftTexSampler", "oceanBumpMapSampler"};
+    for (const char* n : kNames)
+        if (strcmp(name, n) == 0)
+            return true;
+    return false;
+}
 const ResourceInfo* g_giPlaceholder; // Textures/CryMT/gi.dds, see IsGiPlaceholder
 const ResourceInfo* g_jitterPlaceholder; // Textures/CryMT/jitter.dds, see IsJitterPlaceholder
 const ResourceInfo* g_foliagePlaceholder; // Textures/CryMT/foliage.dds, see IsFoliagePlaceholder
@@ -3574,7 +3590,7 @@ public:
     std::vector<Output> outputs;
     int firstTexture = -1;
     int diffuseSlot = -1; // the texture diffuseMapSampler (the z-prepass's alpha test reads its alpha), -1 none
-    bool refractive = false; // reads envMapSamplerRefl / envMapSamplerRefr: water, glass, liquids (no CryMT reflection)
+    bool refractive = false; // water, glass, ice, liquids (no CryMT reflection): see IsRefractiveResource
     int envCubeSlot = -1, env2DSlot = -1; // envMapSamplerCUBE ($EnvironmentCubeMap) / envMapSampler ($Env): the material's env map
     bool water = false; // a vertex shader with the constant WaterLevel (WaterOcean.cfx, its z-prepass too): not voxel geometry
     bool discards = false;
@@ -3621,6 +3637,7 @@ public:
         }
         D3D10_SHADER_DESC d{};
         r->GetDesc(&d);
+        std::string resourceNames; // for the environment map log below
         for (UINT i = 0; i < d.BoundResources; i++)
         {
             D3D10_SHADER_INPUT_BIND_DESC b{};
@@ -3632,8 +3649,10 @@ public:
                 firstTexture = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "diffuseMapSampler") == 0)
                 diffuseSlot = static_cast<int>(b.BindPoint);
-            if (b.Type == D3D10_SIT_TEXTURE && b.Name && (strcmp(b.Name, "envMapSamplerRefl") == 0 || strcmp(b.Name, "envMapSamplerRefr") == 0))
+            if (b.Type == D3D10_SIT_TEXTURE && b.Name && IsRefractiveResource(b.Name))
                 refractive = true;
+            if (b.Name && resourceNames.size() < 600)
+                resourceNames += std::string(resourceNames.empty() ? "" : " ") + b.Name;
             if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "envMapSamplerCUBE") == 0)
                 envCubeSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "envMapSampler") == 0)
@@ -3662,6 +3681,12 @@ public:
             static int logged;
             if (logged++ < 4)
                 Log("ocean vertex shader recognized (WaterLevel), %u bytes", static_cast<unsigned>(code.size()));
+        }
+        if (envCubeSlot >= 0 || env2DSlot >= 0)
+        {
+            static int kept, replaced;
+            if (refractive ? kept++ < 24 : replaced++ < 8)
+                Log("pixel shader with an environment map %s: %s", refractive ? "keeps it (water, glass)" : "may take CryMT's", resourceNames.c_str());
         }
         for (UINT i = 0; i < d.OutputParameters; i++)
         {
