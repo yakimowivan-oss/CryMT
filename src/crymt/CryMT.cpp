@@ -254,6 +254,12 @@ DWORD g_rtTid;
 int g_rtDepth;
 uint64_t g_rtFrameSeq;
 std::atomic<uint64_t> g_preDoneSeq{0};
+// CRYMT_EARLYBARRIER: main is released after preprocess; shadow prep (its callbacks into Cry3DEngine: terrain sectors,
+// casters) runs on while main finishes the frame and runs the next one's game update. Main's next RenderWorld (the
+// engine's pass state: camera, recursion level, terrain LOD) waits for this sequence (WaitShadowPrep).
+std::atomic<uint64_t> g_shadowDoneSeq{0};
+uint64_t g_shadowFenceWaits, g_shadowFenceTicks, g_shadowFenceChecks;
+bool g_shadowBarrier = true; // main waits until shadow prep is done unless CRYMT_EARLYBARRIER is set
 int64_t g_preDoneTime;
 uint64_t g_frameSeq;
 uint64_t g_flushCmdIndex;
@@ -892,6 +898,9 @@ void WriteStats()
                 g_preWaitTicks * g_qpcToMs / frames, static_cast<unsigned long long>(g_preSignals),
                 static_cast<unsigned long long>(g_preFallbacks), static_cast<unsigned long long>(g_lateCallbacks),
                 static_cast<unsigned long long>(g_gcDeferred));
+        fprintf(f, "early barrier: %s; RenderWorld waited for shadow prep %llu of %llu times, %.3f ms/frame\n", g_shadowBarrier ? "off" : "on",
+                static_cast<unsigned long long>(g_shadowFenceWaits), static_cast<unsigned long long>(g_shadowFenceChecks),
+                g_shadowFenceTicks * g_qpcToMs / frames);
         if (g_phaseFrames)
             fprintf(f, "flush phases ms/frame: start to preprocess %.3f, preprocess %.3f, shadow prep %.3f (shadow map draws %.3f, %.2f per frame)\n",
                     g_phaseTicks[0] * g_qpcToMs / g_phaseFrames, g_phaseTicks[1] * g_qpcToMs / g_phaseFrames,
@@ -4733,6 +4742,12 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
             if ((spin & 0xFFF) == 0xFFF)
                 PumpSentMessages();
         }
+        // Diagnostic (CRYMT_EARLYFENCE=1 with CRYMT_EARLYBARRIER): the early signal, but main waits for shadow prep right
+        // here as with the barrier, so nothing of main runs alongside it (does a crash come from main or the signal?).
+        static const bool fenceAtRelease = GetEnvironmentVariableW(L"CRYMT_EARLYFENCE", nullptr, 0) != 0;
+        while (fenceAtRelease && !g_shadowBarrier && g_shadowDoneSeq.load(std::memory_order_acquire) != g_frameSeq &&
+               g_read.load(std::memory_order_acquire) <= g_flushCmdIndex)
+            _mm_pause();
         g_preWaitTicks += Now() - waitStart;
         if (detail)
         {
@@ -4831,7 +4846,6 @@ extern "C" void PrePush(uintptr_t ret)
 // Cry3DEngine to draw terrain sectors into shadow maps. FUN_380AA200 skips it when the global below is
 // zero or bit 8 of its flags (r13) is set; then the signal is raised after preprocess instead.
 DWORD g_shadowTls = TLS_OUT_OF_INDEXES;
-bool g_shadowBarrier = true; // main waits until shadow prep is done unless CRYMT_EARLYBARRIER is set
 
 void CaptureRtPoses();
 
@@ -5025,6 +5039,8 @@ void SignalEngineCallbacksDone()
     }
     g_preSignals++;
     g_preDoneTime = Now();
+    if (g_shadowBarrier)
+        g_shadowDoneSeq.store(g_rtFrameSeq, std::memory_order_release);
     g_preDoneSeq.store(g_rtFrameSeq, std::memory_order_release);
 }
 
@@ -5040,6 +5056,8 @@ extern "C" uintptr_t PrePop(uint64_t r13)
         const bool shadowsSkipped = *reinterpret_cast<const int*>(kShadowPrepGlobal) == 0 || (r13 & 8) != 0;
         if (shadowsSkipped || !g_shadowBarrier)
             SignalEngineCallbacksDone();
+        if (shadowsSkipped)
+            g_shadowDoneSeq.store(g_rtFrameSeq, std::memory_order_release);
     }
     return ret;
 }
@@ -5065,6 +5083,11 @@ extern "C" uintptr_t ShadowPop()
         g_phaseTicks[2] += Now() - g_phaseMark;
     if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0 && g_shadowBarrier)
         SignalEngineCallbacksDone();
+    else if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0)
+    {
+        CarryBack(true); // the frustum bytes shadow prep wrote, before main's next pass computes its own
+        g_shadowDoneSeq.store(g_rtFrameSeq, std::memory_order_release);
+    }
     return ret;
 }
 
@@ -5631,6 +5654,28 @@ bool g_worldSync;
 
 void CensusBegin();
 
+// Main, before its RenderWorld with the early barrier: until the last dispatched flush's shadow prep is done (or the
+// whole flush command has run).
+void WaitShadowPrep()
+{
+    if (g_shadowBarrier || g_mode != 2 || !g_async)
+        return;
+    g_shadowFenceChecks++;
+    if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
+        return;
+    const int64_t start = Now();
+    for (uint32_t spin = 0;; spin++)
+    {
+        if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
+            break;
+        _mm_pause();
+        if ((spin & 0xFFF) == 0xFFF)
+            PumpSentMessages();
+    }
+    g_shadowFenceWaits++;
+    g_shadowFenceTicks += Now() - start;
+}
+
 extern "C" void WorldPush(uintptr_t ret)
 {
     auto* s = static_cast<PreStack*>(TlsGetValue(g_worldTls));
@@ -5641,6 +5686,7 @@ extern "C" void WorldPush(uintptr_t ret)
     }
     if (s->depth == 0 && GetCurrentThreadId() == g_mainThread)
     {
+        WaitShadowPrep();
         CensusBegin();
         if (g_fillOn && g_mode == 2)
         {
