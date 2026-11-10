@@ -593,7 +593,6 @@
         mods.addEventListener('click', () => host.open('mods'));
         // Shown only when the window finds Bin64\Editor.exe (syncHome).
         const ed = el('button', 'btn ghost editor', tt('Редактор', 'Editor'));
-        ed.title = tt('Sandbox Editor из Mod SDK, с выбранным модом, без CryMT', 'The Mod SDK\'s Sandbox Editor with the chosen mod, without CryMT');
         ed.addEventListener('click', () => { if (!S.busy) host.editor(); });
         btns.append(adv, mods, ed);
         quick.append(btns);
@@ -642,7 +641,12 @@
             tt('<p class="fine">Оценка по замерам автора, 2560×1440: разница кадра между пресетами. При 60 FPS кадр — 16.7 мс.</p>', '<p class="fine">Estimate from the author\'s measurements, 2560×1440: frame time differences between presets. At 60 FPS a frame is 16.7 ms.</p>') +
             '<ul class="notes">' + notes.map(n => '<li>' + esc(n) + '</li>').join('') + '</ul>';
         $$('#view-home .quick .opt[data-id]').forEach(syncRow);
-        $('#view-home .quick .editor').hidden = !C.STATUS.editor;
+        const edBtn = $('#view-home .quick .editor');
+        edBtn.hidden = !C.STATUS.editor;
+        edBtn.title = editorCryMT(vals)
+            ? tt('Sandbox Editor из Mod SDK с выбранным модом и CryMT (DirectX 12, GI; без DLAA). Без CryMT: выключите «Редактор с CryMT».',
+                 'The Mod SDK\'s Sandbox Editor with the chosen mod and CryMT (DirectX 12, GI; no DLAA). Without CryMT: turn off "Editor with CryMT".')
+            : tt('Sandbox Editor из Mod SDK с выбранным модом, без CryMT', 'The Mod SDK\'s Sandbox Editor with the chosen mod, without CryMT');
         const dlaa = $('#view-home .dlaa-row');
         const why = dlaaWhyNot(vals);
         dlaa.classList.toggle('off', !!why);
