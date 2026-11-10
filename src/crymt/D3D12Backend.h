@@ -46,5 +46,11 @@ void* Dx12ProducerMemory(ID3D10Buffer* buffer);
 // Context thread: the switch recorded with Dx12DiscardNow's words.
 void Dx12ApplyDiscard(ID3D10Buffer* buffer, const uint64_t* words);
 void Dx12DirectMapStats(uint64_t* discards, uint64_t* bytes);
+// Asynchronous queries (the stream's producer): once the stream thread has executed the query's End, its data if its
+// list has completed (S_OK), else S_FALSE; *flushSerial > 0 when that list is still being recorded and the caller asked
+// for a flush (the stream thread then submits it: Dx12QueryFlush). Thread-safe against the stream thread.
+HRESULT Dx12QueryPoll(ID3D10Asynchronous* query, void* data, UINT size, UINT flags, uint64_t* flushSerial);
+// Context thread: submits the list being recorded when it is the given one (a GetData asked for it).
+void Dx12QueryFlush(uint64_t serial);
 // Context thread: a pass name for frame debuggers (RenderDoc, PIX) begins; null or "" ends the innermost one.
 void Dx12PassName(const char* text);

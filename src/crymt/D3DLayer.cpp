@@ -431,6 +431,14 @@ constexpr uint32_t kOpMatrices = 0x105;   // the renderer's modelview and projec
 constexpr uint32_t kOpUpdate = 0x107;     // UpdateSubresource with its source data copied into the data ring
 constexpr uint32_t kOpPresent = 0x108;    // the swap chain's Present, made by the stream thread in order
 constexpr uint32_t kOpDiscard = 0x109;    // a D3D12 dynamic buffer switches to the memory its producer Map(DISCARD) took
+constexpr uint32_t kOpQueryBegin = 0x10A; // ID3D10Asynchronous::Begin, made by the stream thread in order (D3D12)
+constexpr uint32_t kOpQueryEnd = 0x10B;   // ... End
+constexpr uint32_t kOpQueryFlush = 0x10C; // submit the list a query ends in (a GetData asked for a flush)
+constexpr uint32_t kOpTexUpload = 0x10D;  // a dynamic texture's Map(DISCARD) contents written through the data ring
+using QueryBeginEndFn = void(STDMETHODCALLTYPE*)(ID3D10Asynchronous*);
+using QueryGetDataFn = HRESULT(STDMETHODCALLTYPE*)(ID3D10Asynchronous*, void*, UINT, UINT);
+QueryBeginEndFn g_queryBegin, g_queryEnd; // the back end's (StreamQueryBegin and below)
+QueryGetDataFn g_queryGetData;
 constexpr uint32_t kOpWrap = 0xFFFF;
 
 // Recording is meant to come from one thread at a time (the render thread, or main while it is idle); thread changes
@@ -872,9 +880,11 @@ uint64_t g_dataReadSeen;                          // producer: its last look at 
 alignas(64) std::atomic<uint64_t> g_dataRead{0}; // stream side: everything before is free
 struct RingMap
 {
-    ID3D10Buffer* buffer;
+    ID3D10Buffer* buffer; // or the texture of a texture map (texture set)
     uint64_t start;
     uint32_t size;
+    uint32_t sub = 0, rowBytes = 0, rowPitch = 0, rows = 0, slices = 0, depthPitch = 0;
+    bool texture = false;
 };
 constexpr int kMaxRingMaps = 16;
 RingMap g_ringMaps[kMaxRingMaps]; // mapped now, in Map order
@@ -1200,6 +1210,7 @@ void ExecuteUpload(const uint64_t* w)
 }
 
 void ExecutePresent(const uint64_t* w); // below, with the swap chain hooks
+void ExecuteTexUpload(const uint64_t* w); // below, with the texture hooks
 
 // Execution on the stream thread: calls the real device's current vtable.
 template <typename Fn>
@@ -1325,6 +1336,18 @@ void Execute(const CmdHeader* h)
         break;
     case kOpDiscard:
         Dx12ApplyDiscard(reinterpret_cast<ID3D10Buffer*>(w[0]), w + 1);
+        break;
+    case kOpQueryBegin:
+        g_queryBegin(reinterpret_cast<ID3D10Asynchronous*>(w[0]));
+        break;
+    case kOpQueryEnd:
+        g_queryEnd(reinterpret_cast<ID3D10Asynchronous*>(w[0]));
+        break;
+    case kOpQueryFlush:
+        Dx12QueryFlush(w[0]);
+        break;
+    case kOpTexUpload:
+        ExecuteTexUpload(w);
         break;
     case kOpScene:
         Dx12SceneDone(reinterpret_cast<const DlssSceneInfo*>(w));
@@ -1491,6 +1514,279 @@ void ExecutePresent(const uint64_t* w)
     g_presentResult.store(hr == DXGI_STATUS_OCCLUDED ? S_OK : hr, std::memory_order_release);
 }
 
+// Asynchronous queries on the D3D12 back end (CRYMT_ASYNCQUERIES=0: synced as before). Begin, End and GetData synced the
+// whole stream: harbor with GI 1.8 GetData waits a frame (2.6 ms; 24 k polls a frame) and 0.6 Begin waits (1.0 ms), the
+// render thread waiting for the stream thread to execute everything recorded, the frame's later work too. Now Begin and
+// End are recorded; GetData answers S_FALSE (not ready, as D3D10 allows) until the stream thread has executed the
+// query's own End, then asks the back end without a sync (Dx12QueryPoll); a flush it needs is recorded once per list.
+const void* g_queryVtable;
+bool g_asyncQueries;
+uint64_t g_queryPolls, g_queryBehind, g_queryFlushes, g_queryFlushSerial;
+
+constexpr size_t kQueryEndSlots = 1024;
+struct QueryEndPos
+{
+    ID3D10Asynchronous* query;
+    uint64_t pos;
+};
+QueryEndPos g_queryEnds[kQueryEndSlots];
+
+uint64_t* QueryEndSlot(ID3D10Asynchronous* query, bool create)
+{
+    size_t i = (reinterpret_cast<uintptr_t>(query) >> 4) * 0x9E3779B97F4A7C15ull >> 54; // 10 bits
+    for (size_t n = 0; n < kQueryEndSlots; n++, i = (i + 1) % kQueryEndSlots)
+    {
+        if (g_queryEnds[i].query == query)
+            return &g_queryEnds[i].pos;
+        if (!g_queryEnds[i].query)
+        {
+            if (!create)
+                return nullptr;
+            g_queryEnds[i].query = query;
+            return &g_queryEnds[i].pos;
+        }
+    }
+    return nullptr;
+}
+
+void STDMETHODCALLTYPE StreamQueryBegin(ID3D10Asynchronous* query)
+{
+    Recorder r = Begin(kOpQueryBegin, 8);
+    Hold(query);
+    r.Word(reinterpret_cast<uint64_t>(query));
+    End(r);
+}
+
+void STDMETHODCALLTYPE StreamQueryEnd(ID3D10Asynchronous* query)
+{
+    Recorder r = Begin(kOpQueryEnd, 8);
+    Hold(query);
+    r.Word(reinterpret_cast<uint64_t>(query));
+    End(r);
+    if (uint64_t* pos = QueryEndSlot(query, true))
+        *pos = g_recordPos.load(std::memory_order_relaxed);
+    else
+        StreamSync(kSyncAsyncEnd); // table full (40 queries in Crysis): the old way for this one
+}
+
+// Texture::Map / Unmap on the D3D12 back end. Map(WRITE_DISCARD) of a dynamic texture returns data ring memory at once
+// (our own row pitch) and its Unmap records the upload; the stream thread maps the texture for real, copies the rows and
+// unmaps (CRYMT_ASYNCTEXMAP=0: synced as before). Both waits on harbor were such uploads, not read-backs: the ocean's FFT
+// displacement (CREWaterOcean::vf15 -> FUN_38092090, 0.65 a frame, 3.1 ms of render-thread waiting with the queries
+// asynchronous) and the water volumes' normals (CWaterVolume::vf3, 0.6 a frame, 0.6 ms). Other maps (staging reads)
+// still sync; the census keeps the callers of those.
+using TextureMapFn = HRESULT(STDMETHODCALLTYPE*)(void*, UINT, D3D10_MAP, UINT, void*);
+using TextureUnmapFn = void(STDMETHODCALLTYPE*)(void*, UINT);
+struct TextureVtable
+{
+    const void* vtable;
+    TextureMapFn map;
+    TextureUnmapFn unmap;
+};
+TextureVtable g_textureVtables[4];
+int g_textureVtableCount;
+bool g_asyncTexMaps;
+uint64_t g_texMapsAsync;
+
+const TextureVtable* TextureOriginals(const void* texture)
+{
+    const void* vtable = *static_cast<void* const*>(texture);
+    for (int i = 0; i < g_textureVtableCount; i++)
+        if (g_textureVtables[i].vtable == vtable)
+            return &g_textureVtables[i];
+    return nullptr;
+}
+
+// Space in the data ring for a producer map (waits for the stream thread only when the ring is full).
+uint64_t RingReserve(uint32_t size)
+{
+    uint64_t start = g_dataWrite;
+    if (start % kDataBytes + size > kDataBytes)
+        start += kDataBytes - start % kDataBytes;
+    while (start + size - g_dataReadSeen > kDataBytes)
+    {
+        g_dataReadSeen = g_dataRead.load(std::memory_order_acquire);
+        if (start + size - g_dataReadSeen > kDataBytes)
+        {
+            StreamPublish();
+            _mm_pause();
+        }
+    }
+    g_dataWrite = start + size;
+    return start;
+}
+
+// Map(WRITE_DISCARD) of a dynamic texture subresource through the data ring; false: the old way.
+bool TextureMapToRing(void* texture, UINT sub, void* out)
+{
+    auto* res = static_cast<ID3D10Resource*>(texture);
+    D3D10_RESOURCE_DIMENSION dim = D3D10_RESOURCE_DIMENSION_UNKNOWN;
+    res->GetType(&dim);
+    UINT w = 1, h = 1, depth = 1, mips = 1;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    D3D10_USAGE usage = D3D10_USAGE_DEFAULT;
+    if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE1D)
+    {
+        D3D10_TEXTURE1D_DESC t{};
+        static_cast<ID3D10Texture1D*>(res)->GetDesc(&t);
+        w = t.Width, mips = t.MipLevels, format = t.Format, usage = t.Usage;
+    }
+    else if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        D3D10_TEXTURE2D_DESC t{};
+        static_cast<ID3D10Texture2D*>(res)->GetDesc(&t);
+        w = t.Width, h = t.Height, mips = t.MipLevels, format = t.Format, usage = t.Usage;
+    }
+    else if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE3D)
+    {
+        D3D10_TEXTURE3D_DESC t{};
+        static_cast<ID3D10Texture3D*>(res)->GetDesc(&t);
+        w = t.Width, h = t.Height, depth = t.Depth, mips = t.MipLevels, format = t.Format, usage = t.Usage;
+    }
+    else
+        return false;
+    UINT bytes = 0;
+    bool block = false;
+    if (usage != D3D10_USAGE_DYNAMIC || !FormatElement(format, bytes, block) || !mips)
+        return false;
+    const UINT level = sub % mips;
+    w = std::max(1u, w >> level), h = std::max(1u, h >> level), depth = std::max(1u, depth >> level);
+    RingMap m;
+    m.buffer = reinterpret_cast<ID3D10Buffer*>(texture);
+    m.texture = true;
+    m.sub = sub;
+    m.rowBytes = (block ? (w + 3) / 4 : w) * bytes;
+    m.rowPitch = (m.rowBytes + 15) & ~15u;
+    m.rows = block ? (h + 3) / 4 : h;
+    m.slices = dim == D3D10_RESOURCE_DIMENSION_TEXTURE3D ? depth : 1;
+    m.depthPitch = m.rowPitch * m.rows;
+    const uint64_t size64 = static_cast<uint64_t>(m.depthPitch) * m.slices;
+    if (size64 > kDataBytes / 4)
+        return false;
+    m.size = static_cast<uint32_t>(size64);
+    NoteRecorder();
+    m.start = RingReserve(m.size);
+    g_ringMaps[g_ringMapCount++] = m;
+    uint8_t* p = g_data + m.start % kDataBytes;
+    if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE1D)
+        *static_cast<void**>(out) = p;
+    else if (dim == D3D10_RESOURCE_DIMENSION_TEXTURE2D)
+        *static_cast<D3D10_MAPPED_TEXTURE2D*>(out) = {p, m.rowPitch};
+    else
+        *static_cast<D3D10_MAPPED_TEXTURE3D*>(out) = {p, m.rowPitch, m.depthPitch};
+    g_texMapsAsync++;
+    return true;
+}
+
+void STDMETHODCALLTYPE StreamTextureUnmap(void* texture, UINT sub)
+{
+    for (int i = 0; i < g_ringMapCount; i++)
+    {
+        const RingMap& e = g_ringMaps[i];
+        if (!e.texture || e.buffer != reinterpret_cast<ID3D10Buffer*>(texture) || e.sub != sub)
+            continue;
+        const RingMap m = e;
+        memmove(&g_ringMaps[i], &g_ringMaps[i + 1], (g_ringMapCount - i - 1) * sizeof(RingMap));
+        g_ringMapCount--;
+        const uint64_t freeTo = g_ringMapCount ? g_ringMaps[0].start : g_dataWrite;
+        Recorder r = Begin(kOpTexUpload, 56);
+        Hold(texture);
+        r.Word(reinterpret_cast<uint64_t>(texture));
+        r.Word(m.start);
+        r.Word(freeTo);
+        r.Word(m.sub | static_cast<uint64_t>(m.rowBytes) << 32);
+        r.Word(m.rowPitch | static_cast<uint64_t>(m.rows) << 32);
+        r.Word(m.slices | static_cast<uint64_t>(m.depthPitch) << 32);
+        r.Word(0);
+        End(r);
+        return;
+    }
+    StreamSync(kSyncTextureUnmap);
+    if (const TextureVtable* o = TextureOriginals(texture))
+        o->unmap(texture, sub);
+}
+
+void ExecuteTexUpload(const uint64_t* w)
+{
+    void* texture = reinterpret_cast<void*>(w[0]);
+    const uint8_t* src = g_data + w[1] % kDataBytes;
+    const UINT sub = static_cast<UINT>(w[3]), rowBytes = static_cast<UINT>(w[3] >> 32);
+    const UINT rowPitch = static_cast<UINT>(w[4]), rows = static_cast<UINT>(w[4] >> 32);
+    const UINT slices = static_cast<UINT>(w[5]), depthPitch = static_cast<UINT>(w[5] >> 32);
+    const TextureVtable* o = TextureOriginals(texture);
+    D3D10_RESOURCE_DIMENSION dim = D3D10_RESOURCE_DIMENSION_UNKNOWN;
+    static_cast<ID3D10Resource*>(texture)->GetType(&dim);
+    D3D10_MAPPED_TEXTURE3D m{}; // 1D: only pData; 2D: pData, RowPitch
+    if (o && SUCCEEDED(o->map(texture, sub, D3D10_MAP_WRITE_DISCARD, 0, &m)) && m.pData)
+    {
+        auto* dst = static_cast<uint8_t*>(m.pData);
+        const UINT dstRow = dim == D3D10_RESOURCE_DIMENSION_TEXTURE1D ? rowBytes : m.RowPitch;
+        const UINT dstSlice = dim == D3D10_RESOURCE_DIMENSION_TEXTURE3D ? m.DepthPitch : dstRow * rows;
+        for (UINT s = 0; s < slices; s++)
+            for (UINT y = 0; y < rows; y++)
+                memcpy(dst + s * dstSlice + y * dstRow, src + s * depthPitch + y * rowPitch, rowBytes);
+        o->unmap(texture, sub);
+    }
+    g_dataRead.store(w[2], std::memory_order_release);
+}
+struct MapCaller
+{
+    uintptr_t at;
+    uint64_t calls;
+    double waitMs;
+};
+MapCaller g_mapCallers[16];
+
+HRESULT STDMETHODCALLTYPE StreamTextureMap(void* texture, UINT sub, D3D10_MAP type, UINT flags, void* out)
+{
+    if (g_asyncTexMaps && type == D3D10_MAP_WRITE_DISCARD && out && g_ringMapCount < kMaxRingMaps && TextureMapToRing(texture, sub, out))
+        return S_OK;
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    StreamSync(kSyncTextureMap);
+    QueryPerformanceCounter(&t1);
+    for (MapCaller& c : g_mapCallers)
+        if (c.at == caller || !c.at)
+        {
+            LARGE_INTEGER freq;
+            QueryPerformanceFrequency(&freq);
+            c.at = caller;
+            c.calls++;
+            c.waitMs += (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+            break;
+        }
+    const TextureVtable* o = TextureOriginals(texture);
+    return o ? o->map(texture, sub, type, flags, out) : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE StreamQueryGetData(ID3D10Asynchronous* query, void* data, UINT size, UINT flags)
+{
+    NoteRecorder();
+    g_queryPolls++;
+    const uint64_t* pos = QueryEndSlot(query, false);
+    if (!pos)
+        return S_FALSE; // never ended through the stream
+    if (g_readSeen < *pos && (g_readSeen = g_streamRead.load(std::memory_order_acquire)) < *pos)
+    {
+        g_queryBehind++;
+        StreamPublish();
+        return S_FALSE;
+    }
+    uint64_t flushSerial = 0;
+    const HRESULT hr = Dx12QueryPoll(query, data, size, flags, &flushSerial);
+    if (flushSerial > g_queryFlushSerial)
+    {
+        g_queryFlushSerial = flushSerial;
+        g_queryFlushes++;
+        Recorder r = Begin(kOpQueryFlush, 8);
+        r.Word(flushSerial);
+        End(r);
+        StreamPublish();
+    }
+    return hr;
+}
+
 constexpr int kMaxHookedVtables = 32;
 const void* g_hookedVtables[kMaxHookedVtables];
 std::atomic<int> g_hookedCount{0};
@@ -1523,6 +1819,22 @@ void HookObject(const void* object, HookKind kind)
         snprintf(line, sizeof(line), "stream: buffer vtable %p maps through the data ring", vtable);
         Trace(line);
     }
+    else if (!seen && count < kMaxHookedVtables && kind == kHookAsync && g_asyncQueries && !g_queryVtable)
+    {
+        auto* table = const_cast<uintptr_t*>(reinterpret_cast<const uintptr_t*>(vtable));
+        g_queryBegin = reinterpret_cast<QueryBeginEndFn>(table[7]);
+        g_queryEnd = reinterpret_cast<QueryBeginEndFn>(table[8]);
+        g_queryGetData = reinterpret_cast<QueryGetDataFn>(table[9]);
+        g_queryVtable = vtable;
+        PatchSlot(table, 7, reinterpret_cast<uintptr_t>(&StreamQueryBegin));
+        PatchSlot(table, 8, reinterpret_cast<uintptr_t>(&StreamQueryEnd));
+        PatchSlot(table, 9, reinterpret_cast<uintptr_t>(&StreamQueryGetData));
+        g_hookedVtables[count] = vtable;
+        g_hookedCount.store(count + 1, std::memory_order_release);
+        char line[96];
+        snprintf(line, sizeof(line), "stream: query vtable %p asynchronous (D3D12)", vtable);
+        Trace(line);
+    }
     else if (!seen && count < kMaxHookedVtables)
     {
         const SyncSlot* slots = kind == kHookBuffer ? kBufferSyncs : kind == kHookTexture ? kTextureSyncs : kind == kHookAsync ? kAsyncSyncs : kSwapChainSyncs;
@@ -1533,6 +1845,16 @@ void HookObject(const void* object, HookKind kind)
         auto* table = const_cast<uintptr_t*>(reinterpret_cast<const uintptr_t*>(vtable));
         for (size_t i = 0; i < n; i++)
         {
+            if (kind == kHookTexture && g_asyncQueries && (slots[i].slot == 10 || slots[i].slot == 11) && g_textureVtableCount < 4)
+            {
+                if (slots[i].slot == 10)
+                {
+                    g_textureVtables[g_textureVtableCount++] = {vtable, reinterpret_cast<TextureMapFn>(table[10]), reinterpret_cast<TextureUnmapFn>(table[11])};
+                    PatchSlot(table, 10, reinterpret_cast<uintptr_t>(&StreamTextureMap));
+                    PatchSlot(table, 11, reinterpret_cast<uintptr_t>(&StreamTextureUnmap));
+                }
+                continue;
+            }
             // The first swap chain's Present goes through the stream (one original kept); others sync.
             if (kind == kHookSwapChain && slots[i].slot == 8 && !g_presentOriginal)
             {
@@ -2018,6 +2340,8 @@ HRESULT WINAPI HookD3D10CreateDevice(IDXGIAdapter* adapter, D3D10_DRIVER_TYPE ty
                 device = WrapDeviceOf(device, true);
                 wchar_t v[8];
                 g_directMaps = !(GetEnvironmentVariableW(L"CRYMT_DIRECTMAPS", v, 8) && wcscmp(v, L"0") == 0);
+                g_asyncQueries = !(GetEnvironmentVariableW(L"CRYMT_ASYNCQUERIES", v, 8) && wcscmp(v, L"0") == 0);
+                g_asyncTexMaps = !(GetEnvironmentVariableW(L"CRYMT_ASYNCTEXMAP", v, 8) && wcscmp(v, L"0") == 0);
                 Trace(g_directMaps ? "stream: dynamic buffers map directly (D3D12 upload memory)" : "stream: dynamic buffers map through the data ring");
             }
             g_d3d12Device = device;
@@ -2243,6 +2567,20 @@ void D3DLayerWriteStats()
             Dx12DirectMapStats(&directDiscards, &directBytes);
         fprintf(f, "direct maps: DISCARD %.1f/frame (%.1f KB/frame), NO_OVERWRITE %.1f/frame\n", directDiscards / frames,
                 directBytes / 1024.0 / frames, g_directNoOverwrite / frames);
+        fprintf(f, "asynchronous queries: %s; GetData %.1f/frame, before the stream reached the End %.1f/frame, flushes asked %.2f/frame\n",
+                g_queryVtable ? "on" : "off", g_queryPolls / frames, g_queryBehind / frames, g_queryFlushes / frames);
+        fprintf(f, "asynchronous texture maps (DISCARD through the data ring): %s, %.2f/frame\n", g_asyncTexMaps ? "on" : "off", g_texMapsAsync / frames);
+        for (const MapCaller& c : g_mapCallers)
+            if (c.at)
+            {
+                HMODULE m = nullptr;
+                wchar_t mod[MAX_PATH] = L"?";
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(c.at), &m))
+                    GetModuleFileNameW(m, mod, MAX_PATH);
+                const wchar_t* slash = wcsrchr(mod, L'\\');
+                fprintf(f, "texture map caller %ls+0x%llx: %.2f/frame, wait %.3f ms/frame\n", slash ? slash + 1 : mod,
+                        static_cast<unsigned long long>(c.at - reinterpret_cast<uintptr_t>(m)), c.calls / frames, c.waitMs / frames);
+            }
         fprintf(f, "UpdateSubresource: through the data ring %.2f/frame, synced %.2f/frame; presents through the stream %.2f/frame\n",
                 g_updatesAsync / frames, g_updatesSynced / frames, g_presentsAsync / frames);
         fprintf(f, "highest slot set (start + count):");

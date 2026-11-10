@@ -5793,6 +5793,8 @@ public:
     void QueryBegin(Query12* q);
     void QueryEnd(Query12* q);
     HRESULT QueryData(Query12* q, void* data, UINT size, UINT flags);
+    HRESULT QueryPeek(Query12* q, void* data, UINT size, UINT flags, uint64_t* flushSerial);
+    HRESULT QueryRead(Query12* q, void* data, UINT size);
     void QueryFree(Query12* q);
 
     // ---- presentation
@@ -11038,6 +11040,34 @@ HRESULT Device::QueryData(Query12* q, void* data, UINT size, UINT flags)
     PollDone();
     if (!SerialDone(q->serial))
         return S_FALSE;
+    return QueryRead(q, data, size);
+}
+
+// The producer's GetData (D3DLayer) after the stream thread executed the query's End: no submit (the stream thread does
+// that, Dx12QueryFlush) and the completed serial refreshed only when the lock is free.
+HRESULT Device::QueryPeek(Query12* q, void* data, UINT size, UINT flags, uint64_t* flushSerial)
+{
+    *flushSerial = 0;
+    if (!q->ended)
+        return S_FALSE;
+    if (q->serial >= __atomic_load_n(&g_mainSerial, __ATOMIC_ACQUIRE))
+    {
+        if (!(flags & D3D10_ASYNC_GETDATA_DONOTFLUSH))
+            *flushSerial = q->serial;
+        return S_FALSE;
+    }
+    if (!SerialDone(q->serial) && g.lock.try_lock())
+    {
+        Retire();
+        g.lock.unlock();
+    }
+    if (!SerialDone(q->serial))
+        return S_FALSE;
+    return QueryRead(q, data, size);
+}
+
+HRESULT Device::QueryRead(Query12* q, void* data, UINT size)
+{
     if (!data)
         return S_OK;
     if (size != q->GetDataSize())
@@ -11767,6 +11797,18 @@ bool InitCore(IDXGIAdapter* engineAdapter)
 }
 } // namespace
 } // namespace dx12
+
+HRESULT Dx12QueryPoll(ID3D10Asynchronous* query, void* data, UINT size, UINT flags, uint64_t* flushSerial)
+{
+    *flushSerial = 0;
+    return dx12::g_device ? dx12::g_device->QueryPeek(static_cast<dx12::Query12*>(static_cast<ID3D10Query*>(query)), data, size, flags, flushSerial) : S_FALSE;
+}
+
+void Dx12QueryFlush(uint64_t serial)
+{
+    if (dx12::g_device && serial >= dx12::g_mainSerial)
+        dx12::g_device->Submit();
+}
 
 bool Dx12DiscardNow(ID3D10Buffer* buffer, Dx12Discard* out)
 {
