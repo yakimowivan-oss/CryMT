@@ -9328,6 +9328,96 @@ private:
     const uint64_t* m_listStamps = nullptr;
     uint64_t m_stampedSerial = 0; // main lists up to this one are counted in gpuTicks
 
+public:
+    // GPU time per pass (CRYMT_GPUPASSES=1 with CRYMT_MARKERS): a timestamp at the start and end of every main list and at
+    // every pass name boundary; each span counts for the innermost open name, or "after <last closed name>" between
+    // names, so the spans add up to the GPU busy time.
+    static constexpr UINT kPassStamps = 2048; // per list
+    static constexpr UINT kPassRing = 8;      // lists that may be in flight
+    bool m_passStampsOn = false;
+    ID3D12QueryHeap* m_passStampHeap = nullptr;
+    ID3D12Resource* m_passStampReadback = nullptr;
+    const uint64_t* m_passStampCpu = nullptr;
+    struct PassStampList
+    {
+        uint64_t serial = 0;
+        std::vector<uint16_t> labels;
+    };
+    PassStampList m_passLists[kPassRing];
+    std::vector<uint16_t> m_passLabels; // the list being recorded
+    std::vector<std::string> m_passLabelNames;
+    std::unordered_map<std::string, uint16_t> m_passLabelIds;
+    std::vector<uint64_t> m_passTicks;
+    std::string m_passLastEnded;
+    uint64_t m_passStampedSerial = 0;
+    uint64_t m_passStampsDropped = 0;
+
+    std::string PassLabel() const
+    {
+        if (m_passNames.empty())
+            return "after " + (m_passLastEnded.empty() ? std::string("list start") : m_passLastEnded);
+        const std::wstring& w = m_passNames.back();
+        return std::string(w.begin(), w.end());
+    }
+
+    void PassStamp(const std::string& label)
+    {
+        if (!m_passStampsOn)
+            return;
+        if (m_passLabels.size() >= kPassStamps)
+        {
+            m_passStampsDropped++;
+            return;
+        }
+        auto it = m_passLabelIds.find(label);
+        if (it == m_passLabelIds.end())
+        {
+            if (m_passLabelNames.size() >= 65535)
+                return;
+            it = m_passLabelIds.emplace(label, static_cast<uint16_t>(m_passLabelNames.size())).first;
+            m_passLabelNames.push_back(label);
+            m_passTicks.push_back(0);
+        }
+        const UINT index = static_cast<UINT>(g_mainSerial % kPassRing) * kPassStamps + static_cast<UINT>(m_passLabels.size());
+        m_list->EndQuery(m_passStampHeap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+        m_passLabels.push_back(it->second);
+    }
+
+    void PassStampsSubmit() // before Close
+    {
+        if (!m_passStampsOn)
+            return;
+        PassStamp("(list end)");
+        const UINT base = static_cast<UINT>(g_mainSerial % kPassRing) * kPassStamps;
+        const UINT count = static_cast<UINT>(m_passLabels.size());
+        if (count)
+            m_list->ResolveQueryData(m_passStampHeap, D3D12_QUERY_TYPE_TIMESTAMP, base, count, m_passStampReadback, base * sizeof(uint64_t));
+        PassStampList& l = m_passLists[g_mainSerial % kPassRing];
+        l.serial = g_mainSerial;
+        l.labels.swap(m_passLabels);
+        m_passLabels.clear();
+    }
+
+    void PassStampsRead() // after Retire
+    {
+        if (!m_passStampsOn)
+            return;
+        const uint64_t done = g_doneSerial.load(std::memory_order_acquire);
+        for (; m_passStampedSerial < done; m_passStampedSerial++)
+        {
+            const uint64_t serial = m_passStampedSerial + 1;
+            const PassStampList& l = m_passLists[serial % kPassRing];
+            if (l.serial != serial || l.labels.size() < 2)
+                continue;
+            const uint64_t* s = m_passStampCpu + (serial % kPassRing) * kPassStamps;
+            for (size_t i = 0; i + 1 < l.labels.size(); i++)
+                if (s[i + 1] > s[i])
+                    m_passTicks[l.labels[i]] += s[i + 1] - s[i];
+        }
+    }
+
+private:
+
     void SplitQueries(bool end);
 };
 
@@ -9382,6 +9472,20 @@ bool Device::Init()
         m_listStampReadback->Map(0, nullptr, &p);
         m_listStamps = static_cast<const uint64_t*>(p);
     }
+    if (m_passNamesOn && GetEnvironmentVariableW(L"CRYMT_GPUPASSES", nullptr, 0))
+    {
+        D3D12_QUERY_HEAP_DESC passStamps{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kPassStamps * kPassRing, 0};
+        g.dev->CreateQueryHeap(&passStamps, __uuidof(ID3D12QueryHeap), reinterpret_cast<void**>(&m_passStampHeap));
+        m_passStampReadback = CreateBufferResource(D3D12_HEAP_TYPE_READBACK, kPassStamps * kPassRing * sizeof(uint64_t), D3D12_RESOURCE_STATE_COPY_DEST);
+        if (m_passStampHeap && m_passStampReadback)
+        {
+            void* p = nullptr;
+            m_passStampReadback->Map(0, nullptr, &p);
+            m_passStampCpu = static_cast<const uint64_t*>(p);
+            m_passStampsOn = m_passStampCpu != nullptr;
+        }
+        Log("GPU time per pass: %s", m_passStampsOn ? "on" : "failed");
+    }
     m_alloc = m_allocs.Get();
     if (FAILED(g.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_alloc, nullptr, __uuidof(ID3D12GraphicsCommandList),
                                         reinterpret_cast<void**>(&m_list))))
@@ -9424,6 +9528,7 @@ void Device::BeginList()
     m_drawsSinceSubmit = 0;
     if (m_listStamps)
         m_list->EndQuery(m_listStampHeap, D3D12_QUERY_TYPE_TIMESTAMP, static_cast<UINT>(g_mainSerial % kListStamps) * 2);
+    PassStamp(PassLabel());
 }
 
 // Everything the list needs set again: after a reset, or after Streamline recorded into it.
@@ -9452,14 +9557,17 @@ void Device::PassName(const char* text)
     std::wstring name(text, text + strlen(text)); // ASCII
     m_list->BeginEvent(0, name.c_str(), static_cast<UINT>((name.size() + 1) * sizeof(wchar_t)));
     m_passNames.push_back(std::move(name));
+    PassStamp(PassLabel());
 }
 
 void Device::PassNameEnd()
 {
     if (!m_passNamesOn || m_passNames.empty())
         return;
+    m_passLastEnded = std::string(m_passNames.back().begin(), m_passNames.back().end());
     m_passNames.pop_back();
     m_list->EndEvent();
+    PassStamp(PassLabel());
 }
 
 void Device::Submit()
@@ -9473,6 +9581,7 @@ void Device::Submit()
         m_list->EndQuery(m_listStampHeap, D3D12_QUERY_TYPE_TIMESTAMP, first + 1);
         m_list->ResolveQueryData(m_listStampHeap, D3D12_QUERY_TYPE_TIMESTAMP, first, 2, m_listStampReadback, first * sizeof(uint64_t));
     }
+    PassStampsSubmit();
     for (size_t i = 0; i < m_passNames.size(); i++)
         m_list->EndEvent();
     const HRESULT closed = m_list->Close();
@@ -9509,6 +9618,7 @@ void Device::Submit()
             }
         }
     }
+    PassStampsRead();
     RunDeferred();
     m_frameRing.Reclaim();
     m_srvRing.Reclaim();
@@ -11990,6 +12100,21 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  GPU busy %.3f ms/frame (%llu lists timed), depth to SRV %.2f, clears RT %.1f DS %.1f per frame\n",
             s.gpuTicks * 1000.0 / static_cast<double>(frequency) / std::max<double>(1.0, static_cast<double>(s.frames)), static_cast<unsigned long long>(s.gpuLists),
             s.depthToSrv / frames, s.rtClears / frames, s.dsClears / frames);
+    if (g_device->m_passStampsOn)
+    {
+        const auto& d = *g_device;
+        std::vector<size_t> order(d.m_passTicks.size());
+        for (size_t i = 0; i < order.size(); i++)
+            order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t c) { return d.m_passTicks[a] > d.m_passTicks[c]; });
+        uint64_t sum = 0;
+        for (uint64_t t : d.m_passTicks)
+            sum += t;
+        const double perFrame = 1000.0 / static_cast<double>(frequency) / std::max<double>(1.0, static_cast<double>(s.frames));
+        fprintf(f, "  GPU time per pass (%.3f ms/frame in all, %llu stamps dropped):\n", sum * perFrame, static_cast<unsigned long long>(d.m_passStampsDropped));
+        for (size_t k = 0; k < order.size() && k < 60; k++)
+            fprintf(f, "    %7.3f  %s\n", d.m_passTicks[order[k]] * perFrame, d.m_passLabelNames[order[k]].c_str());
+    }
     fprintf(f, "  pipeline states %llu (failed %llu, %.1f ms on the context thread), sampler heap resets %llu, presented frames %llu\n",
             static_cast<unsigned long long>(s.psoCreated), static_cast<unsigned long long>(s.psoFailed), s.psoMs, static_cast<unsigned long long>(s.samplerResets),
             static_cast<unsigned long long>(s.frames));
