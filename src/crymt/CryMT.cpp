@@ -262,6 +262,9 @@ std::atomic<uint64_t> g_preDoneSeq{0};
 std::atomic<uint64_t> g_shadowDoneSeq{0};
 uint64_t g_shadowFenceWaits[4], g_shadowFenceTicks[4], g_shadowFenceChecks[4]; // RenderWorld, entity update, terrain, AI update
 bool g_shadowBarrier = true; // main waits until shadow prep is done unless CRYMT_EARLYBARRIER is set
+// The early release for the flush the render thread runs (set when it starts): not in the warm-up frames, where main
+// does not take the frame's poses in advance (PrepareSkinning), so the barrier holds main while shadow prep skins.
+bool g_rtEarly;
 int64_t g_preDoneTime;
 uint64_t g_frameSeq;
 uint64_t g_flushCmdIndex;
@@ -3105,6 +3108,7 @@ void ExecuteCommand(Command& c)
         if (g_levelWatch)
             LevelWatchArm(g_threadLevel);
         g_rtFrameSeq = c.count;
+        g_rtEarly = !g_shadowBarrier && c.count > g_warmupFrames + 1;
         memcpy(g_fake + kViewportOffset, renderer + kViewportOffset, 16);
         memcpy(g_fake + kCameraOffset, renderer + kCameraOffset, kCameraBytes);
         memcpy(g_snapMv, **reinterpret_cast<float* const* const*>(renderer + kModelViewStackOffset), 64);
@@ -5530,7 +5534,7 @@ void SignalEngineCallbacksDone()
     }
     g_preSignals++;
     g_preDoneTime = Now();
-    if (g_shadowBarrier)
+    if (!g_rtEarly)
         MarkShadowDone(g_rtFrameSeq);
     g_preDoneSeq.store(g_rtFrameSeq, std::memory_order_release);
 }
@@ -5545,7 +5549,7 @@ extern "C" uintptr_t PrePop(uint64_t r13)
         // Shadow prep only calls back into the engine for terrain sectors; with the terrain calls of the
         // next frame's C3DEngine::Update fenced, main may continue as soon as preprocess is done.
         const bool shadowsSkipped = *reinterpret_cast<const int*>(kShadowPrepGlobal) == 0 || (r13 & 8) != 0;
-        if (shadowsSkipped || !g_shadowBarrier)
+        if (shadowsSkipped || g_rtEarly)
             SignalEngineCallbacksDone();
         if (shadowsSkipped)
             MarkShadowDone(g_rtFrameSeq);
@@ -5572,7 +5576,7 @@ extern "C" uintptr_t ShadowPop()
     const uintptr_t ret = s->ret[--s->depth];
     if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0)
         g_phaseTicks[2] += Now() - g_phaseMark;
-    if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0 && g_shadowBarrier)
+    if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0 && !g_rtEarly)
         SignalEngineCallbacksDone();
     else if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0)
     {
@@ -5670,14 +5674,37 @@ struct ShadowSkin
     uint64_t seen; // world frame of the last miss
 };
 std::vector<ShadowSkin> g_rtShadowSkins;     // misses of the current flush (render thread)
+uint64_t g_missFrames, g_missLastSeq;           // flushes with at least one early-mode late miss
+struct RecentMiss
+{
+    uint64_t frame;
+    uintptr_t vtable;
+    int lod;
+};
+RecentMiss g_recentMisses[16];
+uint64_t g_recentMissCount;
 std::vector<ShadowSkin> g_shadowSkins;       // known shadow-only characters (main)
 uint64_t g_shadowSkinCaptures, g_shadowSkinSkips, g_shadowSkinForgotten;
 
+extern uint64_t g_casterCharPoses, g_casterCharSeen, g_casterAttachments, g_casterNodes;
+extern ptrdiff_t g_charManagerOffset;
+uintptr_t RenderProxyNodeVtable();
+
 void PrintShadowSkins(FILE* f)
 {
-    fprintf(f, "shadow-only characters: poses taken on main %llu, shadows skipped %llu, known now %zu, forgotten %llu\n",
-            static_cast<unsigned long long>(g_shadowSkinCaptures), static_cast<unsigned long long>(g_shadowSkinSkips),
-            g_shadowSkins.size(), static_cast<unsigned long long>(g_shadowSkinForgotten));
+    fprintf(f, "early barrier poses: entity casters %llu (node vtable %llx), their characters seen %llu, taken on main %llu "
+               "(attachments %llu, manager at +0x%llx); late misses answered with no bones %llu; listed misses taken later %llu, "
+               "known %zu, forgotten %llu\n",
+            static_cast<unsigned long long>(g_casterNodes), static_cast<unsigned long long>(RenderProxyNodeVtable()),
+            static_cast<unsigned long long>(g_casterCharSeen), static_cast<unsigned long long>(g_casterCharPoses),
+            static_cast<unsigned long long>(g_casterAttachments), static_cast<unsigned long long>(g_charManagerOffset),
+            static_cast<unsigned long long>(g_shadowSkinSkips), static_cast<unsigned long long>(g_shadowSkinCaptures), g_shadowSkins.size(),
+            static_cast<unsigned long long>(g_shadowSkinForgotten));
+    fprintf(f, "  flushes with misses %llu; last misses (frame, skin vtable, lod):", static_cast<unsigned long long>(g_missFrames));
+    for (uint64_t i = g_recentMissCount > 16 ? g_recentMissCount - 16 : 0; i < g_recentMissCount; i++)
+        fprintf(f, " %llu/%llx/%d", static_cast<unsigned long long>(g_recentMisses[i % 16].frame),
+                static_cast<unsigned long long>(g_recentMisses[i % 16].vtable), g_recentMisses[i % 16].lod);
+    fprintf(f, "\n");
 }
 
 void ForgetShadowSkin(void* skin)
@@ -5952,14 +5979,20 @@ uint32_t __fastcall HookGetPose(void* skin, int lod, const void* matrix, void** 
             g_lateMiss[g_poseMissesLate] = {*static_cast<uintptr_t*>(skin), reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
                                             reinterpret_cast<uintptr_t>(matrix) - 0x14, lod};
         g_poseMissesLate++;
-        if (!g_shadowBarrier) // main is running its frame: no live pose, take it on main from the next frame on
+        if (g_rtEarly && g_async) // main is running its frame: no live pose (CaptureCasterCharacters took the casters' ones)
         {
-            bool listed = false;
+            bool listed = false; // main takes it from the next frame on (CaptureShadowSkins)
             for (const ShadowSkin& k : g_rtShadowSkins)
                 listed = listed || k.skin == skin;
             if (!listed)
                 g_rtShadowSkins.push_back({skin, lod, g_frame});
             g_shadowSkinSkips++;
+            if (g_rtFrameSeq != g_missLastSeq)
+            {
+                g_missLastSeq = g_rtFrameSeq;
+                g_missFrames++;
+            }
+            g_recentMisses[g_recentMissCount++ % 16] = {g_frame, *static_cast<const uintptr_t*>(skin), lod};
             *l = *s = *mbl = *mbs = nullptr;
             memset(shape, 0, kShapeDeformBytes);
             *morph = 0;
@@ -6034,6 +6067,10 @@ void CaptureShadowSkins()
             cached = cached || e.skin == s.skin;
         if (cached)
             continue;
+        const auto vt = *static_cast<const uintptr_t*>(s.skin);
+        if ((vt != kCharInstanceVtable && vt != kSkinInstanceVtable) ||
+            (vt == kSkinInstanceVtable && !*reinterpret_cast<void* const*>(static_cast<uint8_t*>(s.skin) + 0xE8)))
+            continue; // detached (or not a character any more)
         PoseEntry e{};
         e.skin = s.skin;
         e.lod = s.lod;
@@ -6045,14 +6082,148 @@ void CaptureShadowSkins()
     }
 }
 
+// Early barrier: the characters shadow prep will skin, taken on main before the flush is queued (render thread idle).
+// Shadow prep runs after main is released and draws casters the main view may not have drawn; their poses cannot be read
+// live then. The sun's and lamps' frustums list their casters (main gathered them): entity casters are CRenderProxy's
+// IRenderNode (vtable 0x320BBAA8, object at -8), whose slots (vector at +0x48) hold characters (CEntityObject +0x78; the
+// node's slot 3 returns one with the slot's world matrix). A character's attachments (manager embedded in
+// CCharInstance, its offset found once by the manager's vtable; attachments vector at manager +8; an attachment's object
+// at +0x110; CCHRAttachment objects hold a character at +8) are taken too: skin attachments (CSkinInstance: attachment
+// at +0xE8, null when detached) and attached characters (weapons). HookGetPose's same-skin fallback then serves the
+// flush; what is still missing gets no bones (no shadow that frame) rather than a live read.
+// CRenderProxy's IRenderNode vtable: CryEntitySystem +0xBBAA8 (the module may not sit at its preferred 0x32000000).
+constexpr uintptr_t kAttachmentManagerVtable = 0x31669D58, kChrAttachmentVtable = 0x31668FF8;
+uintptr_t RenderProxyNodeVtable()
+{
+    static const uintptr_t vt = [] {
+        const auto mod = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"CryEntitySystem.dll"));
+        return mod ? mod + 0xBBAA8 : 0;
+    }();
+    return vt;
+}
+uint64_t g_casterCharPoses, g_casterCharSeen, g_casterAttachments, g_casterNodes;
+ptrdiff_t g_charManagerOffset = -1; // CCharInstance -> its embedded CAttachmentManager
+
+void CaptureCharacter(void* ci, const float* matrix)
+{
+    const auto vt = *static_cast<const uintptr_t*>(ci);
+    if (vt != kCharInstanceVtable && vt != kSkinInstanceVtable)
+        return;
+    if (vt == kSkinInstanceVtable && !*reinterpret_cast<void* const*>(static_cast<uint8_t*>(ci) + 0xE8))
+        return; // a detached skin attachment: nothing to draw
+    g_casterCharSeen++;
+    for (const PoseEntry& e : g_poseCache)
+        if (e.skin == ci)
+            return;
+    PoseEntry e{};
+    e.skin = ci;
+    e.lod = 0;
+    e.matrix = matrix;
+    if (CapturePose(e, ArenaAllocPublic))
+    {
+        g_poseCache.push_back(e);
+        g_casterCharPoses++;
+    }
+}
+
+void CaptureCharacterTree(void* ci, const float* matrix, int depth)
+{
+    CaptureCharacter(ci, matrix);
+    if (depth > 3 || *static_cast<const uintptr_t*>(ci) != kCharInstanceVtable)
+        return;
+    auto* base = static_cast<uint8_t*>(ci);
+    if (g_charManagerOffset < 0)
+        for (ptrdiff_t o : {0x180, 0x938, 0x40, 0x88, 0x12D8})
+            if (*reinterpret_cast<const uintptr_t*>(base + o) == kAttachmentManagerVtable)
+                g_charManagerOffset = o;
+    if (g_charManagerOffset < 0)
+        return;
+    uint8_t* manager = base + g_charManagerOffset;
+    if (*reinterpret_cast<const uintptr_t*>(manager) != kAttachmentManagerVtable)
+        return;
+    auto** begin = *reinterpret_cast<uint8_t** const*>(manager + 8);
+    auto** end = *reinterpret_cast<uint8_t** const*>(manager + 0x10);
+    for (auto** a = begin; begin && a < end && a - begin < 256; a++)
+    {
+        uint8_t* att = *a;
+        if (!att)
+            continue;
+        uint8_t* obj = *reinterpret_cast<uint8_t* const*>(att + 0x110);
+        if (!obj || *reinterpret_cast<const uintptr_t*>(obj) != kChrAttachmentVtable)
+            continue;
+        void* child = *reinterpret_cast<void* const*>(obj + 8);
+        if (child)
+        {
+            g_casterAttachments++;
+            CaptureCharacterTree(child, matrix, depth + 1);
+        }
+    }
+}
+
+void CaptureCasterCharacters(uint8_t* renderer)
+{
+    if (*reinterpret_cast<const int*>(kShadowPrepGlobal) == 0)
+        return;
+    const uint8_t* list = renderer + kRdLevelLights + 16;
+    auto** lights = *reinterpret_cast<uint8_t** const*>(list);
+    const int count = *reinterpret_cast<const int*>(list + 8);
+    if (!lights)
+        return;
+    std::vector<uintptr_t> done;
+    for (int i = 0; i < count; i++)
+    {
+        uint8_t* light = lights[i];
+        if (!light || !(*reinterpret_cast<const uint32_t*>(light + kLightFlags) & 0x10))
+            continue;
+        auto** frustums = *reinterpret_cast<uint8_t** const*>(light + kLightFrustums);
+        for (int k = 0; frustums && k < 8 && frustums[k]; k++)
+        {
+            const uint8_t* casters = *reinterpret_cast<const uint8_t* const*>(frustums[k] + kFrustumCasters);
+            if (!casters)
+                continue;
+            auto** data = *reinterpret_cast<uint8_t** const*>(casters);
+            const int n = *reinterpret_cast<const int*>(casters + 8);
+            for (int c = 0; c < n && data; c++)
+            {
+                uint8_t* node = data[c];
+                if (!node || *reinterpret_cast<const uintptr_t*>(node) != RenderProxyNodeVtable())
+                    continue;
+                if (std::find(done.begin(), done.end(), reinterpret_cast<uintptr_t>(node)) != done.end())
+                    continue;
+                done.push_back(reinterpret_cast<uintptr_t>(node));
+                g_casterNodes++;
+                const uint8_t* proxy = node - 8;
+                auto** slotsBegin = *reinterpret_cast<uint8_t** const*>(proxy + 0x48);
+                auto** slotsEnd = *reinterpret_cast<uint8_t** const*>(proxy + 0x50);
+                for (int s = 0; slotsBegin && slotsBegin + s < slotsEnd && s < 64; s++)
+                {
+                    if (!slotsBegin[s] || !*reinterpret_cast<void* const*>(slotsBegin[s] + 0x78))
+                        continue;
+                    // IRenderNode slot 3 (GetEntityCharacter): the character and the slot's world matrix.
+                    float* m = static_cast<float*>(ArenaAllocPublic(48));
+                    if (!m)
+                        return;
+                    using GetCharFn = void*(__fastcall*)(void*, int, float*, bool);
+                    void* ch = reinterpret_cast<GetCharFn>((*reinterpret_cast<void***>(node))[3])(node, s, m, false);
+                    if (ch)
+                        CaptureCharacterTree(ch, m, 0);
+                }
+            }
+        }
+    }
+}
+
 // Called on main with the render thread idle, right before the frame is queued.
-void PrepareSkinning(uintptr_t)
+void PrepareSkinning(uintptr_t renderer)
 {
     g_poseCache.clear();
     g_rtPoseUsed = 0;
     CaptureObjectPoses(g_frameObjects, ArenaAllocPublic);
     if (!g_shadowBarrier)
+    {
+        CaptureCasterCharacters(reinterpret_cast<uint8_t*>(renderer));
         CaptureShadowSkins();
+    }
 }
 
 // Render thread, main still held: characters the flush itself put on render objects (shadow casters
@@ -6878,6 +7049,19 @@ DWORD WINAPI WatchdogMain(void*)
                 static_cast<unsigned long long>(g_write.load()), g_async ? 1 : 0, g_fillWindow ? 1 : 0, __DATE__, __TIME__);
         DumpThreadStack(f, g_mainThread, "main");
         DumpThreadStack(f, g_rtTid, "render");
+        // Every other thread of the game too (a stall in CryPhysics' spin locks on 2026-11-11 had a third party: the
+        // physics thread shares the "not main" caller slot with the render thread).
+        if (HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snap != INVALID_HANDLE_VALUE)
+        {
+            THREADENTRY32 te{};
+            te.dwSize = sizeof(te);
+            const DWORD self = GetCurrentThreadId();
+            for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+                if (te.th32OwnerProcessID == GetCurrentProcessId() && te.th32ThreadID != self && te.th32ThreadID != g_mainThread &&
+                    te.th32ThreadID != g_rtTid)
+                    DumpThreadStack(f, te.th32ThreadID, "other");
+            CloseHandle(snap);
+        }
         fclose(f);
     }
 }
@@ -8371,7 +8555,7 @@ bool FenceEntityUpdate()
 {
     static const uint8_t aiExpect[6] = {0x0F, 0x28, 0xD6, 0xFF, 0x56, 0x20}, aiTail[6] = {0x0F, 0x28, 0xD6, 0xFF, 0x66, 0x20};
     static const uint8_t entExpect[6] = {0x48, 0x8B, 0x01, 0xFF, 0x50, 0x10}, entTail[6] = {0x48, 0x8B, 0x01, 0xFF, 0x60, 0x10};
-    const bool ai = FenceVirtualCall(0x365378E0, aiExpect, aiTail, 3);
+    const bool ai = !GetEnvironmentVariableW(L"CRYMT_EARLYAIFENCE", nullptr, 0) || FenceVirtualCall(0x365378E0, aiExpect, aiTail, 3);
     return FenceVirtualCall(0x36537A61, entExpect, entTail, 1) && ai;
 }
 

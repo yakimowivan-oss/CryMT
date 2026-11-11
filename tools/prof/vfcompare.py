@@ -43,6 +43,9 @@ class Pe:
     def vtable(self, cls):
         name = b'\0.?AV' + cls.encode() + b'@@\0'
         n = self.d.find(name)
+        if n < 0:  # structs: .?AU
+            name = b'\0.?AU' + cls.encode() + b'@@\0'
+            n = self.d.find(name)
         if n < 0:
             return None
         td_rva = self.rva(n + 1 - 16)
@@ -69,24 +72,29 @@ class Pe:
         return None
 
 
-md = Cs(CS_ARCH_X86, CS_MODE_64)
-md.detail = False
-dll = sys.argv[1]
-pairs = list(zip(sys.argv[2::2], (int(x) for x in sys.argv[3::2])))
-pes = [Pe(g + '\\Bin64\\' + dll) for g in GAMES]
-for cls, slot in pairs:
-    print('%s::vf%d' % (cls, slot))
-    for g, p in zip(GAMES, pes):
-        vt = p.vtable(cls)
-        if vt is None:
-            print('   %-28s no vtable' % g.split('\\')[-1])
-            continue
-        f = p.slot(vt, slot)
-        end = p.func_end(f)
-        size = (end - f) if end else 0
-        code = p.d[p.off(f):p.off(f) + (size or 0x400)]
-        ins = list(md.disasm(code, p.base + f))
-        calls = sum(1 for x in ins if x.mnemonic == 'call')
-        jumps = sum(1 for x in ins if x.mnemonic.startswith('j'))
-        print('   %-28s %x: %5d bytes, %4d instructions, %3d calls, %3d branches' % (g.split('\\')[-1], p.base + f, size, len(ins),
-                                                                                    calls, jumps))
+def main():
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = False
+    dll = sys.argv[1]
+    pairs = list(zip(sys.argv[2::2], (int(x) for x in sys.argv[3::2])))
+    pes = [Pe(g + '\\Bin64\\' + dll) for g in GAMES]
+    for cls, slot in pairs:
+        print('%s::vf%d' % (cls, slot))
+        for g, p in zip(GAMES, pes):
+            vt = p.vtable(cls)
+            if vt is None:
+                print('   %-28s no vtable' % g.split('\\')[-1])
+                continue
+            f = p.slot(vt, slot)
+            end = p.func_end(f)
+            size = (end - f) if end else 0
+            code = p.d[p.off(f):p.off(f) + (size or 0x400)]
+            ins = list(md.disasm(code, p.base + f))
+            calls = sum(1 for x in ins if x.mnemonic == 'call')
+            jumps = sum(1 for x in ins if x.mnemonic.startswith('j'))
+            print('   %-28s %x: %5d bytes, %4d instructions, %3d calls, %3d branches' % (g.split('\\')[-1], p.base + f, size,
+                                                                                        len(ins), calls, jumps))
+
+
+if __name__ == '__main__':
+    main()
