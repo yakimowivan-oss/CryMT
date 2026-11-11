@@ -14,7 +14,7 @@ print("type descriptor rva", hex(td_rva))
 for (vs, va, rs, rp), fl in secs:
     for o in range(rp, rp + rs - 24, 4):
         sig, off, cd, ptd = struct.unpack_from("<IIII", d, o)
-        if sig == 1 and ptd == td_rva:
+        if sig in (0, 1) and ptd == td_rva:  # VS2005 x64 builds (Crysis 6156) write signature 0
             col_va = base + off2rva(o)
             for (vs2, va2, rs2, rp2), fl2 in secs:
                 for o2 in range(rp2, rp2 + rs2 - 8, 8):
