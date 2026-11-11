@@ -264,6 +264,25 @@ int64_t g_preDoneTime;
 uint64_t g_frameSeq;
 uint64_t g_flushCmdIndex;
 uint64_t g_preWaitTicks;
+// Diagnostic CRYMT_EARLYFENCE=<point> with the early barrier: main waits for shadow prep at that point (1 right after
+// the release in HookEndEf3D, 2 at the end of HookEndEf3D, 3 when RenderScene returns on main), to find which of
+// main's steps after the release clashes with shadow prep.
+int EarlyFencePoint()
+{
+    static const int point = [] {
+        wchar_t v[8] = {};
+        return GetEnvironmentVariableW(L"CRYMT_EARLYFENCE", v, 8) ? _wtoi(v) : 0;
+    }();
+    return point;
+}
+
+void EarlyFenceWait(int point)
+{
+    if (g_shadowBarrier || EarlyFencePoint() != point)
+        return;
+    while (g_shadowDoneSeq.load(std::memory_order_acquire) != g_frameSeq && g_read.load(std::memory_order_acquire) <= g_flushCmdIndex)
+        _mm_pause();
+}
 // Top-level flush phases on the render thread: start to the preprocess call, preprocess, shadow prep.
 int64_t g_flushStartTick, g_phaseMark;
 uint64_t g_phaseTicks[3], g_phaseFrames;
@@ -4758,10 +4777,7 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
         }
         // Diagnostic (CRYMT_EARLYFENCE=1 with CRYMT_EARLYBARRIER): the early signal, but main waits for shadow prep right
         // here as with the barrier, so nothing of main runs alongside it (does a crash come from main or the signal?).
-        static const bool fenceAtRelease = GetEnvironmentVariableW(L"CRYMT_EARLYFENCE", nullptr, 0) != 0;
-        while (fenceAtRelease && !g_shadowBarrier && g_shadowDoneSeq.load(std::memory_order_acquire) != g_frameSeq &&
-               g_read.load(std::memory_order_acquire) <= g_flushCmdIndex)
-            _mm_pause();
+        EarlyFenceWait(1);
         g_preWaitTicks += Now() - waitStart;
         if (detail)
         {
@@ -4803,6 +4819,8 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
         }
     }
     g_waitAtFrameStart = g_mainWaitTicks;
+    if (GetCurrentThreadId() == g_mainThread)
+        EarlyFenceWait(2);
     return r;
 }
 
@@ -5659,6 +5677,8 @@ extern "C" uintptr_t ScenePop()
     const uintptr_t ret = s->ret[--s->depth];
     if (g_sceneSync && GetCurrentThreadId() == g_mainThread)
         WaitIdlePublic(299);
+    if (s->depth == 0 && GetCurrentThreadId() == g_mainThread)
+        EarlyFenceWait(3);
     return ret;
 }
 
