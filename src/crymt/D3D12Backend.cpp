@@ -2293,7 +2293,11 @@ Texture2D<float> foliageTex : register(t2); // update: the z-prepass's foliage m
 RWTexture3D<float4> voxels : register(u0);
 RWTexture2D<float4> viewOut : register(u1);
 RWTexture3D<uint> occupancy : register(u1); // update: the voxelized geometry's frame stamps (levels 0-2)
-RWTexture3D<uint> seen : register(u3);      // update, light: 1 where the screen gave the cell its colour
+RWTexture3D<uint> seen : register(u3);      // update, light: bit 0 the screen gave the cell its colour; bits 1-7
+                                            // how many updates in a row it showed the cell empty (kClearAfter)
+// Kept geometry goes when the screen showed its cell empty this many updates in a row with no new stamp: one depth sample
+// a cell and update flips between a thin part, the DLAA jitter and LOD changes, and the cells came and went.
+static const uint kClearAfter = 4; // updates: 4, 8, 16 frames at levels 0-2 (periods 1, 2, 4)
 RWTexture3D<unorm float4> albedo : register(u4); // light: the material colour the geometry pass stored (a 1 when set)
 RWTexture3D<float4> voxelsDst : register(u2);
 RWTexture3D<float4> voxels1 : register(u3); // view: grid levels 1..3 (their first cells in worldToPrevClip rows 1..3)
@@ -2414,12 +2418,14 @@ void update(uint3 id : SV_DispatchThreadID)
                         v.a *= 0.5;
                     if (track)
                     {
-                        seen[id] = 0;
-                        // Kept geometry (mode < 0) that the screen shows empty now goes (a moved object, a door);
-                        // this frame's voxelizations stay. Not foliage: the screen sees through the gaps between leaves
-                        // from most places, and the kept leaves went and came back as the camera moved (the crowns
-                        // flickered while walking, less when standing).
-                        if (mode < 0 && !foliage && (occupancy[id] >> 8) < (uint)prevGridMin.w)
+                        // Kept geometry (mode < 0) that the screen shows empty goes (a moved object, a door) after
+                        // kClearAfter such updates in a row; a recent stamp (drawn within the window) restarts the
+                        // count. Not foliage: the screen sees through the gaps between leaves from most places, and the
+                        // kept leaves went and came back as the camera moved (the crowns flickered while walking).
+                        const bool fresh = (occupancy[id] >> 8) >= (uint)prevGridMin.w;
+                        const uint empty = fresh ? 0 : min((seen[id] >> 1) + 1, 127u);
+                        seen[id] = empty << 1;
+                        if (mode < 0 && !foliage && !fresh && empty >= kClearAfter)
                             occupancy[id] = 0;
                     }
                 }
@@ -2522,7 +2528,7 @@ void light(uint3 id : SV_DispatchThreadID)
     if (any(id >= (uint)n))
         return;
     float4 v = voxels[id];
-    if (v.a < 0.5 || (seen[id] != 0 && worldToPrevClip[2].z == 0))
+    if (v.a < 0.5 || ((seen[id] & 1) != 0 && worldToPrevClip[2].z == 0))
         return;
     float3 L = worldToPrevClip[0].xyz;
     int3 g = (int3)gridMin.xyz;
