@@ -737,6 +737,7 @@ struct CasterRecording
     float distance;
 };
 bool g_shadowRec;
+void PrintCasterCensus(FILE* f); // CRYMT_CASTERCENSUS
 bool g_recordingNow; // BeginCommand appends to g_recCommands, PublishCommand does nothing
 std::vector<CasterRecording> g_recordings;
 std::vector<Command> g_recCommands;
@@ -1186,6 +1187,7 @@ void WriteStats()
                 fprintf(f, "\n");
             }
         }
+        PrintCasterCensus(f);
         if (g_phaseFrames)
             fprintf(f, "flush phases ms/frame: start to preprocess %.3f, preprocess %.3f, shadow prep %.3f (shadow map draws %.3f, %.2f per frame)\n",
                     g_phaseTicks[0] * g_qpcToMs / g_phaseFrames, g_phaseTicks[1] * g_qpcToMs / g_phaseFrames,
@@ -4639,6 +4641,185 @@ uint64_t RecKey(uintptr_t caster, uintptr_t frustum)
     return static_cast<uint64_t>(caster) * 0x9E3779B97F4A7C15ull ^ frustum;
 }
 
+// Shadow caster census (CRYMT_CASTERCENSUS=1): at dispatch, render thread idle, the casters main gathered for each
+// shadow frustum of the frame's lights. Per sun cascade: how many, how many whose shadow cannot reach the view (the
+// caster's bounding sphere swept 300 m along the sunlight never enters the camera's cone), how many tiny (bounding
+// sphere under two texels of that cascade, its size taken from the frustum), and which classes they are (RTTI). For
+// culling casters by the light-extruded view and by size (the user's video on KCD2, NOTES).
+bool g_casterCensus;
+struct CensusCascade
+{
+    uint64_t frames, casters, outOfView, tiny, both;
+};
+CensusCascade g_census[8];
+uint64_t g_censusFrames, g_censusLocalFrustums, g_censusLocalCasters, g_censusUnique, g_censusMulti;
+std::unordered_map<uintptr_t, uint64_t> g_censusClasses[8]; // vtable -> casters
+uint8_t g_censusFrustumDump[8][0x180];
+bool g_censusDumped;
+float g_censusSunDir[3];
+
+const char* RttiName(uintptr_t vtable)
+{
+    static std::unordered_map<uintptr_t, std::string> names;
+    auto it = names.find(vtable);
+    if (it != names.end())
+        return it->second.c_str();
+    std::string name = "?";
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(vtable), &mod) && mod)
+    {
+        const auto base = reinterpret_cast<uintptr_t>(mod);
+        const auto col = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uintptr_t*>(vtable)[-1]);
+        if (col && (col[0] == 0 || col[0] == 1))
+            name = reinterpret_cast<const char*>(base + col[3] + 16);
+    }
+    return names.emplace(vtable, name).first->second.c_str();
+}
+
+void CasterCensus(uint8_t* renderer)
+{
+    if (!g_casterCensus || *reinterpret_cast<const int*>(kShadowPrepGlobal) == 0)
+        return;
+    const uint8_t* list = renderer + kRdLevelLights + 16;
+    auto** lights = *reinterpret_cast<uint8_t** const*>(list);
+    const int count = *reinterpret_cast<const int*>(list + 8);
+    void* sys = *reinterpret_cast<void* const*>(kRenderSystemGlobal);
+    if (!lights || !sys)
+        return;
+    using MatrixFn = const float*(__fastcall*)(void*);
+    const float* cam = reinterpret_cast<MatrixFn>((*static_cast<void***>(sys))[0x280 / 8])(sys);
+    const float eye[3] = {cam[3], cam[7], cam[11]};
+    float fwd[3] = {cam[1], cam[5], cam[9]};
+    const float fl = sqrtf(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+    if (fl < 1e-4f)
+        return;
+    for (float& v : fwd)
+        v /= fl;
+    // The view cone: vertical FOV 60 degrees (the main camera's, SetCamera census) and the viewport's aspect.
+    const int* vp = reinterpret_cast<const int*>(renderer + kViewportOffset);
+    const float aspect = vp[3] > 0 ? static_cast<float>(vp[2]) / static_cast<float>(vp[3]) : 16.0f / 9.0f;
+    const float tanH = tanf(0.5236f), tanW = tanH * aspect;
+    const float cone = atanf(sqrtf(tanH * tanH + tanW * tanW));
+    g_censusFrames++;
+    std::unordered_map<uintptr_t, int> seen;
+    for (int i = 0; i < count; i++)
+    {
+        uint8_t* light = lights[i];
+        if (!light)
+            continue;
+        const uint32_t flags = *reinterpret_cast<const uint32_t*>(light + kLightFlags);
+        if (!(flags & 0x10))
+            continue;
+        const bool sun = (flags & kLightFlagSun) != 0;
+        float dir[3] = {0, 0, -1};
+        if (sun)
+        {
+            const float* o = reinterpret_cast<const float*>(light + kLightOrigin);
+            float d[3] = {eye[0] - o[0], eye[1] - o[1], eye[2] - o[2]};
+            const float dl = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (dl > 1.0f)
+                for (int j = 0; j < 3; j++)
+                    dir[j] = d[j] / dl;
+            memcpy(g_censusSunDir, dir, sizeof(dir));
+        }
+        auto** frustums = *reinterpret_cast<uint8_t** const*>(light + kLightFrustums);
+        for (int k = 0; frustums && k < 8 && frustums[k]; k++)
+        {
+            uint8_t* frustum = frustums[k];
+            if (sun && !g_censusDumped)
+                memcpy(g_censusFrustumDump[k], frustum, sizeof(g_censusFrustumDump[k]));
+            const uint8_t* casters = *reinterpret_cast<const uint8_t* const*>(frustum + kFrustumCasters);
+            if (!casters)
+                continue;
+            auto** data = *reinterpret_cast<uint8_t** const*>(casters);
+            const int n = *reinterpret_cast<const int*>(casters + 8);
+            if (!sun)
+            {
+                g_censusLocalFrustums++;
+                g_censusLocalCasters += n > 0 ? n : 0;
+                continue;
+            }
+            // The cascade's texel: its frustum's radius over the shadow map size, from the census dump once known;
+            // until then the Very High layout: e_gsm_range 3 m, x3 a cascade, 1024 texels.
+            const float radius = 3.0f * powf(3.0f, static_cast<float>(k));
+            const float texel = 2.0f * radius / 1024.0f;
+            CensusCascade& cc = g_census[k];
+            cc.frames++;
+            for (int c = 0; c < n && data; c++)
+            {
+                uint8_t* caster = data[c];
+                if (!caster)
+                    continue;
+                seen[reinterpret_cast<uintptr_t>(caster)]++;
+                g_censusClasses[k][*reinterpret_cast<const uintptr_t*>(caster)]++;
+                float box[6] = {};
+                using BoxFn = void(__fastcall*)(void*, float*);
+                reinterpret_cast<BoxFn>((*reinterpret_cast<void***>(caster))[2])(caster, box);
+                const float centre[3] = {(box[0] + box[3]) * 0.5f, (box[1] + box[4]) * 0.5f, (box[2] + box[5]) * 0.5f};
+                const float ext[3] = {box[3] - box[0], box[4] - box[1], box[5] - box[2]};
+                const float r = 0.5f * sqrtf(ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]);
+                bool visible = false;
+                for (int s = 0; s <= 32 && !visible; s++)
+                {
+                    const float t = 300.0f * static_cast<float>(s) / 32.0f;
+                    const float v[3] = {centre[0] + dir[0] * t - eye[0], centre[1] + dir[1] * t - eye[1], centre[2] + dir[2] * t - eye[2]};
+                    const float d = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                    if (d <= r + 0.5f)
+                    {
+                        visible = true;
+                        break;
+                    }
+                    const float cosA = (v[0] * fwd[0] + v[1] * fwd[1] + v[2] * fwd[2]) / d;
+                    const float angle = acosf(cosA > 1.0f ? 1.0f : cosA < -1.0f ? -1.0f : cosA);
+                    visible = angle - asinf(r / d < 1.0f ? r / d : 1.0f) <= cone;
+                }
+                const bool tiny = 2.0f * r < 2.0f * texel;
+                cc.casters++;
+                cc.outOfView += visible ? 0 : 1;
+                cc.tiny += tiny ? 1 : 0;
+                cc.both += (!visible && tiny) ? 1 : 0;
+            }
+        }
+    }
+    g_censusDumped = true;
+    g_censusUnique += seen.size();
+    for (const auto& [caster, times] : seen)
+        g_censusMulti += times > 1 ? 1 : 0;
+}
+
+void PrintCasterCensus(FILE* f)
+{
+    if (!g_casterCensus || !g_censusFrames)
+        return;
+    const double frames = static_cast<double>(g_censusFrames);
+    fprintf(f, "shadow caster census over %llu frames (sun dir %.2f %.2f %.2f): unique casters %.1f/frame, in 2+ cascades %.1f/frame; "
+               "other lights' frustums %.2f/frame with %.1f casters\n",
+            static_cast<unsigned long long>(g_censusFrames), g_censusSunDir[0], g_censusSunDir[1], g_censusSunDir[2], g_censusUnique / frames,
+            g_censusMulti / frames, g_censusLocalFrustums / frames, g_censusLocalCasters / frames);
+    for (int k = 0; k < 8; k++)
+    {
+        const CensusCascade& cc = g_census[k];
+        if (!cc.frames)
+            continue;
+        const double n = static_cast<double>(cc.casters);
+        fprintf(f, "  cascade %d: %.1f casters/frame, shadow cannot reach the view %.1f%%, tiny %.1f%%, both %.1f%%; classes:", k,
+                n / cc.frames, n ? 100.0 * cc.outOfView / n : 0.0, n ? 100.0 * cc.tiny / n : 0.0, n ? 100.0 * cc.both / n : 0.0);
+        std::vector<std::pair<uint64_t, uintptr_t>> top;
+        for (const auto& [vt, cnt] : g_censusClasses[k])
+            top.push_back({cnt, vt});
+        std::sort(top.rbegin(), top.rend());
+        for (size_t j = 0; j < top.size() && j < 6; j++)
+            fprintf(f, " %s %.1f%%", RttiName(top[j].second), n ? 100.0 * top[j].first / n : 0.0);
+        fprintf(f, "\n    frustum bytes 0..0x180 (floats / ints):");
+        const auto* fl = reinterpret_cast<const float*>(g_censusFrustumDump[k]);
+        const auto* in = reinterpret_cast<const int*>(g_censusFrustumDump[k]);
+        for (int w = 0; w < 0x180 / 4; w++)
+            fprintf(f, "%s%x:%g/%d", w % 8 == 0 ? "\n     " : " ", w * 4, fl[w], in[w]);
+        fprintf(f, "\n");
+    }
+}
+
 // At dispatch, render thread idle: record every shadow caster's Render for every frustum the flush will prepare
 // (CRYMT_SHADOWREC; see CasterRecording). Main stands in the fill window at the shadow pass's recursion level.
 void RecordShadowCasters(uint8_t* renderer)
@@ -5022,6 +5203,7 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
         }
         if (g_fillOn)
             RecordShadowCasters(static_cast<uint8_t*>(self)); // before the pose capture: casters add characters
+        CasterCensus(static_cast<uint8_t*>(self));
         if (g_frame >= g_warmupFrames)
             PrepareSkinning(reinterpret_cast<uintptr_t>(self));
         else
@@ -8603,6 +8785,7 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
         // Releasing main before shadow prep crashes on the first async frame (terrain LOD for shadow
         // sectors reads engine state main has already moved on), so it stays an experiment.
         g_shadowBarrier = GetEnvironmentVariableW(L"CRYMT_EARLYBARRIER", mask, 16) == 0;
+        g_casterCensus = GetEnvironmentVariableW(L"CRYMT_CASTERCENSUS", nullptr, 0) != 0;
         // Per-thread render levels: with the early barrier always, otherwise on request (CRYMT_THREADLEVEL=1).
         const bool levelVar = GetEnvironmentVariableW(L"CRYMT_THREADLEVEL", mask, 16) != 0;
         if (levelVar ? wcscmp(mask, L"0") != 0 : !g_shadowBarrier)
