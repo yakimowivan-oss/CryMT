@@ -452,6 +452,19 @@ struct SliceHeap
     }
 };
 SliceHeap g_slices;
+// How many more main lists a retired dynamic-buffer slice is kept after the one it was renamed in (CRYMT_SLICEMARGIN,
+// default 2). The GI's voxel geometry replays the z-prepass draws with their buffers' GPU addresses later in the frame,
+// often in a later list (a submission every 2048 draws); freed when only their own list was done, the slices were
+// written again (with direct maps by the producer, a frame ahead) before the replay ran: objects stamped into the grid
+// where the next frame's constants put them, voxels "boiling" on a still camera (the user, 2026-11-11).
+uint64_t SliceMargin()
+{
+    static const uint64_t margin = [] {
+        wchar_t v[8] = {};
+        return GetEnvironmentVariableW(L"CRYMT_SLICEMARGIN", v, 8) ? static_cast<uint64_t>(_wtoi(v)) : uint64_t{2};
+    }();
+    return margin;
+}
 // Map(DISCARD) renames by kind (constant buffers, vertex/index buffers, others): how much the GPU reads from upload memory.
 uint64_t g_renames[3], g_renameBytes[3];
 
@@ -2985,7 +2998,7 @@ public:
         g_renames[kind]++;
         g_renameBytes[kind] += desc.ByteWidth;
         retired.push_back({slice, g_mainSerial});
-        if (SerialDone(retired.front().serial))
+        if (SerialDone(retired.front().serial + SliceMargin()))
         {
             slice = retired.front().slice;
             retired.pop_front();
@@ -3005,7 +3018,7 @@ public:
         retired.push_back({slice, g_mainSerial});
         slice = s;
         generation++;
-        while (!retired.empty() && SerialDone(retired.front().serial))
+        while (!retired.empty() && SerialDone(retired.front().serial + SliceMargin()))
         {
             g_slices.Free(retired.front().slice);
             retired.pop_front();
