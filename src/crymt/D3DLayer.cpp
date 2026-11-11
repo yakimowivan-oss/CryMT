@@ -400,6 +400,7 @@ enum SyncReason
     kSyncBufferNoOverwrite,
     kSyncTextureUnmap,
     kSyncAsyncGetData,
+    kSyncOcclusionGetData,
     kSyncReasons
 };
 const char* const kSyncReasonNames[kSyncReasons - 101] = {"Buffer::Map (read/write)",
@@ -413,7 +414,8 @@ const char* const kSyncReasonNames[kSyncReasons - 101] = {"Buffer::Map (read/wri
                                                           "held objects list full",
                                                           "Buffer::Map NO_OVERWRITE (own uploads)",
                                                           "Texture::Unmap",
-                                                          "Asynchronous::GetData"};
+                                                          "Asynchronous::GetData",
+                                                          "Asynchronous::GetData (occlusion, stream behind the End)"};
 uint64_t g_syncs[kSyncReasons], g_syncWaits[kSyncReasons], g_syncWaitTicks[kSyncReasons];
 
 struct CmdHeader
@@ -979,7 +981,32 @@ const BufferVtable& BufferOriginals(ID3D10Buffer* buffer)
 // current memory at once. Before, NO_OVERWRITE waited for the stream thread to perform the buffer's last ring upload
 // (harbor with GI: 2.3 ms a frame), and every DISCARD was copied twice (ring, then upload memory).
 bool g_directMaps;
+bool g_directNoOverwriteOn = true; // CRYMT_DIRECTNOOVERWRITE=0 (tests): NO_OVERWRITE waits for the stream as before
 uint64_t g_directNoOverwrite;
+// Who maps dynamic buffers directly (producer side): caller, buffer size and bind flags, DISCARD / NO_OVERWRITE counts.
+struct BufferMapCaller
+{
+    uintptr_t at;
+    UINT bytes, bind;
+    uint64_t discards, noOverwrites;
+};
+BufferMapCaller g_bufferMapCallers[24];
+
+void NoteBufferMap(uintptr_t at, ID3D10Buffer* buffer, bool discard)
+{
+    D3D10_BUFFER_DESC desc{};
+    buffer->GetDesc(&desc);
+    for (BufferMapCaller& c : g_bufferMapCallers)
+    {
+        if (!c.at)
+            c = {at, desc.ByteWidth, desc.BindFlags, 0, 0};
+        if (c.at == at && c.bytes == desc.ByteWidth && c.bind == desc.BindFlags)
+        {
+            (discard ? c.discards : c.noOverwrites)++;
+            return;
+        }
+    }
+}
 
 HRESULT STDMETHODCALLTYPE StreamBufferMap(ID3D10Buffer* buffer, D3D10_MAP type, UINT flags, void** data)
 {
@@ -990,6 +1017,7 @@ HRESULT STDMETHODCALLTYPE StreamBufferMap(ID3D10Buffer* buffer, D3D10_MAP type, 
             Dx12Discard dd;
             if (Dx12DiscardNow(buffer, &dd))
             {
+                NoteBufferMap(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), buffer, true);
                 *data = dd.cpu;
                 if (!dd.cpu)
                     return E_OUTOFMEMORY;
@@ -1002,11 +1030,12 @@ HRESULT STDMETHODCALLTYPE StreamBufferMap(ID3D10Buffer* buffer, D3D10_MAP type, 
                 return S_OK;
             }
         }
-        else if (type == D3D10_MAP_WRITE_NO_OVERWRITE)
+        else if (type == D3D10_MAP_WRITE_NO_OVERWRITE && g_directNoOverwriteOn)
         {
             if (void* p = Dx12ProducerMemory(buffer))
             {
                 NoteRecorder();
+                NoteBufferMap(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), buffer, false);
                 g_directNoOverwrite++;
                 *data = p;
                 return S_OK;
@@ -1378,6 +1407,16 @@ DWORD WINAPI StreamMain(void*)
 {
     LARGE_INTEGER runStart{};
     bool running = false;
+    // CRYMT_STREAMSLOW=<microseconds> (tests): the stream thread spins that long after every command, as the D3D12 debug
+    // layer slows it (the user saw white bushes and trees flying with the debug layer on, 2026-11-11).
+    static const int64_t slowTicks = [] {
+        wchar_t v[16] = {};
+        if (!GetEnvironmentVariableW(L"CRYMT_STREAMSLOW", v, 16))
+            return int64_t{0};
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<int64_t>(_wtof(v) * static_cast<double>(f.QuadPart) / 1e6);
+    }();
     for (;;)
     {
         const uint64_t read = g_streamRead.load(std::memory_order_relaxed);
@@ -1417,7 +1456,19 @@ DWORD WINAPI StreamMain(void*)
         {
             const auto* h = reinterpret_cast<const CmdHeader*>(g_stream + pos % kStreamBytes);
             if (h->op != kOpWrap)
+            {
                 Execute(h);
+                if (slowTicks)
+                {
+                    LARGE_INTEGER t0, t;
+                    QueryPerformanceCounter(&t0);
+                    do
+                    {
+                        _mm_pause();
+                        QueryPerformanceCounter(&t);
+                    } while (t.QuadPart - t0.QuadPart < slowTicks);
+                }
+            }
             pos += h->bytes;
             if (n % 32 == 0)
                 g_streamRead.store(pos, std::memory_order_release);
@@ -1766,18 +1817,63 @@ HRESULT STDMETHODCALLTYPE StreamTextureMap(void* texture, UINT sub, D3D10_MAP ty
     return o ? o->map(texture, sub, type, flags, out) : E_FAIL;
 }
 
+// Who polls queries (caller, data size: 4 event/predicate, 8 occlusion/timestamp), how often, and how often "not ready".
+struct QueryCaller
+{
+    uintptr_t at;
+    UINT size;
+    uint64_t polls, notEnded, behind, notDone;
+};
+QueryCaller g_queryCallers[16];
+
+QueryCaller* NoteQueryCaller(uintptr_t at, UINT size)
+{
+    for (QueryCaller& c : g_queryCallers)
+    {
+        if (!c.at)
+            c = {at, size, 0, 0, 0, 0};
+        if (c.at == at && c.size == size)
+        {
+            c.polls++;
+            return &c;
+        }
+    }
+    return nullptr;
+}
+
 HRESULT STDMETHODCALLTYPE StreamQueryGetData(ID3D10Asynchronous* query, void* data, UINT size, UINT flags)
 {
     NoteRecorder();
     g_queryPolls++;
+    QueryCaller* caller = NoteQueryCaller(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), size);
     const uint64_t* pos = QueryEndSlot(query, false);
     if (!pos)
+    {
+        if (caller)
+            caller->notEnded++;
         return S_FALSE; // never ended through the stream
+    }
     if (g_readSeen < *pos && (g_readSeen = g_streamRead.load(std::memory_order_acquire)) < *pos)
     {
-        g_queryBehind++;
-        StreamPublish();
-        return S_FALSE;
+        // Occlusion results (8 bytes; CREOcclusionQuery reads one a frame with DONOTFLUSH and keeps its old value while
+        // not ready) waited for the stream as well: with the stream thread far behind the producer they came frames
+        // late, and in village the ocean's occlusion query hid the sea for whole frames at low frame rates (white
+        // patches between the bushes, the user with the D3D12 debug layer, 2026-11-11)? Tried: it did not remove them,
+        // so it is off unless CRYMT_QUERYWAIT=1.
+        static const bool waitOcclusion = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_QUERYWAIT", v, 8) && wcscmp(v, L"0") != 0;
+        }();
+        if (size == 8 && waitOcclusion)
+            StreamWaitFor(*pos, kSyncOcclusionGetData);
+        else
+        {
+            g_queryBehind++;
+            if (caller)
+                caller->behind++;
+            StreamPublish();
+            return S_FALSE;
+        }
     }
     uint64_t flushSerial = 0;
     const HRESULT hr = Dx12QueryPoll(query, data, size, flags, &flushSerial);
@@ -1790,6 +1886,8 @@ HRESULT STDMETHODCALLTYPE StreamQueryGetData(ID3D10Asynchronous* query, void* da
         End(r);
         StreamPublish();
     }
+    if (caller && hr == S_FALSE)
+        caller->notDone++;
     return hr;
 }
 
@@ -2348,6 +2446,7 @@ HRESULT WINAPI HookD3D10CreateDevice(IDXGIAdapter* adapter, D3D10_DRIVER_TYPE ty
                 device = WrapDeviceOf(device, true);
                 wchar_t v[8];
                 g_directMaps = !(GetEnvironmentVariableW(L"CRYMT_DIRECTMAPS", v, 8) && wcscmp(v, L"0") == 0);
+                g_directNoOverwriteOn = !(GetEnvironmentVariableW(L"CRYMT_DIRECTNOOVERWRITE", v, 8) && wcscmp(v, L"0") == 0);
                 g_asyncQueries = !(GetEnvironmentVariableW(L"CRYMT_ASYNCQUERIES", v, 8) && wcscmp(v, L"0") == 0);
                 g_asyncTexMaps = !(GetEnvironmentVariableW(L"CRYMT_ASYNCTEXMAP", v, 8) && wcscmp(v, L"0") == 0);
                 Trace(g_directMaps ? "stream: dynamic buffers map directly (D3D12 upload memory)" : "stream: dynamic buffers map through the data ring");
@@ -2575,8 +2674,32 @@ void D3DLayerWriteStats()
             Dx12DirectMapStats(&directDiscards, &directBytes);
         fprintf(f, "direct maps: DISCARD %.1f/frame (%.1f KB/frame), NO_OVERWRITE %.1f/frame\n", directDiscards / frames,
                 directBytes / 1024.0 / frames, g_directNoOverwrite / frames);
+        for (const BufferMapCaller& c : g_bufferMapCallers)
+            if (c.at)
+            {
+                HMODULE m = nullptr;
+                wchar_t mod[MAX_PATH] = L"?";
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(c.at), &m))
+                    GetModuleFileNameW(m, mod, MAX_PATH);
+                const wchar_t* slash = wcsrchr(mod, L'\\');
+                fprintf(f, "  direct map caller %ls+0x%llx: %u bytes bind 0x%x, DISCARD %.1f/frame, NO_OVERWRITE %.1f/frame\n",
+                        slash ? slash + 1 : mod, static_cast<unsigned long long>(c.at - reinterpret_cast<uintptr_t>(m)), c.bytes, c.bind,
+                        c.discards / frames, c.noOverwrites / frames);
+            }
         fprintf(f, "asynchronous queries: %s; GetData %.1f/frame, before the stream reached the End %.1f/frame, flushes asked %.2f/frame\n",
                 g_queryVtable ? "on" : "off", g_queryPolls / frames, g_queryBehind / frames, g_queryFlushes / frames);
+        for (const QueryCaller& c : g_queryCallers)
+            if (c.at)
+            {
+                HMODULE m = nullptr;
+                wchar_t mod[MAX_PATH] = L"?";
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(c.at), &m))
+                    GetModuleFileNameW(m, mod, MAX_PATH);
+                const wchar_t* slash = wcsrchr(mod, L'\\');
+                fprintf(f, "  query GetData caller %ls+0x%llx size %u: %.2f/frame, not ended %.2f, stream behind the End %.2f, GPU not done %.2f\n",
+                        slash ? slash + 1 : mod, static_cast<unsigned long long>(c.at - reinterpret_cast<uintptr_t>(m)), c.size, c.polls / frames,
+                        c.notEnded / frames, c.behind / frames, c.notDone / frames);
+            }
         fprintf(f, "asynchronous texture maps (DISCARD through the data ring): %s, %.2f/frame\n", g_asyncTexMaps ? "on" : "off", g_texMapsAsync / frames);
         for (const MapCaller& c : g_mapCallers)
             if (c.at)
