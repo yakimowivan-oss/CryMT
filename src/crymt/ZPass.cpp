@@ -27,6 +27,7 @@
 
 void* DetourHead(uintptr_t fn, const uint8_t* expect, size_t len, const void* hook);
 uint64_t CryMTWorldFrame(); // CryMT.cpp: world frames since start
+int CryMTRenderLevel();      // CryMT.cpp: the 3D engine's render recursion level of the calling thread
 bool D3DLayerTrace(std::vector<uint32_t>* sink);
 const char* D3DLayerOpName(uint32_t op);
 bool D3DLayerPacketsAvailable();
@@ -3207,7 +3208,8 @@ void ZListOwn(uintptr_t r, int first, int last, uint32_t filter)
 // mostly missing. Fix (CRYMT_SPRITEFIX=0 turns it off): the draw uses the level, length and LOD factor recorded when
 // the list was built. CRYMT_SPRITECHECK=1 logs every call with its thread, the array's length and a hash of its
 // contents to logs\mt\crymt_sprites.txt.
-constexpr uintptr_t k3DEngineVtable = 0x301D37E8, kObjManagerPtr = 0x3022B8C8, kSpriteLevel = 0x302008E0, kSpriteLod = 0x302008E4,
+// The level is read through CryMTRenderLevel (per-thread levels: each thread has its own, see CryMT.cpp).
+constexpr uintptr_t k3DEngineVtable = 0x301D37E8, kObjManagerPtr = 0x3022B8C8, kSpriteLod = 0x302008E4,
                     k3DRendererPtr = 0x3022B8A0, k3DCVarsPtr = 0x3022B8E0;
 bool g_spriteFix, g_spriteCheck;
 int g_spriteLevel = -1;
@@ -3241,7 +3243,7 @@ void NoteSprites(char kind)
 {
     SpriteEvent e{::CryMTWorldFrame(), 1469598103934665603ull, GetCurrentThreadId(), 0, kind, 0, 0};
     const uintptr_t objects = *reinterpret_cast<const uintptr_t*>(kObjManagerPtr);
-    const int level = *reinterpret_cast<const int*>(kSpriteLevel);
+    const int level = ::CryMTRenderLevel();
     e.level = static_cast<uint8_t>(level);
     if (objects && level >= 0 && level < 2)
     {
@@ -3301,7 +3303,7 @@ void CopySpriteTextureSets()
 
 void __fastcall SpriteGenHook(void* engine)
 {
-    g_spriteLevel = *reinterpret_cast<const int*>(kSpriteLevel);
+    g_spriteLevel = ::CryMTRenderLevel();
     g_spriteLod = *reinterpret_cast<const float*>(kSpriteLod);
     g_spriteViewDistance = (*reinterpret_cast<ViewDistanceFn* const*>(engine))[45](engine);
     const uintptr_t objects = *reinterpret_cast<const uintptr_t*>(kObjManagerPtr);
