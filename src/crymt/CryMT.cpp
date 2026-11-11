@@ -63,6 +63,7 @@ struct LateMiss
 };
 constexpr uint64_t kLateMissLog = 16;
 extern LateMiss g_lateMiss[kLateMissLog];
+void PrintShadowSkins(FILE* f);
 namespace
 {
 void NoteSyncUnderLock(int reason);
@@ -1249,6 +1250,8 @@ void WriteStats()
                 static_cast<unsigned long long>(g_freesDeferred), static_cast<unsigned long long>(g_posePrepared),
                 static_cast<unsigned long long>(g_poseHits), static_cast<unsigned long long>(g_poseMisses),
                 static_cast<unsigned long long>(g_poseMissesLate));
+        if (!g_shadowBarrier)
+            PrintShadowSkins(f);
         for (uint64_t i = 0; i < std::min(g_poseMissesLate, kLateMissLog); i++)
             fprintf(f, "  late pose miss: skin vtable %llx caller %llx object %llx lod %d\n",
                     static_cast<unsigned long long>(g_lateMiss[i].vtable), static_cast<unsigned long long>(g_lateMiss[i].ret),
@@ -5473,6 +5476,42 @@ struct PendingOp
 std::vector<PendingOp> g_pendingReleases;
 uint64_t g_releaseDeferred;
 
+// Early barrier: characters only shadow prep draws (casters the main view did not draw) are skinned after main is
+// released, so their poses cannot be read live. The render thread lists them (g_rtShadowSkins, render thread only while
+// a flush runs); main takes their poses with the frame's others before the next flush is queued (CaptureShadowSkins),
+// and forgets a character when it is destroyed or loses its model (main, render thread idle). The frame a character
+// first appears only in shadows its shadow is skipped (HookGetPose returns no bones).
+struct ShadowSkin
+{
+    void* skin;
+    int lod;
+    uint64_t seen; // world frame of the last miss
+};
+std::vector<ShadowSkin> g_rtShadowSkins;     // misses of the current flush (render thread)
+std::vector<ShadowSkin> g_shadowSkins;       // known shadow-only characters (main)
+uint64_t g_shadowSkinCaptures, g_shadowSkinSkips, g_shadowSkinForgotten;
+
+void PrintShadowSkins(FILE* f)
+{
+    fprintf(f, "shadow-only characters: poses taken on main %llu, shadows skipped %llu, known now %zu, forgotten %llu\n",
+            static_cast<unsigned long long>(g_shadowSkinCaptures), static_cast<unsigned long long>(g_shadowSkinSkips),
+            g_shadowSkins.size(), static_cast<unsigned long long>(g_shadowSkinForgotten));
+}
+
+void ForgetShadowSkin(void* skin)
+{
+    for (auto* list : {&g_shadowSkins, &g_rtShadowSkins})
+        for (size_t i = 0; i < list->size();)
+            if ((*list)[i].skin == skin)
+            {
+                (*list)[i] = list->back();
+                list->pop_back();
+                g_shadowSkinForgotten++;
+            }
+            else
+                i++;
+}
+
 bool DeferCharacterOpsNow()
 {
     return g_mode == 2 && g_async && GetCurrentThreadId() == g_mainThread;
@@ -5497,6 +5536,7 @@ extern "C" void* __fastcall DeferredCharDelete(void* self, uint64_t flags)
         g_releaseDeferred++;
         return self;
     }
+    ForgetShadowSkin(self);
     return reinterpret_cast<void*(__fastcall*)(void*, uint64_t)>(g_charDeletingDtor)(self, flags);
 }
 
@@ -5508,6 +5548,7 @@ extern "C" void* __fastcall DeferredSkinDelete(void* self, uint64_t flags)
         g_releaseDeferred++;
         return self;
     }
+    ForgetShadowSkin(self);
     return reinterpret_cast<void*(__fastcall*)(void*, uint64_t)>(g_skinDeletingDtor)(self, flags);
 }
 
@@ -5729,6 +5770,20 @@ uint32_t __fastcall HookGetPose(void* skin, int lod, const void* matrix, void** 
             g_lateMiss[g_poseMissesLate] = {*static_cast<uintptr_t*>(skin), reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
                                             reinterpret_cast<uintptr_t>(matrix) - 0x14, lod};
         g_poseMissesLate++;
+        if (!g_shadowBarrier) // main is running its frame: no live pose, take it on main from the next frame on
+        {
+            bool listed = false;
+            for (const ShadowSkin& k : g_rtShadowSkins)
+                listed = listed || k.skin == skin;
+            if (!listed)
+                g_rtShadowSkins.push_back({skin, lod, g_frame});
+            g_shadowSkinSkips++;
+            *l = *s = *mbl = *mbs = nullptr;
+            memset(shape, 0, kShapeDeformBytes);
+            *morph = 0;
+            *remap = nullptr;
+            return 0;
+        }
     }
     return OriginalGetPose(skin)(skin, lod, matrix, l, s, mbl, mbs, shape, morph, remap);
 }
@@ -5765,12 +5820,57 @@ void CaptureObjectPoses(std::vector<uintptr_t>& objects, void* (*alloc)(size_t))
     objects.clear();
 }
 
+// Main, render thread idle: the shadow-only characters the last flushes listed, unless the main view has them.
+void CaptureShadowSkins()
+{
+    for (const ShadowSkin& s : g_rtShadowSkins)
+    {
+        bool known = false;
+        for (ShadowSkin& k : g_shadowSkins)
+            if (k.skin == s.skin)
+            {
+                k = s;
+                known = true;
+            }
+        if (!known)
+            g_shadowSkins.push_back(s);
+    }
+    g_rtShadowSkins.clear();
+    static const float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+    for (size_t i = 0; i < g_shadowSkins.size();)
+    {
+        const ShadowSkin& s = g_shadowSkins[i];
+        if (g_frame - s.seen > 300) // not drawn in shadows for ~5 s
+        {
+            g_shadowSkins[i] = g_shadowSkins.back();
+            g_shadowSkins.pop_back();
+            continue;
+        }
+        i++;
+        bool cached = false;
+        for (const PoseEntry& e : g_poseCache)
+            cached = cached || e.skin == s.skin;
+        if (cached)
+            continue;
+        PoseEntry e{};
+        e.skin = s.skin;
+        e.lod = s.lod;
+        e.matrix = identity;
+        if (!CapturePose(e, ArenaAllocPublic))
+            break;
+        g_poseCache.push_back(e);
+        g_shadowSkinCaptures++;
+    }
+}
+
 // Called on main with the render thread idle, right before the frame is queued.
 void PrepareSkinning(uintptr_t)
 {
     g_poseCache.clear();
     g_rtPoseUsed = 0;
     CaptureObjectPoses(g_frameObjects, ArenaAllocPublic);
+    if (!g_shadowBarrier)
+        CaptureShadowSkins();
 }
 
 // Render thread, main still held: characters the flush itself put on render objects (shadow casters
@@ -5791,6 +5891,7 @@ extern "C" void __fastcall DeferredCharClearModel(void* self)
         g_releaseDeferred++;
         return;
     }
+    ForgetShadowSkin(self);
     reinterpret_cast<void(__fastcall*)(void*)>(g_charClearModel)(self);
 }
 
@@ -5802,6 +5903,7 @@ extern "C" void __fastcall DeferredSkinClearModel(void* self)
         g_releaseDeferred++;
         return;
     }
+    ForgetShadowSkin(self);
     reinterpret_cast<void(__fastcall*)(void*)>(g_skinClearModel)(self);
 }
 
@@ -5883,7 +5985,11 @@ void __fastcall HookPostLoadLevel(void* engine)
 void RunPendingGc()
 {
     for (const PendingOp& op : g_pendingReleases)
+    {
+        if (op.fn == g_charDeletingDtor || op.fn == g_skinDeletingDtor || op.fn == g_charClearModel || op.fn == g_skinClearModel)
+            ForgetShadowSkin(op.self);
         reinterpret_cast<void(__fastcall*)(void*, uint64_t)>(op.fn)(op.self, op.arg);
+    }
     g_pendingReleases.clear();
     if (g_pendingTerrain)
     {

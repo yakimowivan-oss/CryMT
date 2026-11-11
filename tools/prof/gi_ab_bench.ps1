@@ -2,8 +2,9 @@
 # variant as environment variables over CryMT.ini (not changed); 2 passes per run, the second counts. Runs interleave
 # (test by test, the variants in turn) so drift between runs falls on all variants alike.
 #   powershell -File tools\prof\gi_ab_bench.ps1 [-Width 2560 -Height 1440] [-Tests harbor,gpu] [-Rounds 1]
+#   [-PreCfg name]: a Game\Config\<name>.cfg executed before the test's (cvar experiments, after the spec is applied)
 param([int]$Width = 2560, [int]$Height = 1440, [string]$Out = "$PSScriptRoot\..\..\logs\gi_ab_bench.jsonl", [int]$MaxSec = 600,
-      [string[]]$Tests = @('harbor', 'gpu', 'village'), [int]$Rounds = 1, [string[]]$Variants = @('default', 'nogeom', 'screen', 'nogi'))
+      [string[]]$Tests = @('harbor', 'gpu', 'village'), [int]$Rounds = 1, [string]$PreCfg = "", [string[]]$Variants = @('default', 'nogeom', 'screen', 'nogi'))
 $g = 'D:\Games\Crysis'
 $testDefs = @{
     cpu2 = @{Level = 'ice'; Cfg = 'crymt_q_cpu'; Log = 'benchmark_cpu.log'}
@@ -31,7 +32,8 @@ foreach ($t in $Tests) {
         $before = if (Test-Path $log) { (Get-Content $log).Count } else { 0 }
         $t0 = Get-Date
         $gi = if ($v -eq 'nogi') { '0' } else { '1' }
-        $gameArgs = "-dx10 -DEVMODE -crymt=dlaa -crymt-gi=$gi +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map $($test.Level) +exec $($test.Cfg)"
+        $pre = if ($PreCfg) { "+exec $PreCfg " } else { '' }
+        $gameArgs = "-dx10 -DEVMODE -crymt=dlaa -crymt-gi=$gi +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map $($test.Level) $pre+exec $($test.Cfg)"
         $proc = Start-Process "$g\Bin64\Crysis.exe" -ArgumentList $gameArgs -WorkingDirectory "$g\Bin64" -PassThru
         $done = $proc.WaitForExit($MaxSec * 1000)
         if (-not $done) { Stop-Process -Id $proc.Id -Force }
