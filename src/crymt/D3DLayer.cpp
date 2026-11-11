@@ -1846,6 +1846,20 @@ HRESULT STDMETHODCALLTYPE StreamQueryGetData(ID3D10Asynchronous* query, void* da
     NoteRecorder();
     g_queryPolls++;
     QueryCaller* caller = NoteQueryCaller(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), size);
+    // Event queries (4 bytes: the renderer's GPU sync loop at the end of its frame, FUN_380DED50, polls one until the GPU
+    // is done) are synchronous again: the stream drained, then the back end's GetData. Answered asynchronously, the render
+    // thread left the loop with the stream thread still behind and went on into the next frame; with a slow stream thread
+    // (D3D12 debug layer, RenderDoc, CRYMT_STREAMSLOW) far terrain, sea and vegetation went missing or white and flickered
+    // (2026-11-11). The loop waits for the GPU anyway. CRYMT_EVENTSYNC=0: asynchronous as before.
+    static const bool eventSync = [] {
+        wchar_t v[8] = {};
+        return !(GetEnvironmentVariableW(L"CRYMT_EVENTSYNC", v, 8) && wcscmp(v, L"0") == 0);
+    }();
+    if (eventSync && size == sizeof(BOOL))
+    {
+        StreamSync(kSyncAsyncGetData);
+        return g_queryGetData(query, data, size, flags);
+    }
     const uint64_t* pos = QueryEndSlot(query, false);
     if (!pos)
     {

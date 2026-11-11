@@ -16,6 +16,8 @@
 #include "Paths.h"
 #include "RenderDocCapture.h"
 
+uint64_t CryMTWorldFrame(); // CryMT.cpp: world frames since start
+
 namespace rdoc
 {
 namespace
@@ -116,6 +118,17 @@ void Poll(bool focus)
 {
     if (!g_api)
         return;
+    // CRYMT_RENDERDOC_FRAME=<world frame>: a capture at that CryMT world frame (a timedemo shows the same camera there in
+    // every run, at any speed).
+    static uint64_t atFrame = [] {
+        wchar_t value[16] = {};
+        return GetEnvironmentVariableW(L"CRYMT_RENDERDOC_FRAME", value, 16) ? static_cast<uint64_t>(_wtoi64(value)) : ~0ull;
+    }();
+    if (::CryMTWorldFrame() >= atFrame)
+    {
+        atFrame = ~0ull;
+        Trigger();
+    }
     // CRYMT_RENDERDOC_AT=<seconds>: a capture that long after the first frame (tests without a key press);
     // CRYMT_RENDERDOC_AT2 a second one (two frames to compare).
     static ULONGLONG first, at[2] = {~0ull, ~0ull};
