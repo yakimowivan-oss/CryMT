@@ -2997,10 +2997,24 @@ void PumpSentMessages()
     PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
 }
 
+// Main's last sync points (reason, frame, whether shadow prep of the last dispatched flush was done), printed with a
+// fault on the render thread: main often waits inside a generated thunk, which the unwinder cannot walk past.
+struct MainSync
+{
+    int reason;
+    uint32_t frame;
+    bool shadowDone;
+};
+MainSync g_mainSyncs[16];
+uint32_t g_mainSyncCount;
+
 void WaitIdle(int reason)
 {
     if (!g_async)
         return;
+    if (GetCurrentThreadId() == g_mainThread)
+        g_mainSyncs[g_mainSyncCount++ % 16] = {reason, static_cast<uint32_t>(g_frame),
+                                               g_shadowDoneSeq.load(std::memory_order_relaxed) == g_frameSeq};
     NoteSyncUnderLock(reason);
     const uint64_t target = g_write.load(std::memory_order_relaxed);
     const int64_t start = Now();
@@ -6215,6 +6229,10 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
             {
                 fprintf(f, "main thread at the same moment:\n");
                 PrintUnwound(f, mc);
+                fprintf(f, "main's last syncs (oldest first: reason/frame/shadow prep done):");
+                for (uint32_t k = g_mainSyncCount > 16 ? g_mainSyncCount - 16 : 0; k < g_mainSyncCount; k++)
+                    fprintf(f, " %d/%u/%d", g_mainSyncs[k % 16].reason, g_mainSyncs[k % 16].frame, g_mainSyncs[k % 16].shadowDone ? 1 : 0);
+                fprintf(f, "\n");
             }
             ResumeThread(main);
         }
