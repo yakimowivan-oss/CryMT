@@ -7465,6 +7465,9 @@ void GiHotkeys()
         SetTimeOfDay(hours, false);
     }
     g_giControl.timeOfDay = hours;
+    // e_gsm_cache: Cry3DEngine's CVars object (*0x3022B8E0) +0x368 (registered at 0x3012DDF0).
+    if (const auto cvars = *reinterpret_cast<const uintptr_t*>(0x3022B8E0))
+        g_giControl.gsmCache = *reinterpret_cast<const int*>(cvars + 0x368);
     // Home, PgDn, 6 8 9 0 (the main row's digits), "-" and "=": keys the game binds only in multiplayer or not at all.
     static const int kKeys[24] = {VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7,
                                   VK_NUMPAD8, VK_NUMPAD9, VK_MULTIPLY, VK_ADD, VK_SUBTRACT, VK_DIVIDE, VK_DECIMAL,
@@ -7498,6 +7501,16 @@ void GiHotkeys()
             if (done)
             {
                 FocusLog("frame %llu: voxels key %d", static_cast<unsigned long long>(g_frame), kKeys[i]);
+                continue;
+            }
+        }
+        if (g_giControl.panel && g_giControl.page == 3)
+        {
+            // The engine page. Num0: the far shadow cascade cache (e_gsm_cache, CryMT's default 1, launcher option), through
+            // the console so the engine's own handling of the change runs.
+            if (kKeys[i] == VK_NUMPAD0)
+            {
+                ConsoleCommand(g_giControl.gsmCache == 1 ? "e_gsm_cache 0" : "e_gsm_cache 1");
                 continue;
             }
         }
@@ -7558,7 +7571,7 @@ void GiHotkeys()
                 g_giControl.page = 0;
                 g_giControl.panel = true;
             }
-            else if (g_giControl.page < 2)
+            else if (g_giControl.page < 3)
                 g_giControl.page = g_giControl.page + 1;
             else
                 g_giControl.panel = false;

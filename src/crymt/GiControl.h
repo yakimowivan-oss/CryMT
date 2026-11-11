@@ -22,8 +22,10 @@ struct GiControl
     std::atomic<float> occlusionScale{1.0f}, bounceScale{1.0f};
     std::atomic<float> timeOfDay{-1.0f}; // the time of day as main last read it (hours), -1 unknown
     std::atomic<float> startTime{11.5f}; // Num6 goes back to it (CRYMT_GI_STARTTIME, else 11:30)
-    // Num/ pages: 0 GI, 1 voxels, 2 environment maps (the numpad's switches below while it shows; the time keys on all).
+    // Num/ pages: 0 GI, 1 voxels, 2 environment maps, 3 engine (the numpad's switches below while it shows; the time keys
+    // on all).
     std::atomic<int> page{0};
+    std::atomic<int> gsmCache{-1};     // engine page Num0: e_gsm_cache (far shadow cascades cached) as main last read it
     std::atomic<int> voxOpacity{-1};   // voxels page Num0: the cells' opacity 1 from the voxelized geometry only (the screen
                                        // gives their colour), 0 also from the screen; -1 as CRYMT_GI_OCCUPANCY says
     std::atomic<int> geomCache{-1};    // voxels page Num1: unchanged objects voxelized every 4th frame 1, every frame 0; -1 as

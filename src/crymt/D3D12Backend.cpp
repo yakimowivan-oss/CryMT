@@ -8296,6 +8296,14 @@ public:
             lines.push_back({"", "(GEOMETRY: the screen gives the colour only)", "", white});
             lines.push_back({"Num/", "reflections", "", white});
         }
+        else if (g_giControl.page == 3)
+        {
+            lines.push_back({"", "CryMT engine", "", value});
+            const int gsm = g_giControl.gsmCache;
+            lines.push_back({"Num0", "Far shadow cache", gsm < 0 ? "?" : gsm ? "ON" : "OFF", gsm > 0 ? on : off});
+            lines.push_back({"", "(far cascades redrawn less often)", "", white});
+            lines.push_back({"Num/", "hide panel", "", white});
+        }
         else if (g_giControl.page == 2)
         {
             lines.push_back({"", "CryMT environment maps", "", value});
@@ -8310,7 +8318,7 @@ public:
             snprintf(buf, sizeof(buf), "x%.1f", g_giControl.envAllScale.load());
             lines.push_back({"Num5 Num8", "Every material -/+", buf, value});
             lines.push_back({"", "(not vegetation, terrain)", "", white});
-            lines.push_back({"Num*", "Reset   Num/ hide panel", "", white});
+            lines.push_back({"Num*", "Reset   Num/ engine", "", white});
         }
         else
         {

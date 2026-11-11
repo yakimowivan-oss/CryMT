@@ -98,7 +98,9 @@ void LoadCryMT(HMODULE self)
         SetEnvironmentVariableW(L"CRYMT_ASYNCSAVE", L"0"); // the game's save hooks do not cover the editor's saves
     // Console commands CryMT runs on the first frame (CRYMT_TESTCMD, one per frame): what the .cmd launchers pass on the
     // command line, plus the [CVars] lines of the ini ("r_Something=value"), so a plain start of Crysis.exe is the same.
-    std::wstring commands = L"r_DynTexMaxSize 256";
+    // e_gsm_cache 1: far shadow cascades cached (on in the game's High spec, off in Very High; -25% shadow prep on harbor,
+    // the user saw no difference). The launcher's option writes "e_gsm_cache=0" into [CVars] to turn it off (applied after).
+    std::wstring commands = L"r_DynTexMaxSize 256;e_gsm_cache 1";
     if (mode == L"dlaa" && !editor)
         commands += L";r_UseEdgeAA 0";
     wchar_t cvars[2048] = {};
