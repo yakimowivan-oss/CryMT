@@ -7593,6 +7593,18 @@ void GiHotkeys()
 // (then stays), by the frame counter, so every run of a timedemo has the same time at the same frame.
 void TimeSweep()
 {
+    // CRYMT_TODJUMPS=N (tests): every N world frames from frame 300 the time of day jumps +1 hour with everything
+    // recomputed at once, as the panel's Num+ does (the user's device removal on 2026-11-11 came after such presses).
+    static const int jumpEvery = [] {
+        wchar_t v[16] = {};
+        return GetEnvironmentVariableW(L"CRYMT_TODJUMPS", v, 16) ? _wtoi(v) : 0;
+    }();
+    if (jumpEvery > 0 && g_frame >= 300 && g_frame % jumpEvery == 0)
+    {
+        const float t = GetTimeOfDay() + 1.0f;
+        if (t > 0.0f)
+            SetTimeOfDay(t >= 24.0f ? t - 24.0f : t);
+    }
     static int state = 0; // 0 unread, 1 on, 2 off
     static float from, to, frames;
     if (state == 0)

@@ -5674,9 +5674,12 @@ public:
     // ExecuteCommandLists) and are moved to GENERIC_READ explicitly, so a later copy into them knows the state to leave.
     void MarkRead(Buffer12* b)
     {
-        BufferPage* p = b->Page();
-        if (!p)
-            return;
+        if (BufferPage* p = b->Page())
+            MarkPageRead(p);
+    }
+
+    void MarkPageRead(BufferPage* p)
+    {
         if (p->listSerial != g_mainSerial)
         {
             p->listSerial = g_mainSerial;
@@ -7266,6 +7269,12 @@ public:
         const VS12* vs;                   // its outputs (the material pixel shader's input)
         int texture;                      // the z-prepass PS's first 2D texture slot, -1 none
         D3D12_GPU_DESCRIPTOR_HANDLE psSrv; // that PS's texture table as applied
+        // The shared default-heap pages of its vertex and index buffers: the replay moves them to GENERIC_READ like a
+        // normal draw (MarkPageRead). Bound without that, a page was promoted implicitly and a later copy into it in
+        // the same list assumed COMMON; or the replay drew from a page left in COPY_DEST (D3D12 debug layer, 2026-11-11).
+        // Dedicated pages are skipped: they are deleted with their buffer, which may happen before the replay.
+        BufferPage* pages[17];
+        UINT pageCount;
     };
     struct VoxCameraPatch
     {
@@ -7410,6 +7419,20 @@ public:
         memcpy(d.vb, m_vbApplied, d.vbCount * sizeof(D3D12_VERTEX_BUFFER_VIEW));
         d.ib = m_ibApplied;
         d.indexed = indexed;
+        auto notePage = [&d](Buffer12* b) {
+            BufferPage* p = b ? b->Page() : nullptr;
+            if (!p || p->dedicated)
+                return;
+            for (UINT k = 0; k < d.pageCount; k++)
+                if (d.pages[k] == p)
+                    return;
+            if (d.pageCount < std::size(d.pages))
+                d.pages[d.pageCount++] = p;
+        };
+        for (UINT i = 0; i < d.vbCount; i++)
+            notePage(m_vb[i].buffer);
+        if (indexed)
+            notePage(m_ib);
         d.count = count;
         d.instances = instances;
         d.start = start;
@@ -8006,6 +8029,9 @@ public:
                 // Opacity: foliage CRYMT_GI_FOLIAGE, solid 1 (254 / 255 with the LOD dissolve: a mark in captures).
                 const float job2[2] = {d.foliage ? Gi().foliageOpacity : d.dissolve ? 254.0f / 255.0f : 1.0f, d.foliage ? 1.0f : 0.0f};
                 m_list->SetGraphicsRoot32BitConstants(kVoxGeomConstants, 2, job2, 6);
+                for (UINT k = 0; k < d.pageCount; k++)
+                    MarkPageRead(d.pages[k]);
+                FlushBarriers();
                 m_list->IASetPrimitiveTopology(static_cast<D3D12_PRIMITIVE_TOPOLOGY>(d.topology));
                 m_list->IASetVertexBuffers(0, d.vbCount, d.vb);
                 if (d.indexed)
