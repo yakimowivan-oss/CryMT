@@ -761,7 +761,8 @@ uint32_t g_copyNext;
 
 void NoteCopy(const char* site, const D3D12_TEXTURE_COPY_LOCATION& dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION& src,
               const D3D12_BOX* box);
-uint64_t g_emptyCopies; // CopyTexture with an empty box, skipped
+uint64_t g_emptyCopies;      // CopyTexture with an empty box, skipped
+uint64_t g_stagingRowCopies; // staging-to-staging copies done as CopyBufferRegion rows (CopyStagingRows)
 
 // After the device was removed: what DRED kept (see the settings at device creation). Unfinished command lists with
 // the operations around the last one the GPU completed, then the page fault address and the allocations there.
@@ -5908,8 +5909,50 @@ public:
         FlushBarriers();
         const D3D12_TEXTURE_COPY_LOCATION d = Location(dst, dstSub);
         const D3D12_TEXTURE_COPY_LOCATION s = Location(src, srcSub);
+        if (dst->Staging() && src->Staging())
+        {
+            CopyStagingRows(dst, dstSub, x, y, z, src, srcSub, box);
+            return;
+        }
         NoteCopy("CopyTexture", d, x, y, z, s, reinterpret_cast<const D3D12_BOX*>(box));
         m_list->CopyTextureRegion(&d, x, y, z, &s, reinterpret_cast<const D3D12_BOX*>(box));
+    }
+
+    // A copy between two staging textures. Both are buffers here (each subresource at its copyable footprint), and D3D12's
+    // CopyTextureRegion needs a texture on one side: footprint to footprint is invalid. The game's save thumbnail does
+    // this (the screen read back into a staging texture, then a 256x72 region into another): the GPU hung on it, the
+    // driver reset it (DRED and the copy journal of the user's hang 2026-11-12 19:14 and of rp_full_safe 15:27, both a
+    // 256x72 footprint-to-footprint copy as the last one). So the region goes row by row with CopyBufferRegion (the
+    // staging heap is custom, system memory: a valid copy source and destination).
+    void CopyStagingRows(TextureCore* dst, UINT dstSub, UINT x, UINT y, UINT z, TextureCore* src, UINT srcSub, const D3D10_BOX* box)
+    {
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& df = dst->footprints[dstSub];
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& sf = src->footprints[srcSub];
+        const int f = sf.Footprint.Format;
+        const bool bc = (f >= 70 && f <= 84) || (f >= 94 && f <= 99);
+        const UINT block = bc ? 4 : 1;
+        const UINT bytes = bc ? ((f >= 70 && f <= 72) || (f >= 79 && f <= 81) ? 8 : 16) : FormatBytes(sf.Footprint.Format);
+        const UINT left = box ? box->left : 0, top = box ? box->top : 0, front = box ? box->front : 0;
+        const UINT right = box ? box->right : sf.Footprint.Width, bottom = box ? box->bottom : sf.Footprint.Height;
+        const UINT back = box ? box->back : sf.Footprint.Depth;
+        const UINT cols = (right - left + block - 1) / block, rows = (bottom - top + block - 1) / block;
+        const UINT64 rowBytes = static_cast<UINT64>(cols) * bytes;
+        const UINT srcRows = src->rows[srcSub], dstRows = dst->rows[dstSub]; // rows (of blocks) per slice
+        UINT copies = 0;
+        for (UINT slice = 0; slice < back - front; slice++)
+            for (UINT r = 0; r < rows; r++)
+            {
+                const UINT sy = top / block + r, dy = y / block + r;
+                if (sy >= srcRows || dy >= dstRows)
+                    break;
+                const UINT64 so = sf.Offset + (static_cast<UINT64>(front + slice) * srcRows + sy) * sf.Footprint.RowPitch + (left / block) * bytes;
+                const UINT64 dO = df.Offset + (static_cast<UINT64>(z + slice) * dstRows + dy) * df.Footprint.RowPitch + (x / block) * bytes;
+                const UINT64 room = std::min<UINT64>(sf.Footprint.RowPitch - (left / block) * bytes, df.Footprint.RowPitch - (x / block) * bytes);
+                m_list->CopyBufferRegion(dst->res, dO, src->res, so, std::min(rowBytes, room));
+                copies++;
+            }
+        g_stagingRowCopies += copies;
+        LogLimited("stagingcopy", "staging to staging copy %ux%ux%u (format %d) as %u row copies", right - left, bottom - top, back - front, f, copies);
     }
 
     // Upload memory for this list (UpdateSubresource, dynamic textures).
@@ -6032,8 +6075,9 @@ public:
         float sssThickness = 0.005f;       // CRYMT_SSS_THICKNESS: a pixel's assumed thickness, a share of its depth (Bend: 0.005)
         float sssContrast = 4.0f;          // CRYMT_SSS_CONTRAST (Bend: 2..4)
         float sssEdge = 0.02f;             // CRYMT_SSS_EDGE: a depth step taken as an edge, a share of the depth (Bend: 0.02)
-        float sssReach = 1000.0f;          // CRYMT_SSS_REACH: metres from the camera; faded over the last quarter (the
-                                           // materials take them beyond the shadow maps too: fragLib, Terrain)
+        float sssReach = 4000.0f;          // CRYMT_SSS_REACH: metres from the camera; faded over the last quarter (the
+                                           // materials take them beyond the shadow maps too: fragLib, Terrain). 4000 m
+                                           // since 2026-11-12 (the user; 0.235 ms at 5120x1440 against 0.231 at 1000 m)
         float sssNear = 0.0f;              // CRYMT_SSS_NEAR: metres; nearer pixels get none
         float gtao = 1.5f;                 // CRYMT_GI_GTAO=<strength>: GTAO in place of the engine's SSAO, a factor on the GI's
                                            // result as the SSAO was (village rooms: darkening 41.8/68.7/48.2% at 1.5 against the
@@ -10382,8 +10426,18 @@ private:
     void SplitQueries(bool end);
 };
 
+// What a resource's GetDevice gives: the device the engine holds (D3DLayer's wrapper), not this back end. D3DX10 takes the
+// device from a texture: the save thumbnail's resize (CryRenderD3D10+0xdbfda, on main in a sync) called this back end's
+// CopySubresourceRegion directly while the stream thread recorded into the same command list - the driver crashed
+// (nvwgf2umx+0x6dbaf5, 2026-11-12 15:51 and 19:24) or the GPU hung (driver resets at saves). Through the wrapper the
+// calls are recorded into the command stream in order, as the engine's own calls in the same function are.
 ID3D10Device* DeviceInterface()
 {
+    if (ID3D10Device* pub = ::D3DLayerPublicDevice())
+    {
+        pub->AddRef();
+        return pub;
+    }
     g_device->AddRef();
     return g_device;
 }
@@ -13158,7 +13212,8 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  GPU busy %.3f ms/frame (%llu lists timed), depth to SRV %.2f, clears RT %.1f DS %.1f per frame\n",
             s.gpuTicks * 1000.0 / static_cast<double>(frequency) / std::max<double>(1.0, static_cast<double>(s.frames)), static_cast<unsigned long long>(s.gpuLists),
             s.depthToSrv / frames, s.rtClears / frames, s.dsClears / frames);
-    fprintf(f, "  texture copies with an empty box skipped: %llu\n", static_cast<unsigned long long>(g_emptyCopies));
+    fprintf(f, "  texture copies with an empty box skipped: %llu; staging-to-staging copies as buffer rows: %llu rows\n",
+            static_cast<unsigned long long>(g_emptyCopies), static_cast<unsigned long long>(g_stagingRowCopies));
     if (g_device->m_passStampsOn)
     {
         const auto& d = *g_device;

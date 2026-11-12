@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <cstdio>
 
+// The device the engine holds (D3DLayer.cpp: the wrapper, with the command stream recording its calls), or null: what a
+// resource's GetDevice gives, so code that takes the device from a texture (D3DX10) goes the engine's way.
+ID3D10Device* D3DLayerPublicDevice();
 // The renderer's final device, implemented on D3D12; null if D3D12 cannot start (the caller then creates the real one).
 ID3D10Device* Dx12CreateDevice(IDXGIAdapter* adapter, UINT flags);
 // Whether a device given to the DXGI factory is ours.

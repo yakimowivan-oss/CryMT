@@ -2293,6 +2293,8 @@ void StartStream(ID3D10Device1* device)
     SetupLog("d3d command stream running");
 }
 
+ID3D10Device* g_publicDevice; // the last wrapper made (the engine's device): D3DLayerPublicDevice
+
 ID3D10Device* WrapDeviceOf(ID3D10Device* real, bool stream)
 {
     ID3D10Device1* real1 = nullptr;
@@ -2306,6 +2308,7 @@ ID3D10Device* WrapDeviceOf(ID3D10Device* real, bool stream)
         if (g_streamDevice)
             wrap->vtbl = g_streamVtable;
     }
+    g_publicDevice = reinterpret_cast<ID3D10Device*>(wrap);
     return reinterpret_cast<ID3D10Device*>(wrap);
 }
 
@@ -2496,6 +2499,11 @@ HRESULT WINAPI HookD3D10CreateDevice(IDXGIAdapter* adapter, D3D10_DRIVER_TYPE ty
     return hr;
 }
 } // namespace
+
+ID3D10Device* D3DLayerPublicDevice()
+{
+    return g_publicDevice;
+}
 
 // Called for every module load (CryMT's LdrRegisterDllNotification callback).
 void D3DLayerOnDll(const wchar_t* name, size_t chars, uintptr_t base)
