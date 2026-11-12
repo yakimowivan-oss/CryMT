@@ -96,8 +96,9 @@ void LoadCryMT(HMODULE self)
     SetEnvironmentVariableW(L"CRYMT_PAUSEONFOCUS", editor ? L"0" : pause); // focus moves between the editor's panels
     if (editor)
         SetEnvironmentVariableW(L"CRYMT_ASYNCSAVE", L"0"); // the game's save hooks do not cover the editor's saves
-    // Console commands CryMT runs on the first frame (CRYMT_TESTCMD, one per frame): what the .cmd launchers pass on the
-    // command line, plus the [CVars] lines of the ini ("r_Something=value"), so a plain start of Crysis.exe is the same.
+    // Console commands CryMT runs from the first frame (CRYMT_STARTCMD, one per frame): what the .cmd launchers pass on
+    // the command line, plus the [CVars] lines of the ini ("r_Something=value"), so a plain start of Crysis.exe is the
+    // same. A test script's own CRYMT_TESTCMD stays as it is and runs after these (it was overwritten here before).
     // e_gsm_cache 1: far shadow cascades cached (on in the game's High spec, off in Very High; -25% shadow prep on harbor,
     // the user saw no difference). The launcher's option writes "e_gsm_cache=0" into [CVars] to turn it off (applied after).
     std::wstring commands = L"r_DynTexMaxSize 256;e_gsm_cache 1";
@@ -113,8 +114,7 @@ void LoadCryMT(HMODULE self)
                 ch = L' ';
         commands += L";" + line;
     }
-    SetEnvironmentVariableW(L"CRYMT_TESTCMD", commands.c_str());
-    SetEnvironmentVariableW(L"CRYMT_TESTCMDSEC", L"0");
+    SetEnvironmentVariableW(L"CRYMT_STARTCMD", commands.c_str());
     // GI from the ini, or -crymt-gi=0|1 on the command line (the launcher's benchmarks run presets without touching it).
     wchar_t gi[8] = {};
     const std::wstring giArg = ArgValue(L"-crymt-gi=");

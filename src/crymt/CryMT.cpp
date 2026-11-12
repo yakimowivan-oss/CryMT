@@ -7735,14 +7735,21 @@ bool GameHasFocus()
     return pid == GetCurrentProcessId();
 }
 
-// Test tool (CRYMT_TESTCMD="map village;map island", CRYMT_TESTCMDSEC=60): console commands on main, each that many
-// seconds after the previous one, e.g. level changes. IConsole::ExecuteString is slot 31 (Mod SDK order); the console is
-// gEnv->pConsole (+0x30) of CryAction's gEnv (0x30964AE0, read by IsGamePaused).
+// Console commands on main, two queues. CRYMT_STARTCMD: the loader's (DbgHelpProxy: what the .cmd launchers pass, the
+// ini's [CVars]), one per frame from the first frame. Test tool (CRYMT_TESTCMD="map village;map island",
+// CRYMT_TESTCMDSEC=60): after those, each that many seconds after the previous one, e.g. level changes or a teleport.
+// The loader used to write its commands into CRYMT_TESTCMD itself and so dropped the test scripts' commands.
+// IConsole::ExecuteString is slot 31 (Mod SDK order); the console is gEnv->pConsole (+0x30) of CryAction's gEnv
+// (0x30964AE0, read by IsGamePaused).
 constexpr uintptr_t kCryActionEnv = 0x30964AE0;
-char g_testCommands[512];
-size_t g_testNext;
-int g_testInterval;
-DWORD g_testLast;
+struct CommandQueue
+{
+    char text[1024];
+    size_t next;
+    int interval;
+    DWORD last;
+};
+CommandQueue g_startCommands, g_testCommands;
 
 void ConsoleCommand(const char* command)
 {
@@ -7822,21 +7829,22 @@ void RecordHotkeys()
 
 void RunTestCommands()
 {
-    if (!g_testCommands[g_testNext])
+    CommandQueue& q = g_startCommands.text[g_startCommands.next] ? g_startCommands : g_testCommands;
+    if (!q.text[q.next])
         return;
     const DWORD now = GetTickCount();
-    if (!g_testLast)
-        g_testLast = now;
-    if (now - g_testLast < static_cast<DWORD>(g_testInterval) * 1000)
+    if (!q.last)
+        q.last = now;
+    if (now - q.last < static_cast<DWORD>(q.interval) * 1000)
         return;
-    g_testLast = now;
-    char command[128];
+    q.last = now;
+    char command[256];
     size_t n = 0;
-    while (g_testCommands[g_testNext] && g_testCommands[g_testNext] != ';' && n + 1 < sizeof(command))
-        command[n++] = g_testCommands[g_testNext++];
+    while (q.text[q.next] && q.text[q.next] != ';' && n + 1 < sizeof(command))
+        command[n++] = q.text[q.next++];
     command[n] = 0;
-    if (g_testCommands[g_testNext] == ';')
-        g_testNext++;
+    if (q.text[q.next] == ';')
+        q.next++;
     // The loader turns the game's edge anti-aliasing off in DLAA mode; that is right only when DLAA runs. Without an RTX
     // card (AMD, Intel, older NVIDIA) Streamline reports no DLSS, and the game keeps its own anti-aliasing.
     if (_stricmp(command, "r_UseEdgeAA 0") == 0 && !Dx12DlssActive())
@@ -9140,8 +9148,9 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
             g_giControl.startTime = g_giStartTime;
         if (GetEnvironmentVariableW(L"CRYMT_GI_TIMESPEED", level, 8))
             g_giTimeSpeed = static_cast<float>(_wtof(level));
-        if (GetEnvironmentVariableA("CRYMT_TESTCMD", g_testCommands, sizeof(g_testCommands)))
-            g_testInterval = GetEnvironmentVariableW(L"CRYMT_TESTCMDSEC", level, 8) ? _wtoi(level) : 60;
+        GetEnvironmentVariableA("CRYMT_STARTCMD", g_startCommands.text, sizeof(g_startCommands.text));
+        if (GetEnvironmentVariableA("CRYMT_TESTCMD", g_testCommands.text, sizeof(g_testCommands.text)))
+            g_testCommands.interval = GetEnvironmentVariableW(L"CRYMT_TESTCMDSEC", level, 8) ? _wtoi(level) : 60;
         g_frameLogOn = GetEnvironmentVariableW(L"CRYMT_FRAMELOG", level, 8) != 0 || g_gpuProf;
         g_censusOn = g_mode == 0 && GetEnvironmentVariableW(L"CRYMT_CENSUS", level, 8) != 0;
         g_fillOn = g_mode == 2 && GetEnvironmentVariableW(L"CRYMT_FILL", level, 8) != 0 && wcscmp(level, L"0") != 0; // 0: off
