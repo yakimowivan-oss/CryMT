@@ -32,6 +32,8 @@ $defs = [ordered]@{
     geomcache = @{Gi = '1'; Env = @{CRYMT_GI_GEOMCACHE = '1'}}
     nogeom = @{Gi = '1'; Env = @{CRYMT_GI_GEOMETRY = '0'}}
     nozown = @{Gi = '1'; Env = @{CRYMT_ZOWN = '0'}}
+    # Screen-space shadows A/B (sss_ab.ps1 gives the commands: crymt_contact 2/1/0 with crymt_capture each): GPU per pass, 9:00.
+    sss = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_STARTTIME = '9'}}
     full_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     nogi_gpu = @{Gi = '0'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
 }

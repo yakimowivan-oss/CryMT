@@ -256,8 +256,21 @@ sampler2D CryMT_FoliageSampler = sampler_state
   AddressV = Clamp;
 };
 
+// CryMT's screen-space shadows for the sun (Bend Studio's, made by the D3D12 back end after the z-prepass): the
+// occlusion per pixel of the screen (1 shadowed), in place of this placeholder (zero: none).
+sampler2D CryMT_SSSSampler = sampler_state
+{
+  Texture = Textures/CryMT/sss.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
 // CryMT's frame texture, 8x1 (the placeholder's texels are zero but the last, CryMT's mark): 0 the camera jitter
-// (fractions of the screen) and the frame (0..63); 1 towards the sun, w 2 with contact shadows; 2..5 the columns of
+// (fractions of the screen) and the frame (0..63); 1 towards the sun, w 2 with contact shadows, 3 with the screen-space
+// shadows instead (CryMT_SSSSampler); 2..5 the columns of
 // the unjittered view-projection; 6 the contact shadows' length and thickness at 10 m, their reach (metres), w 1:
 // foliage casts them too.
 float4 CryMT_Frame(float i)
@@ -281,6 +294,8 @@ half CryMT_ContactShadow(float3 viewVect, float sceneDepth, float2 screenTC, flo
   float2 texel = float2(ddx(screenTC.x), ddy(screenTC.y));
   float4 sun = CryMT_Frame(1);
   float4 prm = CryMT_Frame(6);
+  if (sun.w > 2.5) // the screen-space shadows, made by CryMT's back end (BendSss.h)
+    return tex2Dlod(CryMT_SSSSampler, float4(screenTC, 0, 0)).r;
   if (sun.w < 1.5 || sceneDepth <= 0)
     return 0;
   float4 f0 = CryMT_Frame(0);
@@ -782,6 +797,9 @@ std::wstring InstallGi()
     // The Forward+ test's placeholder: 2x1, the first texel zero (off), the second 6B6B6B6B.
     std::string fplus = foliage;
     memset(&fplus[132], 0x6B, 4);
+    // The screen-space shadows' placeholder: 2x1, the first texel zero (no shadow), the second 5C5C5C5C.
+    std::string sss = foliage;
+    memset(&sss[132], 0x5C, 4);
     // The environment reflection's placeholder: a 4x4 cube (A8R8G8B8, 6 faces), black; face 0's second texel E7000000.
     std::string env(128 + 6 * 64, '\0');
     const unsigned int eheader[] = {0x20534444, 124, 0x100F, 4, 4, 16, 0, 1};
@@ -802,7 +820,8 @@ std::wstring InstallGi()
                               {"Textures/CryMT/jitter.dds", jitter},
                               {"Textures/CryMT/foliage.dds", foliage},
                               {"Textures/CryMT/pvol.dds", pvol},
-                              {"Textures/CryMT/fplus.dds", fplus}}))
+                              {"Textures/CryMT/fplus.dds", fplus},
+                              {"Textures/CryMT/sss.dds", sss}}))
         return T(L"не удалось записать Game\\zzCryMT.pak", L"could not write Game\\zzCryMT.pak");
     // Loose copies from earlier versions: -DEVMODE would read them before the pak.
     DeleteFileW((g_game + L"Game\\" + kFragLib).c_str());

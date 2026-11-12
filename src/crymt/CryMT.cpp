@@ -8083,6 +8083,21 @@ void RunTestCommands()
     // CryMT's own test commands: crymt_statsreset counts the census from here on (a test's place, not the session). Before a
     // test's quit the logs are written: the frame log otherwise keeps only whole blocks of 3000 frames (the DLL's detach
     // does not run its writes at the game's quit).
+    // crymt_contact <0|1|2>: the contact shadows' mode as the panel sets it (off, the old 12 steps, Bend's screen-space
+    // shadows); crymt_capture <frames>: that many back buffers as the capture key (logs\play\key_*): A/B in one run.
+    if (_strnicmp(command, "crymt_contact ", 14) == 0)
+    {
+        g_giControl.contact = atoi(command + 14);
+        g_giControl.active = true;
+        FocusLog("frame %llu: contact shadows mode %d", static_cast<unsigned long long>(g_frame), g_giControl.contact.load());
+        return;
+    }
+    if (_strnicmp(command, "crymt_capture ", 14) == 0)
+    {
+        Dx12CaptureNow(atoi(command + 14), (g_giControl.enabled ? 1 : 0) | (g_giControl.contact != 0 ? 4 : 0));
+        FocusLog("frame %llu: capture (contact shadows mode %d)", static_cast<unsigned long long>(g_frame), g_giControl.contact.load());
+        return;
+    }
     if (_stricmp(command, "crymt_statsreset") == 0)
     {
         FocusLog("frame %llu: census counts reset", static_cast<unsigned long long>(g_frame));

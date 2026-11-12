@@ -26,5 +26,10 @@ RenderDoc in-application API header (renderdoc_app.h, RenderDoc 1.47)
   License: MIT, Copyright (c) 2015-2026 Baldur Karlsson, Copyright (c) 2014 Crytek
            (https://github.com/baldurk/renderdoc)
 
+Bend Studio Screen Space Shadows (bend_sss_cpu.h, bend_sss_gpu.h; SIGGRAPH 2023)
+  Use:     compiled into CryMT.dll (src\crymt\BendSss.h), modified for CryMT: the shader ported to
+           Direct3D shader model 5 and CryMT's depth; the changes are listed in the source.
+  License: Apache License 2.0, Copyright 2023 Sony Interactive Entertainment (bend_sss.license.txt)
+
 Crysis
   Crysis and CryEngine are trademarks of Crytek. The package contains no game files.
