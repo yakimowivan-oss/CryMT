@@ -43,6 +43,7 @@ struct GiControl
     std::atomic<float> waterSky{-1.0f}; // the cube's brightness on the water (where SSR misses: the sky); -1 as CRYMT_WATERSKY
     std::atomic<int> waterSource{-1};   // the water's cube: 1 the engine's own capture at the camera (CryMT.cpp EnvCubeUpdate),
                                         // 0 the voxel grid's; -1 as CRYMT_ENVCUBE says
+    std::atomic<int> envCubeRate{-1};   // the engine's cube: frames per face drawn (1..8); -1 as CRYMT_ENVCUBE_RATE says
     std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // their strengths
 };
 extern GiControl g_giControl;

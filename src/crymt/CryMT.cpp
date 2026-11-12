@@ -5649,7 +5649,8 @@ void EnvDepthRestore(const uint8_t* renderer)
 void EnvCubeUpdate()
 {
     static const int flags = EnvCubeSetting("CRYMT_ENVCUBE_FLAGS", 0x89C);
-    static const int rate = std::max(EnvCubeSetting("CRYMT_ENVCUBE_RATE", 1), 1);
+    static const int rateBase = std::min(std::max(EnvCubeSetting("CRYMT_ENVCUBE_RATE", 1), 1), 8);
+    const int rate = g_giControl.envCubeRate > 0 ? g_giControl.envCubeRate.load() : rateBase; // the reflections page
     static const float jump = static_cast<float>(std::max(EnvCubeSetting("CRYMT_ENVCUBE_JUMP", 25), 1));
     static uint64_t flushes;
     if (g_levelChange || !D3DLayerPacketsAvailable() || !Dx12WantsEngineEnvCube())
@@ -8268,6 +8269,13 @@ void RunTestCommands()
         g_giControl.waterCube = atoi(command + 16);
         g_giControl.active = true;
         FocusLog("frame %llu: water cube %d", static_cast<unsigned long long>(g_frame), g_giControl.waterCube.load());
+        return;
+    }
+    if (_strnicmp(command, "crymt_envcuberate ", 18) == 0) // the engine's cube: frames per face (1..8)
+    {
+        g_giControl.envCubeRate = std::min(std::max(atoi(command + 18), 1), 8);
+        g_giControl.active = true;
+        FocusLog("frame %llu: engine cube a face every %d frames", static_cast<unsigned long long>(g_frame), g_giControl.envCubeRate.load());
         return;
     }
     if (_strnicmp(command, "crymt_watersky ", 15) == 0) // the cube's brightness on the water

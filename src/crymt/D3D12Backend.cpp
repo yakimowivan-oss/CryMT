@@ -4891,6 +4891,24 @@ public:
         const int panel = g_giControl.waterSource;
         return (panel < 0 ? env : panel) == 1;
     }
+    // How often the engine's cube draws a face (CryMT.cpp EnvCubeUpdate reads the panel's value): every frame (the whole
+    // cube in 6 frames) to every 8th (48 frames); CRYMT_ENVCUBE_RATE, the reflections page.
+    static constexpr int kEnvCubeRates[6] = {1, 2, 3, 4, 6, 8};
+    static int EnvCubeRateBase()
+    {
+        static const int env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_RATE", v, 8) ? std::min(std::max(_wtoi(v), 1), 8) : 1;
+        }();
+        return env;
+    }
+    static int EnvCubeRateIndex(int rate)
+    {
+        int i = 0;
+        while (i < 5 && kEnvCubeRates[i + 1] <= rate)
+            i++;
+        return i;
+    }
     // Its brightness on the water (CRYMT_ENVCUBE_SCALE, default 1: the engine drew it as it draws the planar reflection).
     static float EngineCubeScale()
     {
@@ -9455,6 +9473,8 @@ public:
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE"};
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
         static const char* const waterSource[] = {"ВОКСЕЛИ|VOXELS", "ДВИЖОК|ENGINE"};
+        static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
+                                               "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
         static const std::vector<PanelItem> items = {
             // GI
@@ -9535,6 +9555,9 @@ public:
              true, nullptr},
             {3, "Кубкарта воды|Water cube map", 0, 1, 1, true, waterSource, 0, nullptr, [] { return EngineCubeOn() ? 1 : 0; },
              [] { return 1; }, [](int v) { g_giControl.waterSource = v; }, true, nullptr},
+            {3, "Грань кубкарты рисуется|Cube map face drawn", 0, 5, 1, false, cubeRate, 0, nullptr,
+             [] { const int v = g_giControl.envCubeRate; return EnvCubeRateIndex(v > 0 ? v : EnvCubeRateBase()); },
+             [] { return EnvCubeRateIndex(EnvCubeRateBase()); }, [](int v) { g_giControl.envCubeRate = kEnvCubeRates[v]; }, true, nullptr},
             {3, "Небо в отражении воды|Sky in the water's reflection", 2, 20, 1, false, nullptr, 0.1f, "x%.1f",
              [] { return static_cast<int>(lroundf(WaterSky() * 10.0f)); }, [] { return static_cast<int>(lroundf(WaterSkyBase() * 10.0f)); },
              [](int v) { g_giControl.waterSky = v / 10.0f; }, true, nullptr},
