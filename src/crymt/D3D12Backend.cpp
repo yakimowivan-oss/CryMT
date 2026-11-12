@@ -744,6 +744,70 @@ bool CreateRootSignature(SerializeRootSignatureFn serialize)
     return SUCCEEDED(hr);
 }
 
+// After the device was removed: what DRED kept (see the settings at device creation). Unfinished command lists with
+// the operations around the last one the GPU completed, then the page fault address and the allocations there.
+void LogDred()
+{
+    static const char* const kOps[] = {"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced",
+                                       "ExecuteIndirect", "Dispatch", "CopyBufferRegion", "CopyTextureRegion", "CopyResource",
+                                       "CopyTiles", "ResolveSubresource", "ClearRenderTargetView", "ClearUnorderedAccessView",
+                                       "ClearDepthStencilView", "ResourceBarrier", "ExecuteBundle", "Present",
+                                       "ResolveQueryData", "BeginSubmission", "EndSubmission"};
+    ID3D12DeviceRemovedExtendedData1* d = nullptr;
+    if (!g.dev || FAILED(g.dev->QueryInterface(__uuidof(ID3D12DeviceRemovedExtendedData1), reinterpret_cast<void**>(&d))))
+    {
+        Log("DRED: not available");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bc{};
+    if (SUCCEEDED(d->GetAutoBreadcrumbsOutput1(&bc)))
+    {
+        int shown = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE1* n = bc.pHeadAutoBreadcrumbNode; n && shown < 8; n = n->pNext)
+        {
+            const UINT done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            if (done >= n->BreadcrumbCount)
+                continue;
+            shown++;
+            Log("DRED: list %p (%ls) on queue %ls: %u of %u operations done", static_cast<const void*>(n->pCommandList),
+                n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"-", n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"-",
+                done, n->BreadcrumbCount);
+            UINT draws = 0, dispatches = 0;
+            for (UINT i = 0; i < done && n->pCommandHistory; i++)
+            {
+                draws += n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED || n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED;
+                dispatches += n->pCommandHistory[i] == D3D12_AUTO_BREADCRUMB_OP_DISPATCH;
+            }
+            Log("DRED:   completed before it: %u draws, %u dispatches", draws, dispatches);
+            for (UINT i = done > 12 ? done - 12 : 0; n->pCommandHistory && i < n->BreadcrumbCount && i < done + 6; i++)
+            {
+                const int op = n->pCommandHistory[i];
+                Log("DRED:   %s%5u %s", i == done ? "> " : "  ", i, op >= 0 && op < static_cast<int>(std::size(kOps)) ? kOps[op] : "op");
+            }
+            for (UINT k = 0; k < n->BreadcrumbContextsCount && n->pBreadcrumbContexts; k++)
+            {
+                const D3D12_DRED_BREADCRUMB_CONTEXT& c = n->pBreadcrumbContexts[k];
+                if (c.BreadcrumbIndex + 64 >= done && c.BreadcrumbIndex <= done + 8)
+                    Log("DRED:   context at %u: %ls", c.BreadcrumbIndex, c.pContextString ? c.pContextString : L"");
+            }
+        }
+        if (!shown)
+            Log("DRED: no unfinished command list recorded (breadcrumbs off?)");
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 pf{};
+    if (SUCCEEDED(d->GetPageFaultAllocationOutput1(&pf)))
+    {
+        Log("DRED: page fault at GPU address %llx", static_cast<unsigned long long>(pf.PageFaultVA));
+        int k = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE1* a = pf.pHeadExistingAllocationNode; a && k < 12; a = a->pNext, k++)
+            Log("DRED:   allocation there: %ls (type %d)", a->ObjectNameW ? a->ObjectNameW : L"-", static_cast<int>(a->AllocationType));
+        k = 0;
+        for (const D3D12_DRED_ALLOCATION_NODE1* a = pf.pHeadRecentFreedAllocationNode; a && k < 12; a = a->pNext, k++)
+            Log("DRED:   recently freed there: %ls (type %d)", a->ObjectNameW ? a->ObjectNameW : L"-", static_cast<int>(a->AllocationType));
+    }
+    d->Release();
+}
+
 // D3D12 debug layer messages (CRYMT_D3D12DEBUG=1), drained after each submission.
 void DrainDebugMessages()
 {
@@ -10103,6 +10167,7 @@ void Device::Submit()
         Log("device removed: %08lx (after main list %llu)", static_cast<unsigned long>(g.dev->GetDeviceRemovedReason()),
             static_cast<unsigned long long>(g_mainSerial));
         m_removedLogged = true;
+        LogDred();
     }
     g_inFlight.push_back({g_mainSerial, fence});
     m_allocs.Put(m_alloc, fence);
@@ -12051,6 +12116,7 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
     {
         Log("Present failed %08lx, device removed reason %08lx", static_cast<unsigned long>(hr), static_cast<unsigned long>(g.dev->GetDeviceRemovedReason()));
         m_removedLogged = true;
+        LogDred();
     }
     m_frameFences[m_frame % kFramesInFlight] = g.signaled;
     m_frame++;
@@ -12346,6 +12412,22 @@ bool InitCore(IDXGIAdapter* engineAdapter)
             d->EnableDebugLayer();
             d->Release();
             Log("debug layer enabled");
+        }
+    }
+    // DRED (device removed extended data): after a GPU hang or page fault LogDred writes the unfinished command lists' last
+    // operations and the faulting address with the allocations there. Page faults always; auto-breadcrumbs unless
+    // CRYMT_DRED=0 (the user's GPU hang of 2026-11-12 left only "device removed 887a0006" behind).
+    if (getDebug)
+    {
+        ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
+        if (SUCCEEDED(getDebug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings), reinterpret_cast<void**>(&dred))))
+        {
+            wchar_t v[8] = {};
+            const bool crumbs = !(GetEnvironmentVariableW(L"CRYMT_DRED", v, 8) && wcscmp(v, L"0") == 0);
+            dred->SetAutoBreadcrumbsEnablement(crumbs ? D3D12_DRED_ENABLEMENT_FORCED_ON : D3D12_DRED_ENABLEMENT_SYSTEM_CONTROLLED);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->Release();
+            Log("DRED: page faults on, breadcrumbs %s", crumbs ? "on" : "off");
         }
     }
     if (FAILED(createFactory(0, __uuidof(IDXGIFactory4), reinterpret_cast<void**>(&g.factory))))
