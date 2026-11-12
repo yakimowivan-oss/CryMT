@@ -49,6 +49,7 @@ struct GiControl
     std::atomic<int> envCubeMip{-1};    // ... the mip level the water reads (debug), -1 as the hardware picks
     std::atomic<int> envCubeBlend{-1};  // ... a new face mixed in: 0 replaces, 1 half, 2 a quarter; -1 as CRYMT_ENVCUBE_BLEND
     std::atomic<int> envCubeDown{-1};   // ... its -Z face drawn 1 / left out 0 (the water looks up); -1 as CRYMT_ENVCUBE_DOWN
+    std::atomic<int> envCubeEntities{-1}; // ... entities in it (clouds, vehicles, characters) 1 / 0; -1 as CRYMT_ENVCUBE_ENTITIES
     std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // their strengths
 };
 extern GiControl g_giControl;

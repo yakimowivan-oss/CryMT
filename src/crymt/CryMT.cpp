@@ -5636,6 +5636,7 @@ bool Dx12WantsEngineEnvCube();                  // D3D12Backend.cpp: the water r
 void Dx12EngineEnvCube(ID3D10Resource* cube);   // ... this one (null: none)
 void Dx12DumpEngineCube();                      // ... as one picture at the next present (logs\play\cube_*_envcube.bmp)
 float g_envCubePos[3];
+bool g_envCubeEntitiesPatched;
 bool g_envCubeLogged;
 
 int EnvCubeSetting(const char* name, int fallback)
@@ -5746,6 +5747,62 @@ void EnvCubeUpdate()
     element = nullptr;
     entry[0] = 0;
     const int64_t t0 = Now();
+    // Entities (the clouds among them) in the cube when asked (CRYMT_ENVCUBE_ENTITIES, the panel): the engine's own clearing
+    // of DLD_ENTITIES taken out once (kEnvCubeNoEntities; its bytes checked), then the flag is ours to give.
+    static bool entitiesPatched;
+    if (!entitiesPatched)
+    {
+        entitiesPatched = true;
+        static const uint8_t kBtr[9] = {0x0F, 0xBA, 0xB4, 0x24, 0x48, 0x01, 0x00, 0x00, 0x0A};
+        static const uint8_t kNop9[9] = {0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+        auto* site = reinterpret_cast<uint8_t*>(kEnvCubeNoEntities);
+        DWORD old = 0;
+        if (memcmp(site, kBtr, sizeof(kBtr)) == 0 && VirtualProtect(site, sizeof(kNop9), PAGE_EXECUTE_READWRITE, &old))
+        {
+            memcpy(site, kNop9, sizeof(kNop9));
+            VirtualProtect(site, sizeof(kNop9), old, &old);
+            FlushInstructionCache(GetCurrentProcess(), site, sizeof(kNop9));
+            g_envCubeEntitiesPatched = true;
+        }
+        FocusLog("engine cube: entities %s", g_envCubeEntitiesPatched ? "can be drawn (the engine's clearing taken out)" : "not drawn: unexpected bytes");
+    }
+    static const int entitiesBase = EnvCubeSetting("CRYMT_ENVCUBE_ENTITIES", 1) != 0 ? 1 : 0;
+    const bool entities = g_envCubeEntitiesPatched && (g_giControl.envCubeEntities >= 0 ? g_giControl.envCubeEntities.load() : entitiesBase) != 0;
+    // With the entities the player's own body and weapon are drawn too, around the cube's centre (the eye): the face
+    // cameras then clip at CRYMT_ENVCUBE_NEAR centimetres (default 150) rather than the engine's 0.25 m. DrawCubeSide's one
+    // load of its near plane (kEnvCubeNearLoad) is pointed once at a float of ours in a page within 2 GB of the renderer.
+    static float* nearPlane;
+    static bool nearTried;
+    if (!nearTried)
+    {
+        nearTried = true;
+        auto* site = reinterpret_cast<uint8_t*>(kEnvCubeNearLoad);
+        static const uint8_t kLoad[4] = {0xF3, 0x0F, 0x10, 0x0D};
+        int32_t disp = 0;
+        memcpy(&disp, site + 4, 4);
+        if (memcmp(site, kLoad, 4) == 0 && kEnvCubeNearLoad + 8 + static_cast<intptr_t>(disp) == kEnvCubeNearConst)
+        {
+            uint8_t* page = nullptr;
+            for (uintptr_t hint = kRenderBase + kRenderSize + 0x200000; hint < kRenderBase + 0x40000000 && !page; hint += 0x10000)
+                page = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            const intptr_t newDisp = page ? reinterpret_cast<intptr_t>(page) - static_cast<intptr_t>(kEnvCubeNearLoad + 8) : 0;
+            DWORD old = 0;
+            if (page && newDisp == static_cast<int32_t>(newDisp) && VirtualProtect(site + 4, 4, PAGE_EXECUTE_READWRITE, &old))
+            {
+                nearPlane = reinterpret_cast<float*>(page);
+                *nearPlane = 0.25f;
+                const int32_t d32 = static_cast<int32_t>(newDisp);
+                memcpy(site + 4, &d32, 4);
+                VirtualProtect(site + 4, 4, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), site, 8);
+            }
+        }
+        FocusLog("engine cube: near plane %s", nearPlane ? "ours" : "the engine's (unexpected bytes or no page)");
+    }
+    static const float nearWithEntities = static_cast<float>(std::max(EnvCubeSetting("CRYMT_ENVCUBE_NEAR", 150), 1)) / 100.0f;
+    if (nearPlane)
+        *nearPlane = entities ? nearWithEntities : 0.25f;
+    const uint32_t drawFlags = (static_cast<uint32_t>(flags) & ~0x400u) | (entities ? 0x400u : 0u);
     static bool tableFixed;
     if (!tableFixed)
     {
@@ -5769,7 +5826,7 @@ void EnvCubeUpdate()
     // The back end lets the encode pass read its source (Device::ReleaseOutput) and takes the face into its HDR copy at the
     // end, replacing the old one while the cube is new here (fresh).
     D3DLayerPassName(facesDrawn < 6 ? "CryMT engine cube fresh" : "CryMT engine cube");
-    reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, static_cast<uint32_t>(flags), ~0ull, 0);
+    reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, drawFlags, ~0ull, 0);
     D3DLayerPassName("CryMT engine cube end");
     EnvDepthRestore(renderer);
     for (int l = 0; l < 4; l++)
@@ -8344,6 +8401,13 @@ void RunTestCommands()
         g_giControl.envCubeMip = std::min(std::max(atoi(command + 17), -1), 8);
         g_giControl.active = true;
         FocusLog("frame %llu: engine cube mip %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeMip.load());
+        return;
+    }
+    if (_strnicmp(command, "crymt_envcubeents ", 18) == 0) // entities (clouds, vehicles, characters) in the engine cube 1 / 0
+    {
+        g_giControl.envCubeEntities = atoi(command + 18) != 0 ? 1 : 0;
+        g_giControl.active = true;
+        FocusLog("frame %llu: engine cube entities %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeEntities.load());
         return;
     }
     if (_strnicmp(command, "crymt_envcubeblend ", 19) == 0) // 0 a new face replaces, 1 half, 2 a quarter

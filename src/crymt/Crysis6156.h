@@ -52,6 +52,12 @@ constexpr int kEnvCubeEntries = 16;
 // the 3D engine's view distance), then Encode_ToLDR into the cube's face (RGBK: rgb / max, a = max / 16). The size from
 // r_EnvCMResolution (0 64, 1 128, 2 256, 3 512). Returns 1.
 constexpr uintptr_t kEnvCubeRenderFn = 0x380D4F00;
+// ... where it clears DLD_ENTITIES from the flags before DrawCubeSide: btr dword [rsp+0x148], 10 (9 bytes). The clouds are
+// entities, so the cube had none (the planar water reflection has them).
+constexpr uintptr_t kEnvCubeNoEntities = 0x380D5218;
+// DrawCubeSide's one load of its near plane: movss xmm1, [rip + disp32] (F3 0F 10 0D, 8 bytes) of the 0.25 at 0x3824D628.
+constexpr uintptr_t kEnvCubeNearLoad = 0x380D001B;
+constexpr uintptr_t kEnvCubeNearConst = 0x3824D628;
 constexpr uintptr_t kRdCameraX = 0x28D14;            // the camera's position: floats at +0x28D14, +0x28D24, +0x28D34
 // The renderer's temporary depth surfaces (FUN_380212B0 FX_GetDepthSurface(w, h, aa): the first free one of that size,
 // else a new D3D texture and view): pointers at +0x2D848, count +0x2D850; each {int w, h; char busy at +8; ...}. The

@@ -4994,6 +4994,15 @@ public:
         }();
         return env;
     }
+    // Entities in the engine's cube (clouds, vehicles, characters): CRYMT_ENVCUBE_ENTITIES, default 1 (CryMT.cpp draws them).
+    static int EngineCubeEntitiesBase()
+    {
+        static const int env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_ENTITIES", v, 8) ? (_wtoi(v) != 0 ? 1 : 0) : 1;
+        }();
+        return env;
+    }
     // Its brightness on the water (CRYMT_ENVCUBE_SCALE, default 1: the engine drew it as it draws the planar reflection).
     static float EngineCubeScale()
     {
@@ -9892,6 +9901,9 @@ public:
              nullptr},
             {3, "Смешивание граней|Face blending", 0, 2, 1, true, cubeBlend, 0, nullptr, [] { return EngineCubeBlendIndex(EngineCubeBlend()); },
              [] { return EngineCubeBlendIndex(EngineCubeBlendBase()); }, [](int v) { g_giControl.envCubeBlend = v; }, true, nullptr},
+            {3, "Сущности и облака в кубкарте|Entities and clouds in the cube", 0, 1, 1, true, onOff, 0, nullptr,
+             [] { const int v = g_giControl.envCubeEntities; return v < 0 ? EngineCubeEntitiesBase() : v; }, [] { return EngineCubeEntitiesBase(); },
+             [](int v) { g_giControl.envCubeEntities = v; }, true, nullptr},
             {3, "Нижняя грань кубкарты|Cube map down face", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.envCubeDown; return v < 0 ? EngineCubeDownBase() : v; }, [] { return EngineCubeDownBase(); },
              [](int v) { g_giControl.envCubeDown = v; }, true, nullptr},
