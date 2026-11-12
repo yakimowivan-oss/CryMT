@@ -1,7 +1,8 @@
 param([string[]]$Variants = 'full,nogi,geomcache,nogeom,nozown', [string]$Pre = '', [int]$Width = 5120, [int]$Height = 1440,
       [int]$Settle = 6, [int]$Measure = 20,
       [string]$GotoPos = '1103 1390 137', [string]$Pos = '{x=1103,y=1390,z=137}', [string]$Angles = '{x=-0.0873,y=0,z=-1.117}',
-      [string]$Tag = 'spot', [string]$Capture = '', [string]$Commands = '', [switch]$Sample, [int]$SampleSec = 15)
+      [string]$Tag = 'spot', [string]$Capture = '', [string]$Commands = '', [switch]$Sample, [int]$SampleSec = 15,
+      [string]$Mode = 'dlaa') # -Mode mt: the "MT only" preset (the stock D3D10 renderer), dx12, dlaa
 # Frame times at one place on village (default: the user's spot of 2026-11-12, CamPos 1103 1390 139, Angl -5 0 -64 at
 # 7:00, flying: the ground there is under water at ~98), about 50 s a run. CryMT's test commands (crymt_wait/
 # crymt_waitlevel pace them): once the level runs, the player's physics off (holds it in the air; SimulateOnAction
@@ -39,6 +40,9 @@ $defs = [ordered]@{
     sss_r4000 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_STARTTIME = '9'; CRYMT_SSS_REACH = '4000'}}
     sss_16 = @{Gi = '1'; Env = @{CRYMT_GI_STARTTIME = '16'}} # the sun facing the overview spot's view
     full_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
+    full_early = @{Gi = '1'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}} # main released before shadow prep
+    nogi_early = @{Gi = '0'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}}
+    full_nojitter = @{Gi = '1'; Env = @{CRYMT_DLSS_JITTER = '0'}} # DLAA without the camera jitter (water update test)
     nogi_gpu = @{Gi = '0'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
 }
 $focus = "$g\CryMT\logs\mt\crymt_focus.txt"
@@ -57,7 +61,7 @@ foreach ($v in ($Variants | ForEach-Object { $_ -split ',' })) {
     foreach ($e in $d.Env.GetEnumerator()) { $vars[$e.Key] = $e.Value }
     foreach ($e in $vars.GetEnumerator()) { Set-Item "Env:$($e.Key)" $e.Value }
     $focusLines = if (Test-Path $focus) { (Get-Content $focus).Count } else { 0 }
-    $gameArgs = "-dx10 -DEVMODE -crymt=dlaa -crymt-gi=$($d.Gi) +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map village +exec girecord"
+    $gameArgs = "-dx10 -DEVMODE -crymt=$Mode -crymt-gi=$($d.Gi) +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map village +exec girecord"
     $p = Start-Process "$g\Bin64\Crysis.exe" -ArgumentList $gameArgs -WorkingDirectory "$g\Bin64" -PassThru
     if ($Sample) {
         $t0 = Get-Date

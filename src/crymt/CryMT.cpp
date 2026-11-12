@@ -669,10 +669,11 @@ alignas(16) float g_snapMv[16];
 bool g_bfIdentity = true; // CRYMT_BFIDENTITY=0: BeginFrame invalidates the fake's matrices again (A/B, see TrackViewState)
 bool g_fillLightQueue = true; // CRYMT_FILLLIGHTQ=0: EF_ADDFillLight a sync point again
 bool g_query17 = true;        // CRYMT_Q17=0: EF_Query 0x17 a sync point again
-// CRYMT_SFQUEUE=1: the HUD's Scaleform draws queued (QueueSfDraw). Off by default since 2026-11-12 15:20: with it on the
-// user's play hit two GPU hangs (DRED: a CopyTextureRegion that never finished, no page fault) that none of the static
-// spot runs showed (a HUD that never changes there), and the longer overlap made the particle physics deadlock frequent.
-bool g_sfQueue = false;
+// The HUD's Scaleform draws queued (QueueSfDraw); CRYMT_SFQUEUE=0 keeps them sync points. On by default again since
+// 2026-11-12 night (v17 test): it was off from 15:20 for GPU hangs that were the save thumbnail's (D3DX10 recording on
+// main into the stream thread's command list, and an invalid staging-to-staging copy), not the queue's; the particle
+// physics deadlock is avoided by trimming the particles' object rays. The user checked the HUD, menus, map, binoculars.
+bool g_sfQueue = true;
 alignas(16) float g_snapProj[16];
 std::atomic<uint64_t> g_snapSeq{0};
 bool g_snapInvalid;
@@ -9519,7 +9520,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         wchar_t level[8] = {};
         if (GetEnvironmentVariableW(L"CRYMT_LEVEL", level, 8))
             g_level = _wtoi(level);
-        g_sfQueue = GetEnvironmentVariableW(L"CRYMT_SFQUEUE", level, 8) && wcscmp(level, L"0") != 0;
+        g_sfQueue = !(GetEnvironmentVariableW(L"CRYMT_SFQUEUE", level, 8) && wcscmp(level, L"0") == 0);
         g_physicsTurnOn = GetEnvironmentVariableW(L"CRYMT_PHYSTURN", level, 8) && wcscmp(level, L"0") != 0;
         g_particleObjectRays = GetEnvironmentVariableW(L"CRYMT_PARTICLERAYS", level, 8) && wcscmp(level, L"0") != 0;
         SetPolicies();
