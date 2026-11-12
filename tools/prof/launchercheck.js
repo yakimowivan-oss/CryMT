@@ -14,7 +14,7 @@ vm.runInContext(fs.readFileSync(path.join(ui, 'ini.js'), 'utf8'), ctx);
 const C = ctx.window.CRYMT, I = ctx.window.CryIni;
 
 // Variables that are tests, logs or captures: not for players.
-const INTERNAL = /^CRYMT_(CAPTURE_|.*CENSUS|.*VERIFY|.*TRACE|.*DUMP$|.*LOG$|PSOLOG|GITEST|GI_DEBUG|GI_TIMESWEEP|GI_LAMPTEST|TESTCMD|STARTCMD|DRED|SFQUEUE|BFIDENTITY|RECORDKEYS|FRAMELOG|HEARTBEAT|D3D12DEBUG|DLSS_NOEVAL|DEVGATE|ZCYCLES|ZTRACE|SPRITECHECK|SHADOWREC|GPUPROF|SUNDUMP|VISDUMP|PAKLOG)/;
+const INTERNAL = /^CRYMT_(CAPTURE_|.*CENSUS|.*VERIFY|.*TRACE|.*DUMP$|.*LOG$|PSOLOG|GITEST|GI_DEBUG|GI_TIMESWEEP|GI_LAMPTEST|TESTCMD|STARTCMD|DRED|SFQUEUE|BFIDENTITY|PHYSTURN|PARTICLERAYS|RECORDKEYS|FRAMELOG|HEARTBEAT|D3D12DEBUG|DLSS_NOEVAL|DEVGATE|ZCYCLES|ZTRACE|SPRITECHECK|SHADOWREC|GPUPROF|SUNDUMP|VISDUMP|PAKLOG)/;
 // Knobs known and kept out of the launcher on purpose (experiments, comparisons, fixed tuning): a new variable in the
 // code shows up below until it gets an option in options.js or a place here.
 const HIDDEN = new Set([

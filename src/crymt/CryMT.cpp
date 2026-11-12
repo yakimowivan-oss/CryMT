@@ -667,7 +667,10 @@ uint8_t* g_fakeMvStack;
 uint8_t* g_fakeProjStack;
 alignas(16) float g_snapMv[16];
 bool g_bfIdentity = true; // CRYMT_BFIDENTITY=0: BeginFrame invalidates the fake's matrices again (A/B, see TrackViewState)
-bool g_sfQueue = true;    // CRYMT_SFQUEUE=0: the HUD's Scaleform draws stay sync points (A/B, see QueueSfDraw)
+// CRYMT_SFQUEUE=1: the HUD's Scaleform draws queued (QueueSfDraw). Off by default since 2026-11-12 15:20: with it on the
+// user's play hit two GPU hangs (DRED: a CopyTextureRegion that never finished, no page fault) that none of the static
+// spot runs showed (a HUD that never changes there), and the longer overlap made the particle physics deadlock frequent.
+bool g_sfQueue = false;
 alignas(16) float g_snapProj[16];
 std::atomic<uint64_t> g_snapSeq{0};
 bool g_snapInvalid;
@@ -9484,7 +9487,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         wchar_t level[8] = {};
         if (GetEnvironmentVariableW(L"CRYMT_LEVEL", level, 8))
             g_level = _wtoi(level);
-        g_sfQueue = !(GetEnvironmentVariableW(L"CRYMT_SFQUEUE", level, 8) && wcscmp(level, L"0") == 0);
+        g_sfQueue = GetEnvironmentVariableW(L"CRYMT_SFQUEUE", level, 8) && wcscmp(level, L"0") != 0;
         g_physicsTurnOn = GetEnvironmentVariableW(L"CRYMT_PHYSTURN", level, 8) && wcscmp(level, L"0") != 0;
         g_particleObjectRays = GetEnvironmentVariableW(L"CRYMT_PARTICLERAYS", level, 8) && wcscmp(level, L"0") != 0;
         SetPolicies();
