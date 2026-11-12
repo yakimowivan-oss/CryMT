@@ -41,12 +41,15 @@ def name(f):
     return f
 
 
-frames = open(prefix + '.frames.txt').read().split()
-freq, stamps = int(frames[1]), [int(x) for x in frames[2:]]
 mine = [p for p in (l.rstrip('\n').split('\t') for l in open(prefix + '.samples.txt')) if len(p) >= 3 and p[0] == thread]
-t0, t1 = int(mine[0][1]), int(mine[-1][1])
-nframes = max(1, bisect.bisect_right(stamps, t1) - bisect.bisect_left(stamps, t0) - 1)
-per = (t1 - t0) / freq * 1000.0 / len(mine) / nframes
+try:
+    frames = open(prefix + '.frames.txt').read().split()
+    freq, stamps = int(frames[1]), [int(x) for x in frames[2:]]
+    t0, t1 = int(mine[0][1]), int(mine[-1][1])
+    nframes = max(1, bisect.bisect_right(stamps, t1) - bisect.bisect_left(stamps, t0) - 1)
+    per = (t1 - t0) / freq * 1000.0 / len(mine) / nframes
+except (OSError, IndexError, ValueError):  # no frame log (a hung process): shares in percent
+    nframes, per = 0, 100.0 / len(mine)
 chains = Counter()
 total = 0
 for p in mine:

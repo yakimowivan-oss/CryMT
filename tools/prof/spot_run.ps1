@@ -21,6 +21,8 @@ $defs = [ordered]@{
     nogi_nobf = @{Gi = '0'; Env = @{CRYMT_BFIDENTITY = '0'}}
     nogi_nosf = @{Gi = '0'; Env = @{CRYMT_SFQUEUE = '0'}}
     nogi_nodred = @{Gi = '0'; Env = @{CRYMT_DRED = '0'}}
+    nogi_nophys = @{Gi = '0'; Env = @{CRYMT_PHYSTURN = '0'}}
+    full_nophys = @{Gi = '1'; Env = @{CRYMT_PHYSTURN = '0'}}
     full_nosf = @{Gi = '1'; Env = @{CRYMT_SFQUEUE = '0'}}
     geomcache = @{Gi = '1'; Env = @{CRYMT_GI_GEOMCACHE = '1'}}
     nogeom = @{Gi = '1'; Env = @{CRYMT_GI_GEOMETRY = '0'}}

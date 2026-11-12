@@ -252,6 +252,60 @@ int g_devSiteCount;
 uint64_t g_devCallsAsync;
 DWORD g_rtTid;
 
+// Physics turn. Particles ray-cast CryPhysics from the flush (CREParticle::vf2 -> CParticleContainer::SetVertices ->
+// 3D FUN_30074040 -> RayWorldIntersection, caller slot 1), and main's game update (CEntitySystem::Update inside
+// CCryAction::PreUpdate) uses physics too; CryPhysics' spin locks deadlocked with both at once (both threads spinning:
+// 2026-11-11 with the early release, 2026-11-12 in the user's play once the queued HUD let main run alongside the
+// flush). Main holds the turn through CEntitySystem::Update (EntityUpdateHook) and lets it go whenever it waits for
+// the render thread; the render thread takes it shared around each particle element (CREParticle vtable 0x38262D68
+// slot 2), before the particle code takes its engine lock, so both take the turn first. The render thread waits at
+// most kPhysicsTurnWaitMs, and not again in that flush after such a wait.
+// CRYMT_PHYSTURN=0 off.
+constexpr uintptr_t kParticleReVtable = 0x38262D68;
+constexpr uintptr_t kParticleRePrepare = 0x38127BF0; // slot 2
+constexpr DWORD kPhysicsTurnWaitMs = 20;
+SRWLOCK g_physicsTurn = SRWLOCK_INIT;
+bool g_physicsTurnOn = false; // CRYMT_PHYSTURN=1 (experiment; the particle rays below replace it)
+
+// Particles' object collisions from the render thread. CryPhysics has two caller slots (static blocks at 0x353DD510,
+// 0x313B8 each, a lock at +0x313B4); the 3D engine's particle ray (FUN_30074040) passes slot 1 explicitly, the slot
+// of the physics thread, and deadlocked against main's physics calls (main spinning on the world lock +0x2938, the
+// render thread on slot 1's lock; 2026-11-11, and twice in the user's play on 2026-11-12). On the render thread its
+// object flags (0x20 static, 0x40 dynamic) are dropped: terrain collisions stay (the 3D engine's own terrain ray, no
+// CryPhysics), particles may pass through objects. CRYMT_PARTICLERAYS=1 keeps them (the old behaviour).
+constexpr uintptr_t kParticleRayFn = 0x30074040;
+constexpr uintptr_t kParticleRaySites[] = {0x300460C7, 0x3004689D};
+bool g_particleObjectRays;
+uint64_t g_particleRaysTrimmed;
+
+bool ParticleRayHook(uint64_t a, float* hit, const float* from, const float* to, float length, uint64_t flags)
+{
+    using Fn = bool (*)(uint64_t, float*, const float*, const float*, float, uint64_t);
+    if (!g_particleObjectRays && (flags & 0x60) && GetCurrentThreadId() == g_rtTid)
+    {
+        flags &= ~uint64_t{0x60};
+        g_particleRaysTrimmed++;
+    }
+    return reinterpret_cast<Fn>(kParticleRayFn)(a, hit, from, to, length, flags);
+}
+bool g_mainHoldsPhysicsTurn;
+uint64_t g_physicsTurnWaits, g_physicsTurnTimeouts, g_physicsTurnWaitTicks;
+
+bool DropPhysicsTurn()
+{
+    if (!g_mainHoldsPhysicsTurn || GetCurrentThreadId() != g_mainThread)
+        return false;
+    g_mainHoldsPhysicsTurn = false;
+    ReleaseSRWLockExclusive(&g_physicsTurn);
+    return true;
+}
+
+void RetakePhysicsTurn()
+{
+    AcquireSRWLockExclusive(&g_physicsTurn);
+    g_mainHoldsPhysicsTurn = true;
+}
+
 // The flush calls back into Cry3DEngine (water reflections, FUN_300eefe0) only from the preprocess
 // stage, FUN_380a6d20 called at 0x380AA61F. Main may run ahead once that call has returned.
 int g_rtDepth;
@@ -1221,6 +1275,10 @@ void WriteStats()
                 static_cast<unsigned long long>(g_fillLightsQueued));
         fprintf(f, "scaleform draws queued=%llu (%.1f KB a frame) fallbacks=%llu, ClearBuffer queued=%llu\n", static_cast<unsigned long long>(g_sfQueued),
                 g_sfBytes / 1024.0 / frames, static_cast<unsigned long long>(g_sfFallbacks), static_cast<unsigned long long>(g_sfClears));
+        fprintf(f, "particle object rays trimmed on the render thread: %.2f/frame\n", g_particleRaysTrimmed / frames);
+        fprintf(f, "physics turn %s: particle waits %.3f/frame (%.3f ms/frame), past %u ms %llu\n", g_physicsTurnOn ? "on" : "off",
+                g_physicsTurnWaits / frames, g_physicsTurnWaitTicks * g_qpcToMs / frames, static_cast<unsigned>(kPhysicsTurnWaitMs),
+                static_cast<unsigned long long>(g_physicsTurnTimeouts));
         fprintf(f, "fill mesh SetIndices queued=%llu SetChunk queued=%llu, resource AddRef/Release queued=%llu (releases %llu)\n",
                 static_cast<unsigned long long>(g_meshIndicesQueued), static_cast<unsigned long long>(g_meshChunksQueued),
                 static_cast<unsigned long long>(g_resourceAddRefsQueued), static_cast<unsigned long long>(g_resourceReleasesQueued));
@@ -3402,12 +3460,15 @@ void WaitIdle(int reason)
     const uint64_t target = g_write.load(std::memory_order_relaxed);
     const int64_t start = Now();
     const bool lockDropped = ReleaseEngineLockForWait();
+    const bool turnDropped = DropPhysicsTurn(); // the flush's particles may be waiting for it
     for (uint32_t spin = 0; g_read.load(std::memory_order_acquire) != target; spin++)
     {
         _mm_pause();
         if ((spin & 0xFFF) == 0xFFF)
             PumpSentMessages();
     }
+    if (turnDropped) // the turn before the engine lock, the order the render thread takes them in
+        RetakePhysicsTurn();
     if (lockDropped)
         RetakeEngineLock();
     g_pendingMeshCount = 0; // the render thread has run every queued mesh edit
@@ -3467,8 +3528,14 @@ Command& BeginCommand(uint32_t slot)
     if (w - g_read.load(std::memory_order_acquire) >= kRingSize)
     {
         g_ringFullWaits++;
+        const bool lockDropped = ReleaseEngineLockForWait();
+        const bool turnDropped = DropPhysicsTurn();
         while (w - g_read.load(std::memory_order_acquire) >= kRingSize)
             _mm_pause();
+        if (turnDropped)
+            RetakePhysicsTurn();
+        if (lockDropped)
+            RetakeEngineLock();
     }
     Command& c = g_ring[w & (kRingSize - 1)];
     c.kind = Kind::Call;
@@ -6641,6 +6708,7 @@ void WaitShadowPrep(int site = 0)
     if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
         return;
     const int64_t start = Now();
+    const bool turnDropped = DropPhysicsTurn(); // shadow prep may draw particles
     for (uint32_t spin = 0;; spin++)
     {
         if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
@@ -6649,6 +6717,8 @@ void WaitShadowPrep(int site = 0)
         if ((spin & 0xFFF) == 0xFFF)
             PumpSentMessages();
     }
+    if (turnDropped)
+        RetakePhysicsTurn();
     g_shadowFenceWaits[site]++;
     g_shadowFenceTicks[site] += Now() - start;
 }
@@ -8288,6 +8358,119 @@ void Capture10Install()
     state = 2;
 }
 
+// The particles' side of the physics turn (see g_physicsTurn): shared around each particle element on the render thread.
+uintptr_t g_origParticlePrepare;
+uintptr_t g_origEntityUpdate; // main's side, EntityUpdateHook
+thread_local int t_particleTurn;
+
+void ParticlePrepareHook(void* re)
+{
+    bool got = false;
+    // After a wait past the limit the rest of that flush goes on without waiting (one stall a frame at most).
+    static uint64_t giveUpSeq = ~0ull;
+    if (g_physicsTurnOn && t_particleTurn == 0 && GetCurrentThreadId() == g_rtTid && g_origEntityUpdate && giveUpSeq != g_rtFrameSeq)
+    {
+        got = TryAcquireSRWLockShared(&g_physicsTurn);
+        if (!got)
+        {
+            g_physicsTurnWaits++;
+            const int64_t start = Now();
+            const DWORD t0 = GetTickCount();
+            for (uint32_t spin = 1; !(got = TryAcquireSRWLockShared(&g_physicsTurn)) && GetTickCount() - t0 < kPhysicsTurnWaitMs; spin++)
+            {
+                _mm_pause();
+                if ((spin & 0xFF) == 0)
+                    SwitchToThread();
+            }
+            g_physicsTurnWaitTicks += Now() - start;
+            if (!got)
+            {
+                g_physicsTurnTimeouts++;
+                giveUpSeq = g_rtFrameSeq;
+            }
+        }
+    }
+    t_particleTurn++;
+    reinterpret_cast<void (*)(void*)>(g_origParticlePrepare)(re);
+    t_particleTurn--;
+    if (got)
+        ReleaseSRWLockShared(&g_physicsTurn);
+}
+
+void InstallPhysicsTurn()
+{
+    if (!g_physicsTurnOn || g_mode != 2)
+        return;
+    const auto* vtable = reinterpret_cast<const uintptr_t*>(kParticleReVtable);
+    // Fill mode wraps the renderer classes' methods first (g_methodOrig keeps the originals): then the hook goes on top
+    // of that thunk.
+    bool known = vtable[2] == kParticleRePrepare;
+    for (int i = 0; i < g_rendererMethods && !known && vtable[2] - kRenderBase >= kRenderSize; i++)
+        known = g_methodOrig[i] == kParticleRePrepare;
+    if (!known)
+    {
+        g_physicsTurnOn = false;
+        SetupLog("physics turn: CREParticle vtable differs, off");
+        return;
+    }
+    PatchVtableSlot(kParticleReVtable, 2, &g_origParticlePrepare, reinterpret_cast<const void*>(&ParticlePrepareHook));
+    SetupLog("physics turn: particle elements on the render thread wait for main's game update");
+}
+
+// Main's side: the turn only through CEntitySystem::Update (vtable RVA 0xB6878 slot 2, 0x1E0A0; the module may be
+// relocated), where main stood in the deadlock. Holding it through all of PreUpdate stalled the flush: level loading
+// and its frames run inside PreUpdate, with waits for the render thread the turn did not know (first frame 24 s).
+constexpr uintptr_t kEntitySystemVtableRva = 0xB6878;
+constexpr uintptr_t kEntitySystemUpdateRva = 0x1E0A0;
+
+void EntityUpdateHook(void* self, uint64_t a, uint64_t b, uint64_t c)
+{
+    using Fn = void (*)(void*, uint64_t, uint64_t, uint64_t);
+    if (!g_physicsTurnOn || g_mainHoldsPhysicsTurn || GetCurrentThreadId() != g_mainThread)
+        return reinterpret_cast<Fn>(g_origEntityUpdate)(self, a, b, c);
+    RetakePhysicsTurn();
+    reinterpret_cast<Fn>(g_origEntityUpdate)(self, a, b, c);
+    DropPhysicsTurn();
+}
+
+void InstallEntityTurn()
+{
+    static bool tried;
+    if (tried || !g_physicsTurnOn || !g_origParticlePrepare)
+        return;
+    tried = true;
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"CryEntitySystem.dll"));
+    if (!base || reinterpret_cast<const uintptr_t*>(base + kEntitySystemVtableRva)[2] != base + kEntitySystemUpdateRva)
+    {
+        g_physicsTurnOn = false;
+        SetupLog("physics turn: CEntitySystem vtable differs, off");
+        return;
+    }
+    PatchVtableSlot(base + kEntitySystemVtableRva, 2, &g_origEntityUpdate, reinterpret_cast<const void*>(&EntityUpdateHook));
+    SetupLog("physics turn: main holds it through the entity update");
+}
+
+void InstallParticleRays()
+{
+    static bool tried;
+    if (tried || g_mode != 2)
+        return;
+    tried = true;
+    int patched = 0;
+    for (uintptr_t site : kParticleRaySites)
+        patched += RedirectCall(site, kParticleRayFn, reinterpret_cast<const void*>(&ParticleRayHook));
+    char line[128];
+    sprintf_s(line, "particle object rays: %s on the render thread; %d of 2 call sites", g_particleObjectRays ? "kept (CRYMT_PARTICLERAYS=1)" : "off, terrain only", patched);
+    SetupLog(line);
+}
+
+bool PreUpdateTurn(void* framework, bool engineFocus, unsigned int flags)
+{
+    InstallParticleRays();
+    InstallEntityTurn();
+    return g_origPreUpdate(framework, engineFocus, flags);
+}
+
 bool HookPreUpdate(void* framework, bool engineFocus, unsigned int flags)
 {
     CryMTForceNoMsaa();
@@ -8309,7 +8492,7 @@ bool HookPreUpdate(void* framework, bool engineFocus, unsigned int flags)
     if (g_dlssOn)
         SnapshotLamps();
     if (!g_pauseOnFocus)
-        return g_origPreUpdate(framework, engineFocus, flags);
+        return PreUpdateTurn(framework, engineFocus, flags);
     const bool haveFocus = GameHasFocus();
     if (haveFocus != g_hadFocus)
         FocusLog("frame %llu: focus %d", static_cast<unsigned long long>(g_frame), haveFocus);
@@ -8331,7 +8514,7 @@ bool HookPreUpdate(void* framework, bool engineFocus, unsigned int flags)
         }
     }
     g_hadFocus = haveFocus;
-    return g_origPreUpdate(framework, engineFocus, flags);
+    return PreUpdateTurn(framework, engineFocus, flags);
 }
 
 // Save file written on a worker (CRYMT_ASYNCSAVE, default on). A save captures the game state into an XML tree on main
@@ -9230,6 +9413,7 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
             InstallDlssHooks();
         else if (g_passNames && !InstallGpuProf())
             SetupLog("pass names: render list hook not installed");
+        InstallPhysicsTurn();
         zpass::Install();
         if (g_gpuProf)
         {
@@ -9301,6 +9485,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         if (GetEnvironmentVariableW(L"CRYMT_LEVEL", level, 8))
             g_level = _wtoi(level);
         g_sfQueue = !(GetEnvironmentVariableW(L"CRYMT_SFQUEUE", level, 8) && wcscmp(level, L"0") == 0);
+        g_physicsTurnOn = GetEnvironmentVariableW(L"CRYMT_PHYSTURN", level, 8) && wcscmp(level, L"0") != 0;
+        g_particleObjectRays = GetEnvironmentVariableW(L"CRYMT_PARTICLERAYS", level, 8) && wcscmp(level, L"0") != 0;
         SetPolicies();
         if (g_mode == 2 && !GetEnvironmentVariableW(L"CRYMT_NODEFERFREE", level, 8))
             InstallDeferredFree();
