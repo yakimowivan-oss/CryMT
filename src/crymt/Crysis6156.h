@@ -58,6 +58,12 @@ constexpr uintptr_t kEnvCubeNoEntities = 0x380D5218;
 // DrawCubeSide's one load of its near plane: movss xmm1, [rip + disp32] (F3 0F 10 0D, 8 bytes) of the 0.25 at 0x3824D628.
 constexpr uintptr_t kEnvCubeNearLoad = 0x380D001B;
 constexpr uintptr_t kEnvCubeNearConst = 0x3824D628;
+// ... and its field of view (90 degrees): movss xmm5, [rip+d] of pi/2 (F3 0F 10 2D) at 0x380CFF6F (the camera's fov),
+// mulss xmm1, [rip+d] of 2/pi (F3 0F 59 0D) at 0x380CFF95 (size / fov), movsd xmm0, [rip+d] of pi/4 (F2 0F 10 05) at
+// 0x380CFFCA (the half angle for tan: the projection). 8 bytes each, the displacement at +4.
+constexpr uintptr_t kEnvCubeFovLoad = 0x380CFF6F, kEnvCubeFovConst = 0x38254208;
+constexpr uintptr_t kEnvCubeInvFovLoad = 0x380CFF95, kEnvCubeInvFovConst = 0x38255DC8;
+constexpr uintptr_t kEnvCubeHalfFovLoad = 0x380CFFCA, kEnvCubeHalfFovConst = 0x38255DC0;
 // CTerrain (kTerrainGlobal below): its ocean level, the float at +0x1E0 (what I3DEngine::GetWaterLevel(NULL) returns).
 constexpr uintptr_t kTerrainOceanLevel = 0x1E0;
 constexpr uintptr_t kRdCameraX = 0x28D14;            // the camera's position: floats at +0x28D14, +0x28D24, +0x28D34

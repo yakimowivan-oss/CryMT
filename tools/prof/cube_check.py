@@ -42,9 +42,14 @@ OPS = [('id', lambda s, t: (s, t)), ('mirror s', lambda s, t: (-s, t)), ('mirror
        ('rot -90', lambda s, t: (t, -s)), ('anti-transpose', lambda s, t: (-t, -s))]
 
 
+ENGINE = __import__('os').environ.get('CUBE_ENGINE') == '1'  # the engine's raw faces: flipped vertically (CryMT's lookup)
+
+
 def texel(f, s, t, op=None):
     if op:
         s, t = op(s, t)
+    if ENGINE:
+        t = -t
     u = min(S - 1, max(0, int((s + 1) / 2 * S)))
     v = min(S - 1, max(0, int((t + 1) / 2 * S)))
     return faces[f][1][u, v]

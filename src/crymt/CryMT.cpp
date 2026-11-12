@@ -5655,6 +5655,7 @@ void SetPolicies()
 bool Dx12WantsEngineEnvCube();                  // D3D12Backend.cpp: the water reflection reads the engine's cube
 void Dx12EngineEnvCube(ID3D10Resource* cube);   // ... this one (null: none)
 void Dx12DumpEngineCube();                      // ... as one picture at the next present (logs\play\cube_*_envcube.bmp)
+void Dx12EngineEnvCubeFov(float tanHalf);       // ... its faces' field of view (tan of the half angle; 1 = 90 degrees)
 float g_envCubePos[3];
 bool g_envCubeEntitiesPatched;
 bool g_envCubeRefill; // EnvCubeUpdate: the cube's texture changed, draw all faces fresh
@@ -5829,6 +5830,53 @@ void EnvCubeUpdate()
                 memcpy(site + 4, &d32, 4);
                 VirtualProtect(site + 4, 4, old, &old);
                 FlushInstructionCache(GetCurrentProcess(), site, 8);
+            }
+            // The faces drawn wider than 90 degrees (CRYMT_ENVCUBE_FOV, default 96): neighbours overlap and the back end
+            // blends them there (RunCubeUpdate), so what the engine draws differently per face camera (clouds, sprites,
+            // the underwater fog, things that moved between the faces' frames) fades across the edge instead of a seam.
+            const double fovDeg = std::min(std::max(EnvCubeSetting("CRYMT_ENVCUBE_FOV", 96), 90), 120);
+            if (nearPlane && fovDeg > 90.0)
+            {
+                auto* fov = reinterpret_cast<float*>(page + 16);
+                auto* invFov = reinterpret_cast<float*>(page + 20);
+                auto* halfFov = reinterpret_cast<double*>(page + 24);
+                *fov = static_cast<float>(fovDeg * 3.14159265358979 / 180.0);
+                *invFov = 1.0f / *fov;
+                *halfFov = fovDeg * 3.14159265358979 / 360.0;
+                const struct
+                {
+                    uintptr_t load, constant;
+                    const void* ours;
+                    uint8_t op[4];
+                } loads[3] = {{kEnvCubeFovLoad, kEnvCubeFovConst, fov, {0xF3, 0x0F, 0x10, 0x2D}},
+                              {kEnvCubeInvFovLoad, kEnvCubeInvFovConst, invFov, {0xF3, 0x0F, 0x59, 0x0D}},
+                              {kEnvCubeHalfFovLoad, kEnvCubeHalfFovConst, halfFov, {0xF2, 0x0F, 0x10, 0x05}}};
+                bool ok = true;
+                for (const auto& l : loads)
+                {
+                    auto* at = reinterpret_cast<uint8_t*>(l.load);
+                    int32_t d = 0;
+                    memcpy(&d, at + 4, 4);
+                    ok = ok && memcmp(at, l.op, 4) == 0 && l.load + 8 + static_cast<intptr_t>(d) == l.constant;
+                }
+                for (int i = 0; ok && i < 3; i++)
+                {
+                    auto* at = reinterpret_cast<uint8_t*>(loads[i].load);
+                    const intptr_t nd = reinterpret_cast<intptr_t>(loads[i].ours) - static_cast<intptr_t>(loads[i].load + 8);
+                    DWORD o2 = 0;
+                    if (nd != static_cast<int32_t>(nd) || !VirtualProtect(at + 4, 4, PAGE_EXECUTE_READWRITE, &o2))
+                    {
+                        ok = false;
+                        break;
+                    }
+                    const int32_t d32 = static_cast<int32_t>(nd);
+                    memcpy(at + 4, &d32, 4);
+                    VirtualProtect(at + 4, 4, o2, &o2);
+                    FlushInstructionCache(GetCurrentProcess(), at, 8);
+                }
+                if (ok)
+                    Dx12EngineEnvCubeFov(static_cast<float>(std::tan(*halfFov)));
+                FocusLog("engine cube: faces %s", ok ? "drawn wider (blended at the edges)" : "at 90 degrees (unexpected bytes)");
             }
         }
         FocusLog("engine cube: near plane %s", nearPlane ? "ours" : "the engine's (unexpected bytes or no page)");

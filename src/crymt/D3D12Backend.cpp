@@ -904,6 +904,7 @@ Device* g_device;
 std::mutex g_engineCubeLock;
 ID3D10Resource* g_engineCubePending;
 std::atomic<bool> g_cubeDumpWanted; // Dx12DumpEngineCube (Num0 with the in-game keys): the cube as one picture at the next present
+std::atomic<float> g_engineCubeTanHalf{1.0f}; // Dx12EngineEnvCubeFov: the engine cube faces' tan(half field of view)
 ID3D10Device* DeviceInterface(); // AddRef'd
 void SubmitMain();               // context thread: submits the main list being recorded
 void PollDone();                 // refreshes the completed serial
@@ -1186,26 +1187,65 @@ cbuffer C : register(b0)
   uint size;
   uint face;
   float blend;
-  uint pad;
+  float k; // tan of the engine faces' half field of view (1: 90 degrees)
 };
-
-[numthreads(8, 8, 1)]
-void cubeDecode(uint3 id : SV_DispatchThreadID)
-{
-  if (id.x >= size || id.y >= size)
-    return;
-  float4 c = ldr.Load(int4(id.x, size - 1 - id.y, face, 0));
-  float3 hdr = c.rgb * (c.a * 16);
-  uint3 at = uint3(id.xy, face);
-  float3 old = blend < 1 ? dst[at].rgb : hdr;
-  dst[at] = float4(lerp(old, hdr, blend), 1);
-}
 
 // The direction of a D3D cube face's point (s, t in -1..1, t down).
 float3 CubeDir(uint f, float s, float t)
 {
   return f == 0 ? float3(1, -t, -s) : f == 1 ? float3(-1, -t, s) : f == 2 ? float3(s, 1, t) : f == 3 ? float3(s, -1, -t)
        : f == 4 ? float3(s, -t, 1) : float3(-s, -t, -1);
+}
+
+float3 Ldr(uint f, int2 p)
+{
+  float4 c = ldr.Load(int4(p, f, 0));
+  return c.rgb * (c.a * 16);
+}
+
+// Bilinear in the engine's face g at (s, t) of its own (wide) view; its image is flipped vertically.
+float3 SampleFace(uint g, float2 st)
+{
+  float2 p = (float2(st.x, -st.y) * 0.5 + 0.5) * size - 0.5;
+  int2 p0 = (int2)floor(p);
+  float2 w = p - p0;
+  int2 lo = clamp(p0, 0, (int)size - 1), hi = clamp(p0 + 1, 0, (int)size - 1);
+  return lerp(lerp(Ldr(g, lo), Ldr(g, int2(hi.x, lo.y)), w.x), lerp(Ldr(g, int2(lo.x, hi.y)), Ldr(g, hi), w.x), w.y);
+}
+
+[numthreads(8, 8, 1)]
+void cubeDecode(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= size || id.y >= size)
+    return;
+  float2 st = (id.xy + 0.5) / size * 2 - 1;
+  float3 d = CubeDir(id.z, st.x, st.y);
+  float3 hdr = 0;
+  if (k <= 1.0001)
+    hdr = SampleFace(id.z, st);
+  else
+  {
+    // Every face whose wide view holds d, weighted by how far inside: 1 within its 90 degrees, down to 0 at its view's
+    // edge; on the 90-degree edge two faces weigh the same.
+    float margin = 1 - 1 / k, sum = 0;
+    for (uint g = 0; g < 6; g++)
+    {
+      float3 a = g == 0 ? float3(d.x, -d.z, -d.y) : g == 1 ? float3(-d.x, d.z, -d.y) : g == 2 ? float3(d.y, d.x, d.z)
+               : g == 3 ? float3(-d.y, d.x, -d.z) : g == 4 ? float3(d.z, d.x, -d.y) : float3(-d.z, -d.x, -d.y);
+      if (a.x <= 0)
+        continue;
+      float2 sg = a.yz / (a.x * k);
+      float w = saturate((1 - max(abs(sg.x), abs(sg.y))) / margin);
+      if (w > 0)
+      {
+        hdr += w * SampleFace(g, sg);
+        sum += w;
+      }
+    }
+    hdr /= max(sum, 1e-5);
+  }
+  float3 old = blend < 1 ? dst[id].rgb : hdr;
+  dst[id] = float4(lerp(old, hdr, blend), 1);
 }
 
 [numthreads(8, 8, 1)]
@@ -8046,6 +8086,8 @@ public:
             g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_hdrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             uint32_t k[4] = {dsize, static_cast<uint32_t>(face), 0, 0};
             memcpy(&k[2], &blend, sizeof(float));
+            const float tanHalf = g_engineCubeTanHalf.load();
+            memcpy(&k[3], &tanHalf, sizeof(float));
             // The level above (its six subresources) read through a view: out of unordered access while this level is made.
             D3D12_RESOURCE_BARRIER above[6]{};
             if (m > 0)
@@ -8059,7 +8101,7 @@ public:
             m_list->SetPipelineState(m ? m_cubeDownPso : m_cubeDecodePso);
             m_list->SetComputeRoot32BitConstants(0, 4, k, 0);
             m_list->SetComputeRootDescriptorTable(1, gpu);
-            m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, m ? 6 : 1);
+            m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, 6); // level 0 too: the faces' edges blend from their neighbours
             if (m > 0)
             {
                 for (D3D12_RESOURCE_BARRIER& t : above)
@@ -10744,8 +10786,9 @@ public:
                         face = d[1] > 0 ? 2 : 3, sc = d[0] / ay, tc = (d[1] > 0 ? d[2] : -d[2]) / ay;
                     else
                         face = d[2] > 0 ? 4 : 5, sc = (d[2] > 0 ? d[0] : -d[0]) / az, tc = -d[1] / az;
-                    const UINT u = std::min(s - 1, static_cast<UINT>(std::max(0.0f, (sc + 1) * 0.5f * s)));
-                    const UINT v = std::min(s - 1, static_cast<UINT>(std::max(0.0f, (tc + 1) * 0.5f * s)));
+                    const float wide = g_engineCubeTanHalf.load(); // the engine's faces see wider than 90 degrees
+                    const UINT u = std::min(s - 1, static_cast<UINT>(std::max(0.0f, (sc / wide + 1) * 0.5f * s)));
+                    const UINT v = std::min(s - 1, static_cast<UINT>(std::max(0.0f, (tc / wide + 1) * 0.5f * s)));
                     const float* hdr = &m_cubeFaces[face][(static_cast<size_t>(v) * s + u) * 3];
                     uint8_t* p = &img[(static_cast<size_t>(oy + y) * W + ox + x) * 3];
                     for (int c = 0; c < 3; c++)
@@ -13787,6 +13830,16 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
             static const char* const faces[6] = {"envcube0", "envcube1", "envcube2", "envcube3", "envcube4", "envcube5"};
             for (UINT face = 0; face < 6; face++)
                 RecordDump(m_engineCube->info->res, faces[face], 6, face);
+            if (m_hdrCube.res) // the HDR copy the water reads, level 0: <tag>_hdrcube<face>.ppm (D3D layout, 1 - exp(-x))
+            {
+                Require(&m_hdrCube, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                FlushBarriers();
+                static const char* const hdrFaces[6] = {"hdrcube0", "hdrcube1", "hdrcube2", "hdrcube3", "hdrcube4", "hdrcube5"};
+                for (UINT face = 0; face < 6; face++)
+                    RecordDump(m_hdrCube.res, hdrFaces[face], 0, face * m_hdrCube.mips);
+                Require(&m_hdrCube, kSrvState);
+                FlushBarriers();
+            }
             cubeDump = true;
         }
         else
@@ -14318,6 +14371,11 @@ void Dx12DrawPacket(const uint8_t* packet)
 {
     if (dx12::g_device)
         dx12::g_device->DrawIndexedWithConstants(packet);
+}
+
+void Dx12EngineEnvCubeFov(float tanHalf)
+{
+    dx12::g_engineCubeTanHalf = tanHalf;
 }
 
 void Dx12DumpEngineCube()
