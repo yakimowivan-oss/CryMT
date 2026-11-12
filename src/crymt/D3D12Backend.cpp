@@ -6559,13 +6559,27 @@ public:
     // view-projection (row vectors); 6 the contact shadows' length and thickness at 10 m, their reach (metres).
     // Set with the frame's main camera, before its draws.
     // The patched z-prepass (SV_Target1: 1 on alpha-tested surfaces) into the scene's R32F depth target: the foliage
-    // mask bound as the second target (made at that target's size; smaller ones, the reflections, left out), cleared
-    // at the frame's first such draw.
+    // mask bound as the second target (made at that target's size), cleared at the frame's first such draw. Targets
+    // smaller than the previous frame's largest z-prepass (the reflections') are left out. That was "the largest ever"
+    // until 2026-11-13: after the game's resolution went down (5120 -> 2560 wide) the scene's own z-prepass counted as a
+    // reflection, so no mask, no depth for the screen-space shadows and the water's SSR for the rest of the session.
     void BindFoliageMask()
     {
         const auto* t = static_cast<const TextureCore*>(m_rtv[0]->info);
         const UINT w = t->width, h = t->height;
-        if (m_foliageRtv && (w < m_foliageW || h < m_foliageH))
+        if (m_zMaxFrame != m_frame)
+        {
+            if (m_zMaxW)
+            {
+                m_zPrevW = m_zMaxW;
+                m_zPrevH = m_zMaxH;
+            }
+            m_zMaxW = m_zMaxH = 0;
+            m_zMaxFrame = m_frame;
+        }
+        m_zMaxW = std::max(m_zMaxW, w);
+        m_zMaxH = std::max(m_zMaxH, h);
+        if (w < m_zPrevW || h < m_zPrevH)
             return;
         if (!m_foliageRtv || w != m_foliageW || h != m_foliageH)
         {
@@ -10706,6 +10720,8 @@ private:
     bool m_sssSun = false;
     TextureCore* m_zTarget = nullptr;
     uint64_t m_zTargetFrame = ~0ull;
+    UINT m_zMaxW = 0, m_zMaxH = 0, m_zPrevW = 0, m_zPrevH = 0; // BindFoliageMask: this frame's largest z-prepass, the last one's
+    uint64_t m_zMaxFrame = ~0ull;
     // The depth pyramid for the water's SSR (RunHiz): the texture with all levels, its view, a UAV per level, the
     // pipelines, the frames it was tried and made in, near / far from the frame's camera.
     static constexpr UINT kHizLevels = 7;
