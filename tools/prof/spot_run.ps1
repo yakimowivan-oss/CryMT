@@ -34,6 +34,10 @@ $defs = [ordered]@{
     nozown = @{Gi = '1'; Env = @{CRYMT_ZOWN = '0'}}
     # Screen-space shadows A/B (sss_ab.ps1 gives the commands: crymt_contact 2/1/0 with crymt_capture each): GPU per pass, 9:00.
     sss = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_STARTTIME = '9'}}
+    sss_r200 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_STARTTIME = '9'; CRYMT_SSS_REACH = '200'}}
+    sss_r1000 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_STARTTIME = '9'; CRYMT_SSS_REACH = '1000'}}
+    sss_r4000 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_STARTTIME = '9'; CRYMT_SSS_REACH = '4000'}}
+    sss_16 = @{Gi = '1'; Env = @{CRYMT_GI_STARTTIME = '16'}} # the sun facing the overview spot's view
     full_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     nogi_gpu = @{Gi = '0'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
 }

@@ -202,7 +202,32 @@ half CryMT_GIBakedMix(float4 screenProj, half baked, half bit)
 {
   return CryMT_GIReplaces(screenProj, bit) ? lerp(1, baked, CryMT_GIBakedShare(screenProj)) : baked;
 }
+
+// CryMT's screen-space shadows for the sun (Bend Studio's, made by the D3D12 back end after the z-prepass), in place of
+// Textures/CryMT/sss.dds (whose red is zero everywhere: no shadow).
+sampler2D CryMT_SSSSampler = sampler_state
+{
+  Texture = Textures/CryMT/sss.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
+// The sun's shadow from the screen's shadow mask (red) taken with the screen-space shadows: the deferred shadow pass
+// adds them only within the shadow maps' cascades, beyond them it draws nothing; here they reach as far as the back
+// end's reach (CRYMT_SSS_REACH, the AO page).
+half CryMT_SunShadow(half mask, float4 screenProj)
+{
+  return max(mask, tex2Dproj(CryMT_SSSSampler, screenProj).r);
+}
 #else
+half CryMT_SunShadow(half mask, float4 screenProj)
+{
+  return mask;
+}
+
 half3 CryMT_GIAmbient(half3 ambient, float4 screenProj)
 {
   return ambient;
@@ -701,6 +726,13 @@ std::wstring InstallGi()
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
                                "  float tcIterParam = LightInfoTC_DB.w;\n  for (int i=0; i<LightsNum_DB; i++, tcLI.x+=tcIter)\n#else\n";
     const bool ok = Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl) &&
+                    // The sun's shadow mask with CryMT's screen-space shadows, also beyond the shadow maps.
+                    Replace(frag, "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);",
+                            "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);\n"
+                            "    pPass.cShadowOcclMap.x = CryMT_SunShadow(pPass.cShadowOcclMap.x, pPass.IN.screenProj); // CryMT: screen-space shadows") &&
+                    Replace(terrain, "    shadowOccl = tex2Dproj(shadowOccludeMapSampler, IN.screenProj.xyzw);",
+                            "    shadowOccl = tex2Dproj(shadowOccludeMapSampler, IN.screenProj.xyzw);\n"
+                            "    shadowOccl.x = CryMT_SunShadow(shadowOccl.x, IN.screenProj); // CryMT: screen-space shadows") &&
                     // The single-pass loop's light count is a float's bits under D3D10 (CryMT_LightsNum): vegetation's
                     // back shading divides by it (before fragLib is included, so the conversion is written out here).
                     Replace(vegetation, "  if (LightsNum_DB)\n    fOccFactor = pPass.pCustom.fOcclShadowAcc / LightsNum_DB;\n",
@@ -797,9 +829,11 @@ std::wstring InstallGi()
     // The Forward+ test's placeholder: 2x1, the first texel zero (off), the second 6B6B6B6B.
     std::string fplus = foliage;
     memset(&fplus[132], 0x6B, 4);
-    // The screen-space shadows' placeholder: 2x1, the first texel zero (no shadow), the second 5C5C5C5C.
+    // The screen-space shadows' placeholder: 2x1, the first texel zero (no shadow), the second 005C005C (the mark: its
+    // red is zero in either byte order, as fragLib reads the whole screen from it).
     std::string sss = foliage;
-    memset(&sss[132], 0x5C, 4);
+    memset(&sss[132], 0, 4);
+    sss[133] = sss[135] = 0x5C;
     // The environment reflection's placeholder: a 4x4 cube (A8R8G8B8, 6 faces), black; face 0's second texel E7000000.
     std::string env(128 + 6 * 64, '\0');
     const unsigned int eheader[] = {0x20534444, 124, 0x100F, 4, 4, 16, 0, 1};

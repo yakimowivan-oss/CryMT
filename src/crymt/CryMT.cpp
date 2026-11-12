@@ -8092,6 +8092,13 @@ void RunTestCommands()
         FocusLog("frame %llu: contact shadows mode %d", static_cast<unsigned long long>(g_frame), g_giControl.contact.load());
         return;
     }
+    if (_strnicmp(command, "crymt_sssreach ", 15) == 0)
+    {
+        g_giControl.sssReach = atoi(command + 15);
+        g_giControl.active = true;
+        FocusLog("frame %llu: screen-space shadows reach %d m", static_cast<unsigned long long>(g_frame), g_giControl.sssReach.load());
+        return;
+    }
     if (_strnicmp(command, "crymt_capture ", 14) == 0)
     {
         Dx12CaptureNow(atoi(command + 14), (g_giControl.enabled ? 1 : 0) | (g_giControl.contact != 0 ? 4 : 0));

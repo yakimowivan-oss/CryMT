@@ -6032,7 +6032,8 @@ public:
         float sssThickness = 0.005f;       // CRYMT_SSS_THICKNESS: a pixel's assumed thickness, a share of its depth (Bend: 0.005)
         float sssContrast = 4.0f;          // CRYMT_SSS_CONTRAST (Bend: 2..4)
         float sssEdge = 0.02f;             // CRYMT_SSS_EDGE: a depth step taken as an edge, a share of the depth (Bend: 0.02)
-        float sssReach = 200.0f;           // CRYMT_SSS_REACH: metres from the camera; faded over the last quarter
+        float sssReach = 1000.0f;          // CRYMT_SSS_REACH: metres from the camera; faded over the last quarter (the
+                                           // materials take them beyond the shadow maps too: fragLib, Terrain)
         float sssNear = 0.0f;              // CRYMT_SSS_NEAR: metres; nearer pixels get none
         float gtao = 1.5f;                 // CRYMT_GI_GTAO=<strength>: GTAO in place of the engine's SSAO, a factor on the GI's
                                            // result as the SSAO was (village rooms: darkening 41.8/68.7/48.2% at 1.5 against the
@@ -6237,6 +6238,7 @@ public:
             g_giControl.contact = BaseContact();
         g.contactShadows = g_giControl.contact > 0;
         g.sss = g_giControl.contact == 2;
+        g.sssReach = g_giControl.sssReach > 0 ? static_cast<float>(g_giControl.sssReach) : b.sssReach;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -8928,6 +8930,16 @@ public:
                 best = i;
         return best;
     }
+    // The screen-space shadows' reach on the panel (metres): the list's entry nearest a value.
+    static constexpr int kSssReaches[6] = {100, 200, 500, 1000, 2000, 4000};
+    static int SssReachIndex(float metres)
+    {
+        int best = 0;
+        for (int i = 1; i < 6; i++)
+            if (fabsf(kSssReaches[i] - metres) < fabsf(kSssReaches[best] - metres))
+                best = i;
+        return best;
+    }
     template <int Bit> static int BakedGet()
     {
         const int v = g_giControl.bakedOff;
@@ -8945,6 +8957,7 @@ public:
         static const char* const parts[] = {"ЭКРАН+ВОКСЕЛИ|SCREEN+VOXELS", "ВОКСЕЛИ|VOXELS"};
         static const char* const ao[] = {"SSAO ИГРЫ|GAME'S SSAO", "GTAO"};
         static const char* const contact[] = {"ВЫКЛ|OFF", "СТАРЫЕ, 12 ШАГОВ|OLD, 12 STEPS", "SSS (BEND)"};
+        static const char* const sssReach[] = {"100 М|100 M", "200 М|200 M", "500 М|500 M", "1000 М|1000 M", "2000 М|2000 M", "4000 М|4000 M"};
         static const char* const outdoor[] = {"50%", "70%", "100%", "150%", "200%"};
         static const char* const baked[] = {"ДВИЖОК|ENGINE", "GI"};
         static const char* const view[] = {"ВЫКЛ|OFF", "КАРКАС|WIRE", "СПЛОШНОЙ|SOLID"};
@@ -8974,6 +8987,9 @@ public:
             {1, "Контактные тени|Contact shadows", 0, 2, 1, true, contact, 0, nullptr,
              [] { const int v = g_giControl.contact; return v < 0 ? BaseContact() : v; },
              [] { return BaseContact(); }, [](int v) { g_giControl.contact = v; }, true, nullptr},
+            {1, "Дальность SSS|SSS reach", 0, 5, 1, false, sssReach, 0, nullptr,
+             [] { const int v = g_giControl.sssReach; return SssReachIndex(v > 0 ? static_cast<float>(v) : GiBase().sssReach); },
+             [] { return SssReachIndex(GiBase().sssReach); }, [](int v) { g_giControl.sssReach = kSssReaches[v]; }, true, nullptr},
             {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
              [] { return GiBase().particlesGi ? 1 : 0; }, [](int v) { g_giControl.particles = v; }, true, nullptr},
@@ -10759,8 +10775,10 @@ bool Device::ApplyOnce(bool indexed)
             PassNameEnd();
         }
     }
-    // Bend's screen-space shadows: made once a frame, before the first draw reading them (the deferred shadow pass).
-    if (m_ps && g_sssPlaceholder && m_sssTriedFrame != m_frame && PsReads(g_sssPlaceholder))
+    // Bend's screen-space shadows: made once a frame, before the first draw reading them after the frame's z-prepass
+    // (the deferred shadow pass). fragLib's materials read them too, some before the z-prepass (they get none): the
+    // first such draw took the frame's turn and found no depth (0 frames made).
+    if (m_ps && g_sssPlaceholder && m_sssTriedFrame != m_frame && m_zTargetFrame == m_frame && PsReads(g_sssPlaceholder))
     {
         m_sssTriedFrame = m_frame;
         if (Gi().contactShadows && Gi().sss && m_sssSun)
@@ -11540,8 +11558,8 @@ bool IsFPlusPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_D
     return true;
 }
 
-// Textures/CryMT/sss.dds: CryMT's 2x1 placeholder for the screen-space shadows (patched ShadowMaskGen.cfx): the first
-// texel zero (no shadow), the second 5C5C5C5C (the mark).
+// Textures/CryMT/sss.dds: CryMT's 2x1 placeholder for the screen-space shadows (patched ShadowMaskGen.cfx, fragLib.cfi):
+// the first texel zero (no shadow), the second 005C005C (the mark; red zero in either byte order).
 bool IsSssPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
 {
     if (!init || !init->pSysMem || d.Width != 2 || d.Height != 1 || d.ArraySize != 1 ||
@@ -11550,7 +11568,7 @@ bool IsSssPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DAT
         return false;
     const auto* p = static_cast<const uint8_t*>(init->pSysMem);
     for (int i = 0; i < 8; i++)
-        if (p[i] != (i < 4 ? 0 : 0x5C))
+        if (p[i] != (i == 5 || i == 7 ? 0x5C : 0))
             return false;
     return true;
 }

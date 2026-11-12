@@ -14,7 +14,8 @@ struct GiControl
     std::atomic<int> view{0}; // voxel debug view: 0 off, 1 wire, 2 solid
     std::atomic<int> geometry{-1}; // voxel geometry: 0 off, 1 on, 2 with foliage as partly open
     std::atomic<int> gtao{-1};     // GTAO in place of the engine's SSAO 1, the SSAO 0
-    std::atomic<int> contact{-1};  // contact shadows 1 / 0
+    std::atomic<int> contact{-1};  // contact shadows: 0 off, 1 the old 12 steps, 2 Bend's screen-space shadows
+    std::atomic<int> sssReach{-1}; // the screen-space shadows' reach (metres); -1 as CRYMT_SSS_REACH says
     std::atomic<int> particles{-1}; // blended particles (smoke, dust) take the GI 1 / 0
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> particleOut{-1}; // their darkening outdoors, percent of the indoor one (50 70 100 150 200)
