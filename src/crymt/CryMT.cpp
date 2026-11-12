@@ -4435,6 +4435,22 @@ bool QueueSfDraw(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
     return true;
 }
 
+// A null answer of EF_Query 0x1B (the light at an index of the renderer's current recursion level's list; the editor crash
+// of 2026-11-13: main's CObjManager::GetShadowFrustumsList read +0x90 of it): the thread, CryMT's call depths, the level,
+// the light counts per level, the asked index, the caller and the engine cube renders so far. FocusLog closes its file.
+void LogNullLightQuery(const CallFrame* f, const uintptr_t* rbp, const char* path)
+{
+    const int level = *reinterpret_cast<const int*>(kRecurseLevel);
+    const auto* list = reinterpret_cast<const uint8_t*>(f->rcx) + kRdLevelLights;
+    const DWORD tid = GetCurrentThreadId();
+    FocusLog("frame %llu: EF_Query 0x1B light %u gave null (%s; thread %s, depth %d, render-thread depth %d) at recursion level %d; "
+             "light counts by level %d %d %d %d; caller %p; engine cube renders so far %llu",
+             static_cast<unsigned long long>(g_frame), static_cast<uint32_t>(f->r8), path,
+             tid == g_mainThread ? "main" : tid == g_rtTid ? "render" : "other", g_depth, g_rtDepth, level, *reinterpret_cast<const int*>(list + 8),
+             *reinterpret_cast<const int*>(list + 24), *reinterpret_cast<const int*>(list + 40), *reinterpret_cast<const int*>(list + 56),
+             reinterpret_cast<void*>(rbp[1]), static_cast<unsigned long long>(g_envCubeFaces));
+}
+
 uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
 {
     if (idx >= static_cast<uint32_t>(kAuxBase))
@@ -4555,14 +4571,7 @@ uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
             using QueryPtrFn = uintptr_t (*)(void*, uint64_t, uint64_t);
             const uintptr_t light = reinterpret_cast<QueryPtrFn>(g_orig[idx])(reinterpret_cast<void*>(f->rcx), f->rdx, f->r8);
             if (!light)
-            {
-                const int level = *reinterpret_cast<const int*>(kRecurseLevel);
-                const auto* list = reinterpret_cast<const uint8_t*>(f->rcx) + kRdLevelLights;
-                FocusLog("frame %llu: EF_Query 0x1B light %u gave null at recursion level %d; light counts by level %d %d %d %d (caller %p)",
-                         static_cast<unsigned long long>(g_frame), static_cast<uint32_t>(f->r8), level,
-                         *reinterpret_cast<const int*>(list + 8), *reinterpret_cast<const int*>(list + 24), *reinterpret_cast<const int*>(list + 40),
-                         *reinterpret_cast<const int*>(list + 56), reinterpret_cast<void*>(rbp[1])); // FocusLog closes its file
-            }
+                LogNullLightQuery(f, rbp, "main, sync");
             f->rax = light;
             return kHandled;
         }
@@ -4641,6 +4650,17 @@ extern "C" uintptr_t GateC(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
         g_rePoolEmpty++;
         WaitIdle(static_cast<int>(idx));
         return orig;
+    }
+    // Diagnosis (the editor crash of 2026-11-13, twice, after game mode on / off / on): a null EF_Query 0x1B answer on the
+    // paths that go straight to the renderer (another thread, main inside a renderer call) is logged as on main's.
+    if (idx == kEfQuery && (f->rdx & 0xFF) == 0x1B && (GetCurrentThreadId() != g_mainThread || g_depth != 0))
+    {
+        using QueryPtrFn = uintptr_t (*)(void*, uint64_t, uint64_t);
+        const uintptr_t light = reinterpret_cast<QueryPtrFn>(orig)(reinterpret_cast<void*>(f->rcx), f->rdx, f->r8);
+        if (!light)
+            LogNullLightQuery(f, rbp, "straight to the renderer");
+        f->rax = light;
+        return kHandled;
     }
     if (GetCurrentThreadId() != g_mainThread || g_depth != 0)
         return orig;

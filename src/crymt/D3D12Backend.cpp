@@ -1172,12 +1172,15 @@ void hizDown(uint3 id : SV_DispatchThreadID)
 
 // The engine's environment cube as the back end keeps it (Device::RunCubeUpdate): HDR, in D3D's cube layout, with all its
 // mip levels. cubeDecode: one face from the engine's RGBK cube (rgb a 16), flipped vertically (the engine's face images
-// are), mixed into the old content by `blend` (1 replaces); cubeDown: the face's next level, the mean of 2x2. Constants:
-// the written level's size, the face, the blend.
+// are), mixed into the old content by `blend` (1 replaces); cubeDown: the next level of all six faces, each texel the
+// level above looked up as a cube by the texel's direction (bilinear at the corner of 2x2: their mean; across the faces'
+// edges the hardware's cube filtering takes the neighbour's texels, so the faces meet at every level: per-face 2x2 means
+// left seams on far water). Constants: the written level's size, the face, the blend.
 const char* const kCubeShader = R"(
 Texture2DArray<float4> ldr : register(t0);
+TextureCube<float4> prev : register(t1);
+SamplerState linearClamp : register(s0);
 RWTexture2DArray<float4> dst : register(u0);
-RWTexture2DArray<float4> src : register(u1);
 cbuffer C : register(b0)
 {
   uint size;
@@ -1198,13 +1201,20 @@ void cubeDecode(uint3 id : SV_DispatchThreadID)
   dst[at] = float4(lerp(old, hdr, blend), 1);
 }
 
+// The direction of a D3D cube face's point (s, t in -1..1, t down).
+float3 CubeDir(uint f, float s, float t)
+{
+  return f == 0 ? float3(1, -t, -s) : f == 1 ? float3(-1, -t, s) : f == 2 ? float3(s, 1, t) : f == 3 ? float3(s, -1, -t)
+       : f == 4 ? float3(s, -t, 1) : float3(-s, -t, -1);
+}
+
 [numthreads(8, 8, 1)]
 void cubeDown(uint3 id : SV_DispatchThreadID)
 {
   if (id.x >= size || id.y >= size)
     return;
-  uint3 s = uint3(id.xy * 2, face);
-  dst[uint3(id.xy, face)] = 0.25 * (src[s] + src[s + uint3(1, 0, 0)] + src[s + uint3(0, 1, 0)] + src[s + uint3(1, 1, 0)]);
+  float2 st = (id.xy + 0.5) / size * 2 - 1;
+  dst[id] = prev.SampleLevel(linearClamp, CubeDir(id.z, st.x, st.y), 0);
 }
 )";
 SerializeRootSignatureFn g_serializeRoot;
@@ -7878,15 +7888,22 @@ public:
             if (errors)
                 errors->Release();
         }
-        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1}};
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = 4;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {2, ranges};
+        D3D12_STATIC_SAMPLER_DESC linear{};
+        linear.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        linear.AddressU = linear.AddressV = linear.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        linear.MaxLOD = D3D12_FLOAT32_MAX;
+        linear.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         D3D12_ROOT_SIGNATURE_DESC rd{};
         rd.NumParameters = 2;
         rd.pParameters = params;
+        rd.NumStaticSamplers = 1;
+        rd.pStaticSamplers = &linear;
         ID3DBlob* blob = nullptr;
         ID3DBlob* rootErrors = nullptr;
         HRESULT hr = g_serializeRoot(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rootErrors);
@@ -7988,7 +8005,7 @@ public:
         Require(&m_hdrCube, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu0;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu0;
-        while (!m_srvRing.TryAlloc(3 * mips, cpu0, gpu0))
+        while (!m_srvRing.TryAlloc(3 * mips, cpu0, gpu0)) // per level: t0 the engine's cube (level 0), t1 the level above, u0
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -8015,21 +8032,40 @@ public:
             }
             else
                 g.dev->CopyDescriptorsSimple(1, cpu, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, m_hdrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_hdrCubeUav[m ? m - 1 : 0], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            uint32_t k[4] = {dsize, static_cast<uint32_t>(face), 0, 0};
-            memcpy(&k[2], &blend, sizeof(float));
             if (m > 0)
             {
-                D3D12_RESOURCE_BARRIER uav{};
-                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                uav.UAV.pResource = m_hdrCube.res;
-                m_list->ResourceBarrier(1, &uav);
+                D3D12_SHADER_RESOURCE_VIEW_DESC pv{};
+                pv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                pv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+                pv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                pv.TextureCube = {m - 1, 1, 0.0f};
+                g.dev->CreateShaderResourceView(m_hdrCube.res, &pv, {cpu.ptr + g.srvInc});
             }
+            else
+                g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_hdrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            uint32_t k[4] = {dsize, static_cast<uint32_t>(face), 0, 0};
+            memcpy(&k[2], &blend, sizeof(float));
+            // The level above (its six subresources) read through a view: out of unordered access while this level is made.
+            D3D12_RESOURCE_BARRIER above[6]{};
+            if (m > 0)
+                for (UINT f = 0; f < 6; f++)
+                {
+                    above[f] = Transition(m_hdrCube.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    above[f].Transition.Subresource = (m - 1) + f * mips;
+                }
+            if (m > 0)
+                m_list->ResourceBarrier(6, above);
             m_list->SetPipelineState(m ? m_cubeDownPso : m_cubeDecodePso);
             m_list->SetComputeRoot32BitConstants(0, 4, k, 0);
             m_list->SetComputeRootDescriptorTable(1, gpu);
-            m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, 1);
+            m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, m ? 6 : 1);
+            if (m > 0)
+            {
+                for (D3D12_RESOURCE_BARRIER& t : above)
+                    std::swap(t.Transition.StateBefore, t.Transition.StateAfter);
+                m_list->ResourceBarrier(6, above);
+            }
         }
         Require(&m_hdrCube, kSrvState); // read by the water from now on (its table may not be rebuilt)
         FlushBarriers();
