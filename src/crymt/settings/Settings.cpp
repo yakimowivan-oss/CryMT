@@ -117,7 +117,8 @@ samplerCUBE CryMT_WaterEnvSampler = sampler_state
 };
 
 // CryMT's frame texture (as ShadowMaskGen's): 0 the jitter (fractions of the screen), 2..5 the columns of the unjittered
-// view-projection, 7 the depth pyramid's size, the camera's near plane, w 2 when the water's SSR is on.
+// view-projection, 7: x the cube's brightness on the water (CRYMT_WATERSKY), z the camera's near plane, w 2 when the
+// water's SSR is on (the depth pyramid has the screen's size: from the screen coordinate's derivatives).
 sampler2D CryMT_WaterFrameSampler = sampler_state
 {
   Texture = Textures/CryMT/jitter.dds;
@@ -215,16 +216,17 @@ float CryMT_HiZConfidence(float3 hit, float2 uv, float2 screenSize, float nearZ)
 // planar one; with SSR the scene where the ray meets it. screenProj: the pixel's (u, v) * w and w (Water.cfx's).
 half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj)
 {
+  float wP = screenProj.w;
+  float2 uvP = screenProj.xy / wP;
+  float2 screenSize = floor(1 / max(abs(float2(ddx(uvP.x), ddy(uvP.y))), 1e-6) + 0.5); // before any branch
   half3 n = normalize(half3(normal.xy * 0.5, normal.z));
   half3 r = 2 * dot(viewVec, n) * n - viewVec;
   half4 c = texCUBE(CryMT_WaterEnvSampler, r);
-  half4 base = c.a > 0.5 ? half4(-2 * log(max(1 - c.rgb, 0.001)), planar.a) : planar;
   float4 hz = CryMT_WaterFrame(7);
-  if (hz.w < 1.5 || hz.x < 1)
+  half4 base = c.a > 0.5 ? half4(-2 * log(max(1 - c.rgb, 0.001)) * (hz.x > 0 ? hz.x : 1), planar.a) : planar;
+  if (hz.w < 1.5)
     return base;
   float4 f0 = CryMT_WaterFrame(0), c0 = CryMT_WaterFrame(2), c1 = CryMT_WaterFrame(3), c3 = CryMT_WaterFrame(5);
-  float wP = screenProj.w;
-  float2 uvP = screenProj.xy / wP;
   // The ray's direction as a homogeneous screen point (u w, v w, w) with the jitter; its far end where it stays in front.
   float xR = dot(r, c0.xyz), yR = dot(r, c1.xyz), wR = dot(r, c3.xyz);
   float3 Rh = float3(0.5 * xR + (0.5 + f0.x) * wR, -0.5 * yR + (0.5 + f0.y) * wR, wR);
@@ -233,8 +235,8 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   float3 origin = float3(uvP, hz.z / wP);
   float3 endPoint = float3(Eh.xy / Eh.z, hz.z / Eh.z);
   bool valid;
-  float3 hit = CryMT_HiZMarch(origin, endPoint - origin, hz.xy, valid);
-  float confidence = valid ? CryMT_HiZConfidence(hit, uvP, hz.xy, hz.z) : 0;
+  float3 hit = CryMT_HiZMarch(origin, endPoint - origin, screenSize, valid);
+  float confidence = valid ? CryMT_HiZConfidence(hit, uvP, screenSize, hz.z) : 0;
   if (confidence <= 0)
     return base;
   half3 seen = tex2Dlod(envMapSamplerRefr, float4(hit.xy, 0, 0)).rgb;

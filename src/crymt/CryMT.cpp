@@ -8107,6 +8107,13 @@ void RunTestCommands()
         FocusLog("frame %llu: water cube %d", static_cast<unsigned long long>(g_frame), g_giControl.waterCube.load());
         return;
     }
+    if (_strnicmp(command, "crymt_watersky ", 15) == 0) // the cube's brightness on the water
+    {
+        g_giControl.waterSky = static_cast<float>(atof(command + 15));
+        g_giControl.active = true;
+        FocusLog("frame %llu: water sky %.2f", static_cast<unsigned long long>(g_frame), g_giControl.waterSky.load());
+        return;
+    }
     if (_strnicmp(command, "crymt_sssweapon ", 16) == 0) // the panel's list index: 0.5% 2% 5% 10% 20%
     {
         g_giControl.sssWeapon = atoi(command + 16);

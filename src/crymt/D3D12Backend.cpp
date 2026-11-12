@@ -4857,6 +4857,22 @@ public:
         return panel < 0 ? env : std::min(panel, 2);
     }
     static bool WaterCubeOn() { return WaterMode() >= 1; }
+    // The cube's brightness on the water (CRYMT_WATERSKY, the reflections page, crymt_watersky), 1 = as decoded. Default
+    // 0.75: the low sea view against the planar reflection (2026-11-13, wsky): water luma +13% at 1.0, -2% at 0.7; the
+    // cube's sky near the horizon is greyer (blue -5..-7) at any scale.
+    static float WaterSkyBase()
+    {
+        static const float env = [] {
+            wchar_t v[16] = {};
+            return GetEnvironmentVariableW(L"CRYMT_WATERSKY", v, 16) ? static_cast<float>(_wtof(v)) : 0.75f;
+        }();
+        return env > 0 ? env : 0.75f;
+    }
+    static float WaterSky()
+    {
+        const float panel = g_giControl.waterSky;
+        return panel > 0 ? panel : WaterSkyBase();
+    }
     static bool WaterSsrOn() { return WaterMode() == 2; }
 
     bool EnsureEnvTargets()
@@ -6505,9 +6521,9 @@ public:
         data[25] = 0.5f;
         data[26] = 50.0f;
         data[27] = s.contactFoliage ? 1.0f : 0.0f;
-        // Texel 7: the depth pyramid for the water's SSR (its last size; 0 before the first), the near plane, 2 when on.
-        data[28] = static_cast<float>(m_hiz.width);
-        data[29] = static_cast<float>(m_hiz.height);
+        // Texel 7: the cube's brightness on the water, -, the near plane, 2 when the water's SSR is on.
+        data[28] = WaterSky();
+        data[29] = 0.0f;
         data[30] = info->nearZ;
         data[31] = WaterSsrOn() && !m_hizFailed ? 2.0f : 0.0f;
         m_hizNearOverFar = info->farZ > 0 ? info->nearZ / info->farZ : 0.0f;
@@ -9379,6 +9395,9 @@ public:
                  CryMTConsoleCommand(v ? "r_WaterReflections 0" : "r_WaterReflections 1"); // the engine's planar pass
              },
              true, nullptr},
+            {3, "Небо в отражении воды|Sky in the water's reflection", 2, 20, 1, false, nullptr, 0.1f, "x%.1f",
+             [] { return static_cast<int>(lroundf(WaterSky() * 10.0f)); }, [] { return static_cast<int>(lroundf(WaterSkyBase() * 10.0f)); },
+             [](int v) { g_giControl.waterSky = v / 10.0f; }, true, nullptr},
             {3, "На всех материалах|On every material", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.envAll ? 1 : 0; },
              [] { return 1; }, [](int v) { g_giControl.envAll = v != 0; }, true, nullptr},
             {3, "Материалы со своей картой|Materials with a map", 0, 16, 1, false, nullptr, 0.5f, "x%.1f",
