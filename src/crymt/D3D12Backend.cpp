@@ -4046,6 +4046,7 @@ struct Stats
 
 // GPU busy time: a timestamp at the start and the end of every main list, resolved with the list.
 constexpr int kListStamps = 256;
+std::atomic<bool> g_statsResetAsked{false}; // Dx12ResetStats: m_stats and the pass times start over at the next Present
 
 // Pipeline states are created before their first draw. Every pipeline state drawn with is recorded on disk as a recipe
 // (its states, with its shaders and input layout by content), and each run starts creating all recorded ones on worker
@@ -12055,6 +12056,12 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
     m_frame++;
     m_stats.frames++;
     g_presented++;
+    if (g_statsResetAsked.exchange(false))
+    {
+        m_stats = Stats{};
+        std::fill(m_passTicks.begin(), m_passTicks.end(), 0);
+        m_passStampsDropped = 0;
+    }
     // Buffer memory over a long session (a heap that only grows ends in the engine's "Pipeline buffer overflow. Current
     // geometry cannot fit in video memory" when a page can no longer be created).
     if (m_frame % 3600 == 0)
@@ -12615,6 +12622,11 @@ HRESULT Dx12CreateSwapChain(IUnknown*, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChai
         s->windowed, d1.Flags);
     *out = s;
     return S_OK;
+}
+
+void Dx12ResetStats()
+{
+    dx12::g_statsResetAsked = true;
 }
 
 void Dx12WriteStats(FILE* f, double frames)

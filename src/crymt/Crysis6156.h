@@ -365,6 +365,12 @@ constexpr int kEndEf3DSlot = 0x398 / 8;
 // EF_Query ids.
 constexpr uint32_t kQueryRecurseLevel = 0x13;
 constexpr uint32_t kQueryLevelLight = 0x1B; // n-th light of the current level (kRdLevelLights), 0 past the end
+// 0x17: stores renderer slot 201's bool into kQueryFlag17 and returns its address. CrySystem (+0xD95C7) asks twice a
+// frame in the game update; slot 201 is a shared "return false" stub (0x38091100) in this build, so the answer is fixed.
+constexpr uint32_t kQueryConstFlag = 0x17;
+constexpr int kRendererSlot201 = 201;
+constexpr uintptr_t kReturnFalseStub = 0x38091100;
+constexpr uintptr_t kQueryFlag17 = 0x382E9BEC;
 
 // CD3DRenderAuxGeom slots.
 constexpr int kAuxSetFlags = 0;

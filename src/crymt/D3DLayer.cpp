@@ -2657,6 +2657,19 @@ void D3DLayerFrame(void* device)
     g_censusFrames++;
 }
 
+// Test command crymt_statsreset: the census per frame from here on (the place a test moved to, not the whole session).
+// Counters of other threads are plain: a few counts around the reset may land on either side.
+void D3DLayerResetStats()
+{
+    g_censusFrames = 1; // 0 would install the census again (mode 0)
+    g_streamCommands = g_streamPublishes = g_streamBusyTicks = 0;
+    g_recorderSwitches = 0;
+    g_heldTotal = g_holds = 0;
+    g_ringUploads = g_ringBytes = 0;
+    if (g_d3d12Device)
+        Dx12ResetStats();
+}
+
 void D3DLayerWriteStats()
 {
     if (!g_censusOn && !g_wrapOn && !g_d3d12On)

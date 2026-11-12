@@ -1,6 +1,6 @@
-r"""Frame times at one place, per variant, from spot runs (tools\prof\spot_run.ps1 -> logs\spot): from <skip> s after the
-camera was turned ("#g_localActor:SetAngles" test command, frame numbers in crymt_focus.txt) to "quit" or the last frame
-the frame log wrote (it writes blocks of 3000 frames, the last partial block is lost at quit).
+r"""Frame times at one place, per variant, from spot runs (tools\prof\spot_run.ps1 -> logs\spot): from the census reset
+(crymt_statsreset) to "quit", frame numbers in crymt_focus.txt. Older runs without the reset: from <skip> s after the
+camera was turned ("#g_localActor:SetAngles") to quit or the last frame the frame log wrote (blocks of 3000 frames).
 spot_report.py <dir> <tag> <variant,variant,...> [skip=8]"""
 import os
 import re
@@ -13,9 +13,12 @@ skip = float(sys.argv[4]) if len(sys.argv) > 4 else 8.0
 def commands(focus):
     text = open(focus, encoding='utf-8', errors='replace').read()
     text = text[text.rfind("console command 'r_DynTexMaxSize"):]
+    reset = re.search(r"frame (\d+): census counts reset", text)
     a = re.search(r"frame (\d+): console command '#g_localActor:SetAngles", text)
     b = re.search(r"frame (\d+): console command 'quit'", text)
-    return (int(a.group(1)), int(b.group(1))) if a and b else None
+    if reset and b:
+        return int(reset.group(1)), int(b.group(1)), True
+    return (int(a.group(1)), int(b.group(1)), False) if a and b else None
 
 
 def pct(xs, p):
@@ -24,7 +27,7 @@ def pct(xs, p):
 
 
 print('%-10s %6s %6s %7s %7s %7s %7s %13s | %8s %8s %8s %8s | %s' % (
-    'variant', 'frames', 'sec', 'FPS', 'ms', 'p95', 'p99', 'FPS halves', 'mainWork', 'waitBar', 'rtPre', 'rtFlush', 'draws/frame (session)'))
+    'variant', 'frames', 'sec', 'FPS', 'ms', 'p95', 'p99', 'FPS halves', 'mainWork', 'waitBar', 'rtPre', 'rtFlush', 'census (the window with a reset, else the session)'))
 for v in variants:
     p = lambda f: os.path.join(d, '%s_%s_%s' % (tag, v, f))
     try:
@@ -43,7 +46,7 @@ for v in variants:
         print('%-10s no window' % v)
         continue
     a = w[0]
-    while a < len(stamps) - 1 and (stamps[a] - stamps[w[0]]) / freq < skip:
+    while not w[2] and a < len(stamps) - 1 and (stamps[a] - stamps[w[0]]) / freq < skip:
         a += 1
     b = min(w[1] - 5, len(stamps) - 1)
     sel = list(range(a, b))
@@ -59,8 +62,13 @@ for v in variants:
     work = mean - cols[0] - cols[1] - cols[2]
     census = ''
     try:
-        m = re.search(r'draws ([\d.]+) \(packets ([\d.]+)', open(p('d3d10_census.txt'), encoding='utf-8', errors='replace').readline())
-        census = '%s (packets %s)' % m.groups() if m else ''
+        text = open(p('d3d10_census.txt'), encoding='utf-8', errors='replace').read()
+        m = re.search(r'draws ([\d.]+) \(packets ([\d.]+)', text)
+        census = 'draws %s (packets %s)' % m.groups() if m else ''
+        m = re.search(r'GPU busy ([\d.]+)', text)
+        census += ', GPU busy %s ms' % m.group(1) if m else ''
+        m = re.search(r'stream thread busy ([\d.]+)', text)
+        census += ', stream thread %s ms' % m.group(1) if m else ''
     except OSError:
         pass
     print('%-10s %6d %6.1f %7.1f %7.2f %7.2f %7.2f %13s | %8.2f %8.2f %8.2f %8.2f | %s' % (

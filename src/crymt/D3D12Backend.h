@@ -14,6 +14,7 @@ bool Dx12OwnsDevice(IUnknown* device);
 // The swap chain for our device: a flip-model D3D12 swap chain behind an IDXGISwapChain the renderer uses as before.
 HRESULT Dx12CreateSwapChain(IUnknown* device, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out);
 void Dx12WriteStats(FILE* f, double frames);
+void Dx12ResetStats(); // test command crymt_statsreset: the census counts from the next Present on (one place, not the session)
 struct DlssSceneInfo;
 // Context thread: the scene is complete before HDR post-processing (DLSS runs here).
 void Dx12SceneDone(const DlssSceneInfo* info);

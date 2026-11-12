@@ -39,6 +39,7 @@ using namespace ce2;
 void D3DLayerOnDll(const wchar_t* name, size_t chars, uintptr_t base);
 void D3DLayerFrame(void* device);
 void D3DLayerWriteStats();
+void D3DLayerResetStats();
 bool D3DLayerPacketsAvailable(); // the renderer's device is on the D3D12 back end
 void D3DLayerSceneDone(const DlssSceneInfo* info);
 void D3DLayerCamera(const DlssSceneInfo* info);
@@ -4352,6 +4353,15 @@ uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
             f->rax = static_cast<uint64_t>(static_cast<int64_t>(g_shadowLevel));
             return kHandled;
         }
+        // A fixed answer (Crysis6156.h): this sync point alone held main ~4.5 ms a frame at the user's village spot
+        // (2026-11-12), the game update waiting for the render thread to finish the frame before.
+        if (id == kQueryConstFlag && reinterpret_cast<uintptr_t>(g_orig[kRendererSlot201]) == kReturnFalseStub)
+        {
+            *reinterpret_cast<volatile uint32_t*>(kQueryFlag17) = 0;
+            g_queryHits++;
+            f->rax = kQueryFlag17;
+            return kHandled;
+        }
         if (g_snapSeq.load(std::memory_order_acquire) == g_frameSeq)
             for (int q = 0; q < 4; q++)
                 if (id == kSnapQueries[q])
@@ -4401,6 +4411,8 @@ uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
         return kHandled;
     }
     }
+    if (g_async) // the callers and arguments of these sync points too (crymt_stats.txt, "fill sync" lines)
+        NoteFillSync(-1 - static_cast<int>(idx), rbp[1], f->rdx, f->r8);
     WaitIdle(static_cast<int>(idx));
     return reinterpret_cast<uintptr_t>(g_orig[idx]);
 }
@@ -7847,6 +7859,25 @@ void RunTestCommands()
         q.next++;
     // The loader turns the game's edge anti-aliasing off in DLAA mode; that is right only when DLAA runs. Without an RTX
     // card (AMD, Intel, older NVIDIA) Streamline reports no DLSS, and the game keeps its own anti-aliasing.
+    // CryMT's own test commands: crymt_statsreset counts the census from here on (a test's place, not the session). Before a
+    // test's quit the logs are written: the frame log otherwise keeps only whole blocks of 3000 frames (the DLL's detach
+    // does not run its writes at the game's quit).
+    if (_stricmp(command, "crymt_statsreset") == 0)
+    {
+        FocusLog("frame %llu: census counts reset", static_cast<unsigned long long>(g_frame));
+        D3DLayerResetStats();
+        return;
+    }
+    if (_stricmp(command, "quit") == 0)
+    {
+        WriteStats();
+        if (g_frameLogOn)
+        {
+            WriteFrameLog();
+            if (g_mode == 2)
+                WriteDetailLog();
+        }
+    }
     if (_stricmp(command, "r_UseEdgeAA 0") == 0 && !Dx12DlssActive())
     {
         SetupLog("DLAA is not running: r_UseEdgeAA 0 skipped, the game's own anti-aliasing stays");
