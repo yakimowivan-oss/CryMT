@@ -5705,8 +5705,15 @@ void EnvCubeUpdate()
     // One face a call, always (entry +1 set, the face at +8 cycles): the engine's six-face pass would draw them all into
     // one slice (kTextureRtv). After a jump the faces start again from 0; the water reads the cube once it has six.
     static int facesDrawn;
+    static float lastHours = -1.0f;
     const float dx = cam[0] - g_envCubePos[0], dy = cam[1] - g_envCubePos[1], dz = cam[2] - g_envCubePos[2];
-    if (dx * dx + dy * dy + dz * dz > jump * jump)
+    // A jump of the time of day (the panel's Num+ / Num-, a script) redraws the whole cube too; the fast time's small steps
+    // are mixed in (the back end's blending).
+    const float hours = g_giControl.timeOfDay;
+    const float hourStep = hours >= 0 && lastHours >= 0 ? std::fabs(hours - lastHours) : 0.0f;
+    const bool timeJump = std::min(hourStep, 24.0f - hourStep) > 0.1f;
+    lastHours = hours;
+    if (dx * dx + dy * dy + dz * dz > jump * jump || timeJump)
     {
         *reinterpret_cast<int*>(entry + 8) = 0;
         facesDrawn = 0;
@@ -5716,6 +5723,11 @@ void EnvCubeUpdate()
     }
     entry[1] = 1;
     *reinterpret_cast<int*>(0x382E984C) = 0; // the renderer's "all faces next time" (FUN_380D4F00 clears it after a render)
+    // The -Z face only once after a start (the water's reflections look up): CRYMT_ENVCUBE_DOWN=1 / the panel draws it always.
+    static const int downBase = EnvCubeSetting("CRYMT_ENVCUBE_DOWN", 0) != 0 ? 1 : 0;
+    const bool downOn = (g_giControl.envCubeDown >= 0 ? g_giControl.envCubeDown.load() : downBase) != 0;
+    if (*reinterpret_cast<int*>(entry + 8) == 5 && facesDrawn >= 6 && !downOn)
+        *reinterpret_cast<int*>(entry + 8) = 0;
     // The face's render target view: made anew for this face (the engine keeps the first one for all).
     if (auto* ct = *reinterpret_cast<uint8_t**>(texture + 0x98))
         if (auto*& rtv = *reinterpret_cast<ID3D10RenderTargetView**>(ct + kTextureRtv))
@@ -5754,7 +5766,9 @@ void EnvCubeUpdate()
     for (int l = 0; l < 4; l++)
         memcpy(lightsBefore[l], renderer + kRdLevelLights + l * 16, 16);
     EnvDepthSnapshot(renderer);
-    D3DLayerPassName("CryMT engine cube"); // the back end lets the encode pass read its source (Device::ReleaseOutput)
+    // The back end lets the encode pass read its source (Device::ReleaseOutput) and takes the face into its HDR copy at the
+    // end, replacing the old one while the cube is new here (fresh).
+    D3DLayerPassName(facesDrawn < 6 ? "CryMT engine cube fresh" : "CryMT engine cube");
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, static_cast<uint32_t>(flags), ~0ull, 0);
     D3DLayerPassName("CryMT engine cube end");
     EnvDepthRestore(renderer);
@@ -8323,6 +8337,20 @@ void RunTestCommands()
         g_giControl.envCubeCull = std::min(std::max(atoi(command + 18), 0), 2);
         g_giControl.active = true;
         FocusLog("frame %llu: engine cube culling %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeCull.load());
+        return;
+    }
+    if (_strnicmp(command, "crymt_envcubemip ", 17) == 0) // the water reads the engine cube's HDR copy at this level (-1 auto)
+    {
+        g_giControl.envCubeMip = std::min(std::max(atoi(command + 17), -1), 8);
+        g_giControl.active = true;
+        FocusLog("frame %llu: engine cube mip %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeMip.load());
+        return;
+    }
+    if (_strnicmp(command, "crymt_envcubeblend ", 19) == 0) // 0 a new face replaces, 1 half, 2 a quarter
+    {
+        g_giControl.envCubeBlend = std::min(std::max(atoi(command + 19), 0), 2);
+        g_giControl.active = true;
+        FocusLog("frame %llu: engine cube blending %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeBlend.load());
         return;
     }
     if (_stricmp(command, "crymt_cubepic") == 0) // the engine's cube as one picture (as Num0)

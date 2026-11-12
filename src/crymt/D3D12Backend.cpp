@@ -1169,6 +1169,44 @@ void hizDown(uint3 id : SV_DispatchThreadID)
   dst[id.xy] = d;
 }
 )";
+
+// The engine's environment cube as the back end keeps it (Device::RunCubeUpdate): HDR, in D3D's cube layout, with all its
+// mip levels. cubeDecode: one face from the engine's RGBK cube (rgb a 16), flipped vertically (the engine's face images
+// are), mixed into the old content by `blend` (1 replaces); cubeDown: the face's next level, the mean of 2x2. Constants:
+// the written level's size, the face, the blend.
+const char* const kCubeShader = R"(
+Texture2DArray<float4> ldr : register(t0);
+RWTexture2DArray<float4> dst : register(u0);
+RWTexture2DArray<float4> src : register(u1);
+cbuffer C : register(b0)
+{
+  uint size;
+  uint face;
+  float blend;
+  uint pad;
+};
+
+[numthreads(8, 8, 1)]
+void cubeDecode(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= size || id.y >= size)
+    return;
+  float4 c = ldr.Load(int4(id.x, size - 1 - id.y, face, 0));
+  float3 hdr = c.rgb * (c.a * 16);
+  uint3 at = uint3(id.xy, face);
+  float3 old = blend < 1 ? dst[at].rgb : hdr;
+  dst[at] = float4(lerp(old, hdr, blend), 1);
+}
+
+[numthreads(8, 8, 1)]
+void cubeDown(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= size || id.y >= size)
+    return;
+  uint3 s = uint3(id.xy * 2, face);
+  dst[uint3(id.xy, face)] = 0.25 * (src[s] + src[s + uint3(1, 0, 0)] + src[s + uint3(0, 1, 0)] + src[s + uint3(1, 1, 0)]);
+}
+)";
 SerializeRootSignatureFn g_serializeRoot;
 
 // CryMT GI compute pass (Device::RunGi). Root constants b0 (kGiConstants floats), t0 scene depth, t1 previous HDR colour,
@@ -4228,6 +4266,7 @@ struct Stats
     uint64_t sssRuns, sssDispatches, sssNoDepth; // RunSss: frames made, their dispatches, frames without the z-prepass target
     uint64_t engineCubeDraws, engineCubeFaces[6]; // draws into the engine's environment cube (Dx12EngineEnvCube), per face
     uint64_t engineCubeUnbinds;                   // its source let go as a render target (ReleaseOutput)
+    uint64_t engineCubeHdrRuns;                   // faces taken into the HDR copy (RunCubeUpdate)
     uint64_t hizRuns; // RunHiz: frames whose depth pyramid was built (the water's SSR)
 };
 
@@ -4927,6 +4966,34 @@ public:
         const int panel = g_giControl.envCubeCull;
         return panel < 0 ? EngineCubeCullBase() : std::min(panel, 2);
     }
+    // A new face mixed into the HDR copy (CRYMT_ENVCUBE_BLEND, the reflections page): 1 replaces, 0.5 half (default), 0.25.
+    static float EngineCubeBlend()
+    {
+        static const float env = [] {
+            wchar_t v[16] = {};
+            const float b = GetEnvironmentVariableW(L"CRYMT_ENVCUBE_BLEND", v, 16) ? static_cast<float>(_wtof(v)) : 0.5f;
+            return b > 0.0f && b <= 1.0f ? b : 0.5f;
+        }();
+        const int panel = g_giControl.envCubeBlend;
+        return panel < 0 ? env : panel == 0 ? 1.0f : panel == 1 ? 0.5f : 0.25f;
+    }
+    static int EngineCubeBlendIndex(float b) { return b >= 0.99f ? 0 : b >= 0.4f ? 1 : 2; }
+    static float EngineCubeBlendBase()
+    {
+        const int saved = g_giControl.envCubeBlend.exchange(-1);
+        const float b = EngineCubeBlend();
+        g_giControl.envCubeBlend = saved;
+        return b;
+    }
+    // The -Z face (the water's reflections look up): CRYMT_ENVCUBE_DOWN 1 draws it, default 0 (once after each start).
+    static int EngineCubeDownBase()
+    {
+        static const int env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_DOWN", v, 8) ? (_wtoi(v) != 0 ? 1 : 0) : 0;
+        }();
+        return env;
+    }
     // Its brightness on the water (CRYMT_ENVCUBE_SCALE, default 1: the engine drew it as it draws the planar reflection).
     static float EngineCubeScale()
     {
@@ -4979,19 +5046,45 @@ public:
             static_cast<int>(td.Format), td.MipLevels);
         return m_engineCube;
     }
-    // The cube the water reads (Water.cfx's waterenv.dds placeholder), and whether it is the engine's (RGBK).
-    Srv12* WaterEnvCube(bool* engine)
+    // The cube the water reads (Water.cfx's waterenv.dds placeholder): kind 0 the voxel grid's, 1 the engine's RGBK cube as
+    // it is (the faces flipped: the shader turns its lookup), 2 the HDR copy with mips (D3D's layout), once it has all faces.
+    struct EnvView
     {
-        *engine = false;
+        ResourceInfo* info = nullptr;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+        int kind = 0;
+    };
+    EnvView WaterEnvCube()
+    {
+        EnvView v;
         if (!WaterCubeOn())
-            return nullptr;
+            return v;
         if (EngineCubeOn())
         {
-            Srv12* cube = EngineCube();
-            *engine = cube != nullptr;
-            return cube;
+            Srv12* raw = EngineCube();
+            bool all = m_hdrCube.res != nullptr;
+            for (bool f : m_hdrFaceValid)
+                all = all && f;
+            if (raw && all)
+            {
+                v.info = &m_hdrCube;
+                v.cpu = m_hdrCubeSrv;
+                v.kind = 2;
+            }
+            else if (raw)
+            {
+                v.info = raw->info;
+                v.cpu = raw->cpu;
+                v.kind = 1;
+            }
+            return v;
         }
-        return m_envReady && m_envCubeAll ? m_envCubeAll : nullptr;
+        if (m_envReady && m_envCubeAll)
+        {
+            v.info = m_envCubeAll->info;
+            v.cpu = m_envCubeAll->cpu;
+        }
+        return v;
     }
 
     bool EnsureEnvTargets()
@@ -5576,6 +5669,7 @@ public:
             const D3D10_RENDER_TARGET_VIEW_DESC& d = m_rtv[0]->desc;
             const UINT face = d.ViewDimension == D3D10_RTV_DIMENSION_TEXTURE2DARRAY ? d.Texture2DArray.FirstArraySlice : 0;
             m_stats.engineCubeFaces[face < 6 ? face : 5]++;
+            m_engineCubeLastFace = static_cast<int>(face < 6 ? face : 5);
             if (m_engineCubeDumpWanted)
             {
                 // The capture key: what the next draw into the cube (the engine's Encode_ToLDR) read, as <tag>_envsrc.
@@ -6697,14 +6791,15 @@ public:
         data[25] = 0.5f;
         data[26] = 50.0f;
         data[27] = s.contactFoliage ? 1.0f : 0.0f;
-        // Texel 7: the cube's brightness on the water, 1 when the cube is the engine's (RGBK), the near plane, 2 when the
-        // water's SSR is on.
-        bool engineCube = false;
-        WaterEnvCube(&engineCube);
+        // Texel 7: the cube's brightness on the water; which cube (0 the voxel grid's, 1 the engine's RGBK one, 2 its HDR copy,
+        // 3 + L that copy read at mip level L: the debug); the near plane; 2 when the water's SSR is on.
+        const EnvView waterCube = WaterEnvCube();
+        const bool engineCube = waterCube.kind != 0;
         if (m_engineCubeDumpWanted) // the capture key: the world direction to the sun, to place it in the cube's dump
             Log("capture: sun direction %.3f %.3f %.3f (found %.0f)", info->sun[0], info->sun[1], info->sun[2], info->sun[3]);
         data[28] = engineCube ? EngineCubeScale() : WaterSky();
-        data[29] = engineCube ? 1.0f : 0.0f;
+        data[29] = waterCube.kind == 2 ? (g_giControl.envCubeMip >= 0 ? 3.0f + static_cast<float>(g_giControl.envCubeMip) : 2.0f)
+                                       : static_cast<float>(waterCube.kind);
         data[30] = info->nearZ;
         data[31] = WaterSsrOn() && !m_hizFailed ? 2.0f : 0.0f;
         m_hizNearOverFar = info->farZ > 0 ? info->nearZ / info->farZ : 0.0f;
@@ -7736,6 +7831,200 @@ public:
         RestoreListState();
         m_hizFrame = m_frame;
         m_stats.hizRuns++;
+    }
+
+    bool EnsureCubePipeline()
+    {
+        if (m_cubeDecodePso || m_cubeFailed)
+            return m_cubeDecodePso != nullptr;
+        m_cubeFailed = true;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R16G16B16A16_FLOAT, {}, {}};
+        if (FAILED(g.dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) || !(fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD))
+        {
+            Log("engine cube in HDR: no typed UAV loads of RGBA16F here, the water reads the engine's RGBK cube as it is");
+            return false;
+        }
+        using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+        auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+        if (!compile || !g_serializeRoot)
+            return false;
+        ID3DBlob* code[2] = {};
+        const char* entries[2] = {"cubeDecode", "cubeDown"};
+        for (int i = 0; i < 2; i++)
+        {
+            ID3DBlob* errors = nullptr;
+            if (FAILED(compile(kCubeShader, strlen(kCubeShader), "CryMT_Cube", nullptr, nullptr, entries[i], "cs_5_0", 1 << 15, 0, &code[i], &errors)))
+            {
+                Log("engine cube shader %s: %s", entries[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
+                if (errors)
+                    errors->Release();
+                if (i)
+                    code[0]->Release();
+                return false;
+            }
+            if (errors)
+                errors->Release();
+        }
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1}};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.Num32BitValues = 4;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {2, ranges};
+        D3D12_ROOT_SIGNATURE_DESC rd{};
+        rd.NumParameters = 2;
+        rd.pParameters = params;
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* rootErrors = nullptr;
+        HRESULT hr = g_serializeRoot(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rootErrors);
+        if (SUCCEEDED(hr))
+            hr = g.dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                            reinterpret_cast<void**>(&m_cubeRoot));
+        if (blob)
+            blob->Release();
+        if (rootErrors)
+            rootErrors->Release();
+        ID3D12PipelineState** psos[2] = {&m_cubeDecodePso, &m_cubeDownPso};
+        for (int i = 0; i < 2; i++)
+        {
+            if (SUCCEEDED(hr))
+            {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+                pd.pRootSignature = m_cubeRoot;
+                pd.CS = {code[i]->GetBufferPointer(), code[i]->GetBufferSize()};
+                hr = g.dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(psos[i]));
+            }
+            code[i]->Release();
+        }
+        if (FAILED(hr) && m_cubeDecodePso)
+        {
+            m_cubeDecodePso->Release();
+            m_cubeDecodePso = nullptr;
+        }
+        m_cubeFailed = FAILED(hr);
+        Log("engine cube in HDR: pipeline %s", SUCCEEDED(hr) ? "ready" : "failed");
+        return SUCCEEDED(hr);
+    }
+
+    // After the engine drew a face of its cube (the "CryMT engine cube end" mark): that face decoded into the HDR copy
+    // (made at the engine cube's size, all mip levels), mixed with the old one unless fresh, and its levels made again.
+    void RunCubeUpdate(int face, bool fresh)
+    {
+        ResourceInfo* srcInfo = m_engineCubeRes ? Info(m_engineCubeRes) : nullptr;
+        if (!srcInfo || !srcInfo->res || face < 0 || face > 5 || !EnsureCubePipeline())
+            return;
+        const D3D12_RESOURCE_DESC sd = srcInfo->res->GetDesc();
+        const UINT size = static_cast<UINT>(sd.Width);
+        UINT mips = 1;
+        while (mips < 12 && (size >> mips) > 0)
+            mips++;
+        if (!m_hdrCube.res || m_hdrCube.width != size)
+        {
+            DeferRelease(m_hdrCube.res);
+            m_hdrCube.res = nullptr;
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = size;
+            d.Height = size;
+            d.DepthOrArraySize = 6;
+            d.MipLevels = static_cast<UINT16>(mips);
+            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d.SampleDesc.Count = 1;
+            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_hdrCube.res))))
+            {
+                m_hdrCube.res = nullptr;
+                m_hdrCube.width = 0;
+                Log("engine cube in HDR: no %ux%u texture", size, size);
+                m_cubeFailed = true;
+                return;
+            }
+            m_hdrCube.width = m_hdrCube.height = size;
+            m_hdrCube.depthOrArray = 6;
+            m_hdrCube.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            m_hdrCube.samples = 1;
+            m_hdrCube.mips = mips;
+            m_hdrCube.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            if (!m_hdrCubeSrv.ptr)
+                m_hdrCubeSrv = g_srvCpu.Alloc();
+            D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
+            vd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            vd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            vd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            vd.TextureCube.MipLevels = mips;
+            g.dev->CreateShaderResourceView(m_hdrCube.res, &vd, m_hdrCubeSrv);
+            for (UINT m = 0; m < mips; m++)
+            {
+                if (!m_hdrCubeUav[m].ptr)
+                    m_hdrCubeUav[m] = g_srvCpu.Alloc();
+                D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+                ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                ud.Texture2DArray = {m, 0, 6, 0};
+                g.dev->CreateUnorderedAccessView(m_hdrCube.res, nullptr, &ud, m_hdrCubeUav[m]);
+            }
+            for (bool& f : m_hdrFaceValid)
+                f = false;
+            Log("engine cube in HDR: %ux%u, %u levels", size, size, mips);
+        }
+        const float blend = fresh || !m_hdrFaceValid[face] ? 1.0f : EngineCubeBlend();
+        Require(srcInfo, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Require(&m_hdrCube, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu0;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu0;
+        while (!m_srvRing.TryAlloc(3 * mips, cpu0, gpu0))
+        {
+            Submit();
+            WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
+            PollFence();
+            m_srvRing.Reclaim();
+        }
+        FlushBarriers();
+        m_list->SetComputeRootSignature(m_cubeRoot);
+        for (UINT m = 0; m < mips; m++)
+        {
+            const UINT dsize = std::max(1u, size >> m);
+            const D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu0.ptr + 3 * m * g.srvInc};
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu0.ptr + 3 * m * g.srvInc};
+            if (m == 0)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
+                vd.Format = sd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS   ? DXGI_FORMAT_R8G8B8A8_UNORM
+                            : sd.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                                                         : sd.Format;
+                vd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                vd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                vd.Texture2DArray = {0, 1, 0, 6, 0, 0.0f};
+                g.dev->CreateShaderResourceView(srcInfo->res, &vd, cpu);
+            }
+            else
+                g.dev->CopyDescriptorsSimple(1, cpu, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, m_hdrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_hdrCubeUav[m ? m - 1 : 0], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            uint32_t k[4] = {dsize, static_cast<uint32_t>(face), 0, 0};
+            memcpy(&k[2], &blend, sizeof(float));
+            if (m > 0)
+            {
+                D3D12_RESOURCE_BARRIER uav{};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav.UAV.pResource = m_hdrCube.res;
+                m_list->ResourceBarrier(1, &uav);
+            }
+            m_list->SetPipelineState(m ? m_cubeDownPso : m_cubeDecodePso);
+            m_list->SetComputeRoot32BitConstants(0, 4, k, 0);
+            m_list->SetComputeRootDescriptorTable(1, gpu);
+            m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, 1);
+        }
+        Require(&m_hdrCube, kSrvState); // read by the water from now on (its table may not be rebuilt)
+        FlushBarriers();
+        RestoreListState();
+        m_hdrFaceValid[face] = true;
+        m_hdrCubeRuns++;
+        m_stats.engineCubeHdrRuns++;
     }
 
     bool PsReads(const ResourceInfo* placeholder) const
@@ -9508,6 +9797,8 @@ public:
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
         static const char* const waterSource[] = {"ВОКСЕЛИ|VOXELS", "ДВИЖОК|ENGINE"};
         static const char* const cubeCull[] = {"КАК В ДВИЖКЕ|ENGINE'S", "НЕТ|NONE", "ОБРАТНОЕ|INVERTED"};
+        static const char* const cubeMip[] = {"АВТО|AUTO", "0", "1", "2", "3", "4", "5", "6", "7", "8"};
+        static const char* const cubeBlend[] = {"ВЫКЛ|OFF", "50%", "25%"};
         static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
@@ -9596,6 +9887,14 @@ public:
              [] { return EnvCubeRateIndex(EnvCubeRateBase()); }, [](int v) { g_giControl.envCubeRate = kEnvCubeRates[v]; }, true, nullptr},
             {3, "Отсечение в кубкарте|Cube map culling", 0, 2, 1, true, cubeCull, 0, nullptr, [] { return EngineCubeCull(); },
              [] { return EngineCubeCullBase(); }, [](int v) { g_giControl.envCubeCull = v; }, true, nullptr},
+            {3, "Mip кубкарты (отладка)|Cube map mip (debug)", 0, 9, 1, false, cubeMip, 0, nullptr,
+             [] { return std::max(g_giControl.envCubeMip.load(), -1) + 1; }, [] { return 0; }, [](int v) { g_giControl.envCubeMip = v - 1; }, true,
+             nullptr},
+            {3, "Смешивание граней|Face blending", 0, 2, 1, true, cubeBlend, 0, nullptr, [] { return EngineCubeBlendIndex(EngineCubeBlend()); },
+             [] { return EngineCubeBlendIndex(EngineCubeBlendBase()); }, [](int v) { g_giControl.envCubeBlend = v; }, true, nullptr},
+            {3, "Нижняя грань кубкарты|Cube map down face", 0, 1, 1, true, onOff, 0, nullptr,
+             [] { const int v = g_giControl.envCubeDown; return v < 0 ? EngineCubeDownBase() : v; }, [] { return EngineCubeDownBase(); },
+             [](int v) { g_giControl.envCubeDown = v; }, true, nullptr},
             {3, "Снимок кубкарты (logs\\play)|Cube map picture (logs\\play)", 0, 1, 1, true, cubePicture, 0, nullptr, [] { return 0; },
              [] { return 0; }, [](int) { g_cubeDumpWanted = true; }, false, nullptr},
             {3, "Небо в отражении воды|Sky in the water's reflection", 2, 20, 1, false, nullptr, 0.1f, "x%.1f",
@@ -10971,6 +11270,18 @@ private:
     Srv12* m_engineCube = nullptr;            // the engine-captured cube (EngineCube), RGBK
     ID3D10Resource* m_engineCubeRes = nullptr; // its texture (the view keeps it)
     uint64_t m_engineCubeViews = 0;
+    // The engine's cube kept in HDR with its mips (RunCubeUpdate, kCubeShader): what the water reads once all six faces
+    // came; each face is decoded, turned to D3D's layout and mixed in when the engine has drawn it.
+    TextureCore m_hdrCube{};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_hdrCubeSrv{}, m_hdrCubeUav[12]{};
+    ID3D12RootSignature* m_cubeRoot = nullptr;
+    ID3D12PipelineState* m_cubeDecodePso = nullptr;
+    ID3D12PipelineState* m_cubeDownPso = nullptr;
+    bool m_cubeFailed = false;
+    bool m_hdrFaceValid[6] = {};
+    int m_engineCubeLastFace = -1; // the face drawn in this cube render (AfterDraw)
+    bool m_engineCubeFresh = false; // this render's face replaces the old one (after a jump, a change of the time of day)
+    uint64_t m_hdrCubeRuns = 0;
     bool m_engineCubeDumpWanted = false;
     bool m_engineCubePass = false; // between CryMT's "CryMT engine cube" marks (PassName), stream order
     bool m_envReady = false, m_envFailed = false;
@@ -11269,10 +11580,23 @@ void Device::RestoreListState()
 void Device::PassName(const char* text)
 {
     // CryMT.cpp EnvCubeUpdate marks the engine's cube render in stream order (with or without pass names).
-    if (strcmp(text, "CryMT engine cube") == 0 || strcmp(text, "CryMT engine cube end") == 0)
+    // "CryMT engine cube" (a face mixed in), "... fresh" (it replaces the old one), "... end" (the HDR copy takes it).
+    if (strncmp(text, "CryMT engine cube", 17) == 0 && (!text[17] || !strcmp(text + 17, " fresh") || !strcmp(text + 17, " end")))
     {
-        m_engineCubePass = text[17] == 0;
+        const bool end = !strcmp(text + 17, " end");
+        if (!end)
+        {
+            m_engineCubeFresh = text[17] != 0;
+            m_engineCubeLastFace = -1;
+        }
+        m_engineCubePass = !end;
         m_psoDirty = true; // its culling (EngineCubeCull)
+        if (end && m_engineCubeLastFace >= 0 && EngineCubeOn())
+        {
+            PassName("CryMT cube HDR");
+            RunCubeUpdate(m_engineCubeLastFace, m_engineCubeFresh);
+            PassNameEnd();
+        }
         return;
     }
     if (!m_passNamesOn)
@@ -11782,10 +12106,9 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
     if (envAll && st.srvDirty)
         Require(envAll->info, kSrvState);
     // The ocean's reflection cube (Water.cfx reads it in place of its placeholder; water is "refractive", so not envAll).
-    bool waterEngine = false;
-    Srv12* waterEnv = s == kPS ? WaterEnvCube(&waterEngine) : nullptr;
-    if (waterEnv && st.srvDirty)
-        Require(waterEnv->info, kSrvState);
+    const EnvView waterEnv = s == kPS ? WaterEnvCube() : EnvView{};
+    if (waterEnv.info && st.srvDirty)
+        Require(waterEnv.info, kSrvState);
     if (s == kPS && m_ps && st.srvDirty)
         for (int k = 0; k < 2; k++)
             if (const int slot = k ? m_ps->env2DSlot : m_ps->envCubeSlot; slot >= 0 && slot < static_cast<int>(kTableSrvs) && st.srv[slot])
@@ -11823,8 +12146,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = envSub[0]->cpu;
             if (v && envAll && v->info == g_envPlaceholder)
                 src[i] = envAll->cpu;
-            if (v && waterEnv && v->info == g_waterEnvPlaceholder)
-                src[i] = waterEnv->cpu;
+            if (v && waterEnv.info && v->info == g_waterEnvPlaceholder)
+                src[i] = waterEnv.cpu;
             if (v && envSub[1] && static_cast<int>(i) == m_ps->env2DSlot)
                 src[i] = envSub[1]->cpu;
             if (v && s == kPS && m_foliageSrv && v->info == g_foliagePlaceholder)
@@ -14083,11 +14406,12 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  foliage mask: written in %llu frames; R32F draws with depth %.1f per frame, with SV_Target1 %.1f\n", static_cast<unsigned long long>(s.foliageFrames),
             s.zpassDraws / frames, s.zpassTarget1 / frames);
     fprintf(f, "  water SSR: depth pyramid built in %llu frames\n", static_cast<unsigned long long>(s.hizRuns));
-    fprintf(f, "  engine environment cube: %llu draws into it (faces %llu %llu %llu %llu %llu %llu), its source let go as a target %llu times\n",
+    fprintf(f, "  engine environment cube: %llu draws into it (faces %llu %llu %llu %llu %llu %llu), its source let go as a target %llu times; HDR copy updates %llu\n",
             static_cast<unsigned long long>(s.engineCubeDraws), static_cast<unsigned long long>(s.engineCubeFaces[0]),
             static_cast<unsigned long long>(s.engineCubeFaces[1]), static_cast<unsigned long long>(s.engineCubeFaces[2]),
             static_cast<unsigned long long>(s.engineCubeFaces[3]), static_cast<unsigned long long>(s.engineCubeFaces[4]),
-            static_cast<unsigned long long>(s.engineCubeFaces[5]), static_cast<unsigned long long>(s.engineCubeUnbinds));
+            static_cast<unsigned long long>(s.engineCubeFaces[5]), static_cast<unsigned long long>(s.engineCubeUnbinds),
+            static_cast<unsigned long long>(s.engineCubeHdrRuns));
     fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu\n",
             static_cast<unsigned long long>(s.sssRuns), s.sssRuns ? static_cast<double>(s.sssDispatches) / s.sssRuns : 0.0,
             static_cast<unsigned long long>(s.sssNoDepth));

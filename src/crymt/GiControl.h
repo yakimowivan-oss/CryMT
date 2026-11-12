@@ -46,6 +46,9 @@ struct GiControl
     std::atomic<int> envCubeRate{-1};   // the engine's cube: frames per face drawn (1..8); -1 as CRYMT_ENVCUBE_RATE says
     std::atomic<int> envCubeCull{-1};   // ... its faces' culling: 0 as the engine sets it, 1 none, 2 the other side; -1 as
                                         // CRYMT_ENVCUBE_CULL says
+    std::atomic<int> envCubeMip{-1};    // ... the mip level the water reads (debug), -1 as the hardware picks
+    std::atomic<int> envCubeBlend{-1};  // ... a new face mixed in: 0 replaces, 1 half, 2 a quarter; -1 as CRYMT_ENVCUBE_BLEND
+    std::atomic<int> envCubeDown{-1};   // ... its -Z face drawn 1 / left out 0 (the water looks up); -1 as CRYMT_ENVCUBE_DOWN
     std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // their strengths
 };
 extern GiControl g_giControl;
