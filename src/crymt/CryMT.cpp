@@ -8099,6 +8099,13 @@ void RunTestCommands()
         FocusLog("frame %llu: screen-space shadows reach %d m", static_cast<unsigned long long>(g_frame), g_giControl.sssReach.load());
         return;
     }
+    if (_strnicmp(command, "crymt_sssweapon ", 16) == 0) // the panel's list index: 0.5% 2% 5% 10% 20%
+    {
+        g_giControl.sssWeapon = atoi(command + 16);
+        g_giControl.active = true;
+        FocusLog("frame %llu: screen-space shadows weapon thickness index %d", static_cast<unsigned long long>(g_frame), g_giControl.sssWeapon.load());
+        return;
+    }
     if (_strnicmp(command, "crymt_capture ", 14) == 0)
     {
         Dx12CaptureNow(atoi(command + 14), (g_giControl.enabled ? 1 : 0) | (g_giControl.contact != 0 ? 4 : 0));

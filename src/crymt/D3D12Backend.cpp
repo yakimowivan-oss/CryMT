@@ -6079,6 +6079,8 @@ public:
                                            // materials take them beyond the shadow maps too: fragLib, Terrain). 4000 m
                                            // since 2026-11-12 (the user; 0.235 ms at 5120x1440 against 0.231 at 1000 m)
         float sssNear = 0.0f;              // CRYMT_SSS_NEAR: metres; nearer pixels get none
+        float sssWeaponThickness = 0.1f;   // CRYMT_SSS_WEAPONTHICK: the first-person view's thickness, a share of its depth (at
+                                           // the world's 0.005 the weapon cast no shadow on the hands)
         float gtao = 1.5f;                 // CRYMT_GI_GTAO=<strength>: GTAO in place of the engine's SSAO, a factor on the GI's
                                            // result as the SSAO was (village rooms: darkening 41.8/68.7/48.2% at 1.5 against the
                                            // SSAO's 44.1/69.8/54.2%; creases darker than the SSAO, open walls not darkened)
@@ -6187,6 +6189,7 @@ public:
             read(L"CRYMT_SSS_EDGE", v.sssEdge);
             read(L"CRYMT_SSS_REACH", v.sssReach);
             read(L"CRYMT_SSS_NEAR", v.sssNear);
+            read(L"CRYMT_SSS_WEAPONTHICK", v.sssWeaponThickness);
             if (GetEnvironmentVariableW(L"CRYMT_GI_BAKED", text, 32))
             {
                 _wcslwr_s(text);
@@ -6283,6 +6286,7 @@ public:
         g.contactShadows = g_giControl.contact > 0;
         g.sss = g_giControl.contact == 2;
         g.sssReach = g_giControl.sssReach > 0 ? static_cast<float>(g_giControl.sssReach) : b.sssReach;
+        g.sssWeaponThickness = g_giControl.sssWeapon >= 0 && g_giControl.sssWeapon < 5 ? kSssWeaponThick[g_giControl.sssWeapon] : b.sssWeaponThickness;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -7072,7 +7076,7 @@ public:
     }
 
     // Bend's screen-space shadows (BendSss.h): compiled once with the sample count asked for; root: 16 constants (b0) and
-    // a table of t0 the depth, t1 the foliage mask, u0 the result.
+    // a table of t0 the depth, t1 the foliage mask, t2 the hardware depth (the first-person view), u0 the result.
     bool EnsureSssPipeline()
     {
         if (m_sssPso || m_sssFailed)
@@ -7101,7 +7105,7 @@ public:
         }
         if (errors)
             errors->Release();
-        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 3}};
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = 16;
@@ -7181,7 +7185,7 @@ public:
         }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-        while (!m_srvRing.TryAlloc(3, cpu, gpu))
+        while (!m_srvRing.TryAlloc(4, cpu, gpu))
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -7189,10 +7193,17 @@ public:
             m_srvRing.Reclaim();
         }
         const GiSettings& s = Gi();
+        // The scene's depth buffer bound for the deferred shadow pass (stencil): the first-person view lies under 0.1.
+        TextureCore* hw = m_dsv ? static_cast<TextureCore*>(m_dsv->info) : nullptr;
+        if (hw && (hw->width != w || hw->height != h || hw->samples != 1 || !hw->res))
+            hw = nullptr;
+        // The foliage mask: whether grass and leaves cast (CRYMT_CONTACTFOLIAGE=0: they do not).
         Srv12* foliage = !s.contactFoliage && m_foliageSrv && m_foliageFrame == m_frame ? m_foliageSrv : nullptr;
         Require(z, kSrvState);
         if (foliage)
             Require(foliage->info, kSrvState);
+        if (hw)
+            Require(hw, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Require(&m_sss, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         FlushBarriers();
         D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
@@ -7204,10 +7215,18 @@ public:
         if (foliage)
             foliage->Refresh();
         g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, foliage ? foliage->cpu : g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if (hw)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC hd = sd;
+            hd.Format = DepthSrvFormat(hw->format);
+            g.dev->CreateShaderResourceView(hw->res, &hd, {cpu.ptr + 2 * g.srvInc});
+        }
+        else
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
         ud.Format = DXGI_FORMAT_R8_UNORM;
         ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        g.dev->CreateUnorderedAccessView(m_sss.res, nullptr, &ud, {cpu.ptr + 2 * g.srvInc});
+        g.dev->CreateUnorderedAccessView(m_sss.res, nullptr, &ud, {cpu.ptr + 3 * g.srvInc});
 
         float clip[4] = {m_sssClip[0], m_sssClip[1], m_sssClip[2], m_sssClip[3]};
         int size[2] = {static_cast<int>(w), static_cast<int>(h)}, lo[2] = {0, 0};
@@ -7224,8 +7243,9 @@ public:
         put(10, s.sssContrast);
         put(11, m_sssFar > 0 ? m_sssFar : 1000.0f);
         put(12, s.sssReach);
-        put(13, foliage ? 0.0f : 1.0f);
+        put(13, foliage && !s.contactFoliage ? 0.0f : 1.0f);
         put(14, s.sssNear);
+        put(15, hw ? s.sssWeaponThickness : s.sssThickness); // the null view reads 0: all "first-person" without the buffer
         m_list->SetComputeRootSignature(m_sssRoot);
         m_list->SetPipelineState(m_sssPso);
         m_list->SetComputeRootDescriptorTable(1, gpu);
@@ -7236,11 +7256,15 @@ public:
             m_list->SetComputeRoot32BitConstants(0, 16, k, 0);
             m_list->Dispatch(d.WaveCount[0], d.WaveCount[1], d.WaveCount[2]);
         }
-        if (m_giDumpWanted) // the capture key: the result as logs\play\<tag>_sss.pgm
+        if (m_giDumpWanted) // the capture key: the result as logs\play\<tag>_sss.pgm, the foliage mask as <tag>_foliage.pgm
         {
             Require(&m_sss, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (foliage)
+                Require(foliage->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
             FlushBarriers();
             RecordDump(m_sss.res, "sss", 4);
+            if (foliage)
+                RecordDump(foliage->info->res, "foliage", 4);
         }
         RestoreListState();
         m_sssFrame = m_frame;
@@ -8976,6 +9000,15 @@ public:
     }
     // The screen-space shadows' reach on the panel (metres): the list's entry nearest a value.
     static constexpr int kSssReaches[6] = {100, 200, 500, 1000, 2000, 4000};
+    static constexpr float kSssWeaponThick[5] = {0.005f, 0.02f, 0.05f, 0.1f, 0.2f}; // the panel's list for the weapon and hands
+    static int SssWeaponIndex(float t)
+    {
+        int best = 0;
+        for (int i = 1; i < 5; i++)
+            if (fabsf(kSssWeaponThick[i] - t) < fabsf(kSssWeaponThick[best] - t))
+                best = i;
+        return best;
+    }
     static int SssReachIndex(float metres)
     {
         int best = 0;
@@ -9002,6 +9035,7 @@ public:
         static const char* const ao[] = {"SSAO ИГРЫ|GAME'S SSAO", "GTAO"};
         static const char* const contact[] = {"ВЫКЛ|OFF", "СТАРЫЕ, 12 ШАГОВ|OLD, 12 STEPS", "SSS (BEND)"};
         static const char* const sssReach[] = {"100 М|100 M", "200 М|200 M", "500 М|500 M", "1000 М|1000 M", "2000 М|2000 M", "4000 М|4000 M"};
+        static const char* const sssWeapon[] = {"КАК МИР|AS THE WORLD", "+2%", "+5%", "+10%", "+20%"}; // a second window, the darker
         static const char* const outdoor[] = {"50%", "70%", "100%", "150%", "200%"};
         static const char* const baked[] = {"ДВИЖОК|ENGINE", "GI"};
         static const char* const view[] = {"ВЫКЛ|OFF", "КАРКАС|WIRE", "СПЛОШНОЙ|SOLID"};
@@ -9034,6 +9068,9 @@ public:
             {1, "Дальность SSS|SSS reach", 0, 5, 1, false, sssReach, 0, nullptr,
              [] { const int v = g_giControl.sssReach; return SssReachIndex(v > 0 ? static_cast<float>(v) : GiBase().sssReach); },
              [] { return SssReachIndex(GiBase().sssReach); }, [](int v) { g_giControl.sssReach = kSssReaches[v]; }, true, nullptr},
+            {1, "SSS: толщина рук и оружия|SSS: hands and weapon thickness", 0, 4, 1, false, sssWeapon, 0, nullptr,
+             [] { const int v = g_giControl.sssWeapon; return v >= 0 ? v : SssWeaponIndex(GiBase().sssWeaponThickness); },
+             [] { return SssWeaponIndex(GiBase().sssWeaponThickness); }, [](int v) { g_giControl.sssWeapon = v; }, true, nullptr},
             {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
              [] { return GiBase().particlesGi ? 1 : 0; }, [](int v) { g_giControl.particles = v; }, true, nullptr},

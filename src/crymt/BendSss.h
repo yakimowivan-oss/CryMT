@@ -198,6 +198,9 @@ inline DispatchList BuildDispatchList(float inLightProjection[4], int inViewport
 // - no wave intrinsics (not in SM 5): no group-wide early-out; a pixel outside [near, reach] metres (the sky, far away)
 //   is written as unshadowed after the group's depth samples are shared;
 // - grass and leaves (the z-prepass's foliage mask, t1) cast nothing unless FoliageCasts;
+// - the first-person view (weapon, hands: drawn with their own camera into the hardware depth under 0.1, t2) takes its
+//   own thickness: its objects lie centimetres apart at well under a metre, where 0.5% of the depth is a few millimetres
+//   (the weapon cast no shadow on the hands, the watch's small parts did);
 // - the result is the occlusion (1 - the original's value: 1 shadowed), so the shaders' placeholder (zero) means none,
 //   faded out over the last quarter of the reach.
 static const char* const kBendSssShader = R"(
@@ -221,6 +224,7 @@ static const char* const kBendSssShader = R"(
 
 Texture2D<float> CryDepth : register(t0);   // the z-prepass's linear depth
 Texture2D<float> CryFoliage : register(t1); // the foliage mask (1 leaves, 0.6 grass)
+Texture2D<float> CryHwDepth : register(t2); // the scene's depth buffer: the first-person view lies under 0.1
 RWTexture2D<unorm float> CryOut : register(u0);
 
 cbuffer CrySss : register(b0)
@@ -235,7 +239,7 @@ cbuffer CrySss : register(b0)
   float ReachMeters;       // pixels farther get no shadow (faded over the last quarter)
   float FoliageCasts;      // 1: the foliage mask is not read
   float NearMeters;        // pixels nearer get no shadow
-  float Pad;
+  float WeaponThickness;   // SurfaceThickness for the first-person view (SurfaceThickness without the depth buffer)
 };
 
 groupshared float DepthData[READ_COUNT * WAVE_SIZE];
@@ -299,6 +303,55 @@ void ComputeWavefrontExtents(int3 inGroupID, uint inGroupThreadID, out float2 ou
   outPixelDistance = pixel_distance;
   outDeltaXY = xy_delta;
   outMajorAxisX = x_axis_major;
+}
+
+// The shadow test against the group's shared samples for one thickness window (Bend's main loop, unchanged): 1 lit,
+// 0 shadowed. depth_scale: the window's inverse size for the pixel (see main).
+float Visibility(float start_depth, float depth_scale, int sample_index)
+{
+  int i;
+  float4 shadow_value = 1;
+  float hard_shadow = 1;
+  start_depth = start_depth * depth_scale + 1; // - z_sign (-1: near over far)
+
+  // The first number of hard shadow samples, a single pixel can produce a full shadow
+  [unroll] for (i = 0; i < HARD_SHADOW_SAMPLES; i++)
+  {
+    float depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
+
+    // We want to find the distance of the sample that is closest to the reference depth
+    hard_shadow = min(hard_shadow, depth_delta);
+  }
+
+  // Brute force go! The main shadow samples, averaged in to a set of 4 shadow values
+  [unroll] for (i = HARD_SHADOW_SAMPLES; i < SAMPLE_COUNT - FADE_OUT_SAMPLES; i++)
+  {
+    float depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
+
+    // Do the same as the hard_shadow code above, but this will accumulate to 4 separate values. By using 4 values, the
+    // average shadow can be taken, which can help soften single-pixel shadows.
+    shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta);
+  }
+
+  // Final fade out samples
+  [unroll] for (i = SAMPLE_COUNT - FADE_OUT_SAMPLES; i < SAMPLE_COUNT; i++)
+  {
+    float depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
+
+    // Add the fade value to these samples
+    const float fade_out = (float)(i + 1 - (SAMPLE_COUNT - FADE_OUT_SAMPLES)) / (float)(FADE_OUT_SAMPLES + 1) * 0.75;
+
+    shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta + fade_out);
+  }
+
+  // Apply the contrast value. A value of 0 indicates a sample was exactly matched to the reference depth (and the result
+  // is fully shadowed). We want some boost to this range, so samples don't have to exactly match to produce a full shadow.
+  shadow_value = saturate(shadow_value * ShadowContrast + (1 - ShadowContrast));
+  hard_shadow = saturate(hard_shadow * ShadowContrast + (1 - ShadowContrast));
+
+  // Take the average of 4 samples, this is useful to reduces aliasing noise in the source depth, especially with long
+  // shadows. If the first samples are always producing a hard shadow, then compute this value separately.
+  return min(hard_shadow, dot(shadow_value, 0.25));
 }
 
 [numthreads(WAVE_SIZE, 1, 1)]
@@ -416,9 +469,6 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
   // Start by reading the next value
   int sample_index = inGroupThreadID + 1;
 
-  float4 shadow_value = 1;
-  float hard_shadow = 1;
-
   // This is the inverse of how large the shadowing window is for the projected sample data. All values in the LDS sample
   // list are scaled by 1.0 / sample_distance, such that all light directions become parallel. The multiply by
   // sample_distance[0] here is to compensate for the projection divide in the data. The 1.0 / SurfaceThickness is to
@@ -426,51 +476,14 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
   // depth between the sample and the far clip - not a percentage of the full depth range. The min() function is to make
   // sure the window is a minimum width when very close to the light. The +direction term will bias the result so the
   // pixel at the very center of the light is either fully lit or shadowed
-  float depth_scale = min(sample_distance[0] + direction, 1.0 / SurfaceThickness) * sample_distance[0] / depth_thickness_scale[0];
+  const float scale_base = sample_distance[0] / depth_thickness_scale[0];
+  float result = Visibility(start_depth, min(sample_distance[0] + direction, 1.0 / SurfaceThickness) * scale_base, sample_index);
 
-  start_depth = start_depth * depth_scale - z_sign;
-
-  // The first number of hard shadow samples, a single pixel can produce a full shadow
-  [unroll] for (i = 0; i < HARD_SHADOW_SAMPLES; i++)
-  {
-    float depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
-
-    // We want to find the distance of the sample that is closest to the reference depth
-    hard_shadow = min(hard_shadow, depth_delta);
-  }
-
-  // Brute force go! The main shadow samples, averaged in to a set of 4 shadow values
-  [unroll] for (i = HARD_SHADOW_SAMPLES; i < SAMPLE_COUNT - FADE_OUT_SAMPLES; i++)
-  {
-    float depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
-
-    // Do the same as the hard_shadow code above, but this will accumulate to 4 separate values. By using 4 values, the
-    // average shadow can be taken, which can help soften single-pixel shadows.
-    shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta);
-  }
-
-  // Final fade out samples
-  [unroll] for (i = SAMPLE_COUNT - FADE_OUT_SAMPLES; i < SAMPLE_COUNT; i++)
-  {
-    float depth_delta = abs(start_depth - DepthData[sample_index + i] * depth_scale);
-
-    // Add the fade value to these samples
-    const float fade_out = (float)(i + 1 - (SAMPLE_COUNT - FADE_OUT_SAMPLES)) / (float)(FADE_OUT_SAMPLES + 1) * 0.75;
-
-    shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta + fade_out);
-  }
-
-  // Apply the contrast value. A value of 0 indicates a sample was exactly matched to the reference depth (and the result
-  // is fully shadowed). We want some boost to this range, so samples don't have to exactly match to produce a full shadow.
-  shadow_value = saturate(shadow_value * ShadowContrast + (1 - ShadowContrast));
-  hard_shadow = saturate(hard_shadow * ShadowContrast + (1 - ShadowContrast));
-
-  // Take the average of 4 samples, this is useful to reduces aliasing noise in the source depth, especially with long
-  // shadows.
-  float result = dot(shadow_value, 0.25);
-
-  // If the first samples are always producing a hard shadow, then compute this value separately.
-  result = min(hard_shadow, result);
+  // CryMT: the first-person view (the hardware depth under 0.1) also with its own, thicker window, the darker result: a
+  // window takes occluders 0.25 to 2 thicknesses above the ray, so the world's (a few millimetres at half a metre) missed
+  // the weapon over the hands, and a thick one alone lost the small parts (the watch: shadows on the weapon fell 17%).
+  [branch] if (WeaponThickness != SurfaceThickness && CryHwDepth.Load(int3((int2)write_xy, 0)) < 0.1)
+    result = min(result, Visibility(start_depth, min(sample_distance[0] + direction, 1.0 / WeaponThickness) * scale_base, sample_index));
 
   // CryMT: written as the occlusion, faded out over the reach's last quarter
   CryOut[(int2)write_xy] = (1 - result) * saturate((ReachMeters - start_meters) / (0.25 * ReachMeters));
