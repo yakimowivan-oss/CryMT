@@ -8481,6 +8481,13 @@ void RunTestCommands()
         FocusLog("frame %llu: water cube %d", static_cast<unsigned long long>(g_frame), g_giControl.waterCube.load());
         return;
     }
+    if (_strnicmp(command, "crymt_envmode ", 14) == 0) // the materials' reflection: 0 the game's maps, 1 the voxel cube, 2 the engine's
+    {
+        g_giControl.env = std::min(std::max(atoi(command + 14), 0), 2);
+        g_giControl.active = true;
+        FocusLog("frame %llu: materials' reflection mode %d", static_cast<unsigned long long>(g_frame), g_giControl.env.load());
+        return;
+    }
     if (_strnicmp(command, "crymt_envcubecull ", 18) == 0) // the engine's cube faces' culling: 0 the engine's, 1 none, 2 inverted
     {
         g_giControl.envCubeCull = std::min(std::max(atoi(command + 18), 0), 2);

@@ -1248,6 +1248,15 @@ void cubeDecode(uint3 id : SV_DispatchThreadID)
   dst[id] = float4(lerp(old, hdr, blend), 1);
 }
 
+// The materials' copy: each level of the HDR copy (an array view in ldr) encoded as the voxel cube (1 - exp(-0.5 x)).
+[numthreads(8, 8, 1)]
+void cubeEncode(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= size || id.y >= size)
+    return;
+  dst[id] = float4(1 - exp(-0.5 * ldr.Load(int4(id.xy, id.z, 0)).rgb), 1);
+}
+
 [numthreads(8, 8, 1)]
 void cubeDown(uint3 id : SV_DispatchThreadID)
 {
@@ -3908,6 +3917,7 @@ public:
     int firstTexture = -1;
     int diffuseSlot = -1; // the texture diffuseMapSampler (the z-prepass's alpha test reads its alpha), -1 none
     bool refractive = false; // water, glass, ice, liquids (no CryMT reflection): see IsRefractiveResource
+    bool noEnv = false;      // eyes, hair, skin (Eye.cfx, Hair.cfx, HumanSkin.cfx by their own parameters): no CryMT reflection
     int envCubeSlot = -1, env2DSlot = -1; // envMapSamplerCUBE ($EnvironmentCubeMap) / envMapSampler ($Env): the material's env map
     int waterEnvSamplerSlot = -1;         // Water.cfx's CryMT_WaterEnvSampler (its sampler state: the back end's trilinear clamp)
     bool water = false; // a vertex shader with the constant WaterLevel (WaterOcean.cfx, its z-prepass too): not voxel geometry
@@ -3984,6 +3994,23 @@ public:
             else
                 srvEnd = std::max(srvEnd, end);
         }
+        // Eyes, hair and skin keep their own look (the user, 2026-11-13): told by parameters only their shaders have.
+        static const char* const kNoEnvParams[] = {"IrisColor", "CorneaOpacity", "IrisGlintMul", "HairColor", "PrimarySpecShift", "SecondarySpecShift",
+                                                   "PrimarySpecColor", "Melanin", "SubsurfaceStrenght", "DiffusionAmount", "WrinklesBlend"};
+        for (UINT i = 0; i < d.ConstantBuffers && !noEnv; i++)
+            if (ID3D10ShaderReflectionConstantBuffer* cb = r->GetConstantBufferByIndex(i))
+            {
+                D3D10_SHADER_BUFFER_DESC bd{};
+                if (SUCCEEDED(cb->GetDesc(&bd)))
+                    for (UINT j = 0; j < bd.Variables && !noEnv; j++)
+                    {
+                        D3D10_SHADER_VARIABLE_DESC vd{};
+                        ID3D10ShaderReflectionVariable* var = cb->GetVariableByIndex(j);
+                        if (var && SUCCEEDED(var->GetDesc(&vd)) && vd.Name)
+                            for (const char* p : kNoEnvParams)
+                                noEnv = noEnv || strcmp(vd.Name, p) == 0;
+                    }
+            }
         for (UINT i = 0; i < d.ConstantBuffers && !water; i++)
             if (ID3D10ShaderReflectionConstantBuffer* cb = r->GetConstantBufferByIndex(i))
             {
@@ -4932,17 +4959,25 @@ public:
 
     // CRYMT_ENVMAP=voxels: the materials' environment maps from the voxel grid (with the GI's voxel part on).
     // ... or the panel's Num0 on its environment page (CRYMT_GI_KEYS).
-    static bool EnvOn()
+    // The materials' reflection: 0 the game's maps, 1 the voxel grid's cube (CRYMT_ENVMAP=voxels), 2 the engine's own cube
+    // (CRYMT_ENVMAP=engine: its HDR copy encoded as the voxel one, with mips by gloss); the reflections page.
+    static int EnvModeBase()
     {
-        static int on = -1;
-        if (on < 0)
-        {
+        static const int mode = [] {
             char v[16] = {};
-            on = GetEnvironmentVariableA("CRYMT_ENVMAP", v, sizeof(v)) && _stricmp(v, "voxels") == 0;
-        }
-        const int key = g_giControl.env;
-        return g_giControl.active && key >= 0 ? key == 1 : on == 1;
+            if (!GetEnvironmentVariableA("CRYMT_ENVMAP", v, sizeof(v)))
+                return 0;
+            return _stricmp(v, "voxels") == 0 ? 1 : _stricmp(v, "engine") == 0 ? 2 : 0;
+        }();
+        return mode;
     }
+    static int EnvMode()
+    {
+        const int key = g_giControl.env;
+        return g_giControl.active && key >= 0 ? std::min(key, 2) : EnvModeBase();
+    }
+    static bool EnvOn() { return EnvMode() == 1; }       // the voxel cube (made by the GI pass)
+    static bool EnvEngineOn() { return EnvMode() == 2; } // the engine's cube
 
     // The ocean's reflection (reflections phases 0 and 1): 0 planar, 1 the environment cube, 2 SSR + the cube;
     // CRYMT_WATERCUBE=1/2 or the reflections page.
@@ -5201,12 +5236,26 @@ public:
 
     // What the material's environment map in this slot of the pixel shader is replaced by (null: kept): the CRYMT_ENVTEST
     // colour (stage 0), or the maps from the voxel grid once they have been made.
-    Srv12* EnvSubstitute(int slot)
+    // A material's own environment map replaced: the voxel cube / 2D map (mode 1), the engine's cube (mode 2: cube maps only).
+    EnvView EnvSubstitute(int slot)
     {
-        if (!m_ps || (slot != m_ps->envCubeSlot && slot != m_ps->env2DSlot) || m_ps->refractive)
-            return nullptr; // water, glass: their maps stay (the user: the river came out overbright)
+        EnvView v;
+        if (!m_ps || (slot != m_ps->envCubeSlot && slot != m_ps->env2DSlot) || m_ps->refractive || m_ps->noEnv)
+            return v; // water, glass: their maps stay (the user: the river came out overbright); eyes, hair, skin too
         if (EnvTestColour() == 0xFFFFFFFFu)
-            return EnvOn() && m_envReady ? (slot == m_ps->envCubeSlot ? m_envCube : m_env2D) : nullptr;
+        {
+            if (EnvEngineOn() && m_ldrCubeReady && slot == m_ps->envCubeSlot)
+            {
+                v.info = &m_ldrCube;
+                v.cpu = m_ldrCubeSrv;
+            }
+            else if (Srv12* s = EnvOn() && m_envReady ? (slot == m_ps->envCubeSlot ? m_envCube : m_env2D) : nullptr)
+            {
+                v.info = s->info;
+                v.cpu = s->cpu;
+            }
+            return v;
+        }
         if (!m_envTestTried)
         {
             m_envTestTried = true;
@@ -5214,7 +5263,12 @@ public:
             m_envTest2D = EnvTestTexture(false);
             Log("environment test textures %06x: cube %s, 2D %s", EnvTestColour(), m_envTestCube ? "ready" : "failed", m_envTest2D ? "ready" : "failed");
         }
-        return slot == m_ps->envCubeSlot ? m_envTestCube : m_envTest2D;
+        if (Srv12* s = slot == m_ps->envCubeSlot ? m_envTestCube : m_envTest2D)
+        {
+            v.info = s->info;
+            v.cpu = s->cpu;
+        }
+        return v;
     }
 
     // In the engine's cube render (m_engineCubePass): its encode pass binds the face's scene (TempEnvCMap) as its input
@@ -7911,9 +7965,9 @@ public:
         auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
         if (!compile || !g_serializeRoot)
             return false;
-        ID3DBlob* code[2] = {};
-        const char* entries[2] = {"cubeDecode", "cubeDown"};
-        for (int i = 0; i < 2; i++)
+        ID3DBlob* code[3] = {};
+        const char* entries[3] = {"cubeDecode", "cubeDown", "cubeEncode"};
+        for (int i = 0; i < 3; i++)
         {
             ID3DBlob* errors = nullptr;
             if (FAILED(compile(kCubeShader, strlen(kCubeShader), "CryMT_Cube", nullptr, nullptr, entries[i], "cs_5_0", 1 << 15, 0, &code[i], &errors)))
@@ -7921,8 +7975,8 @@ public:
                 Log("engine cube shader %s: %s", entries[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
                 if (errors)
                     errors->Release();
-                if (i)
-                    code[0]->Release();
+                for (int j = 0; j < i; j++)
+                    code[j]->Release();
                 return false;
             }
             if (errors)
@@ -7954,8 +8008,8 @@ public:
             blob->Release();
         if (rootErrors)
             rootErrors->Release();
-        ID3D12PipelineState** psos[2] = {&m_cubeDecodePso, &m_cubeDownPso};
-        for (int i = 0; i < 2; i++)
+        ID3D12PipelineState** psos[3] = {&m_cubeDecodePso, &m_cubeDownPso, &m_cubeEncodePso};
+        for (int i = 0; i < 3; i++)
         {
             if (SUCCEEDED(hr))
             {
@@ -8111,10 +8165,102 @@ public:
         }
         Require(&m_hdrCube, kSrvState); // read by the water from now on (its table may not be rebuilt)
         FlushBarriers();
+        if (EnvEngineOn())
+            EncodeMaterialsCube(size, mips);
         RestoreListState();
         m_hdrFaceValid[face] = true;
         m_hdrCubeRuns++;
         m_stats.engineCubeHdrRuns++;
+    }
+
+    // The materials' copy (m_ldrCube) from the HDR copy, every level; the HDR copy is in kSrvState, the root signature set.
+    void EncodeMaterialsCube(UINT size, UINT mips)
+    {
+        if (!m_cubeEncodePso)
+            return;
+        if (!m_ldrCube.res || m_ldrCube.width != size)
+        {
+            DeferRelease(m_ldrCube.res);
+            m_ldrCube.res = nullptr;
+            m_ldrCubeReady = false;
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = size;
+            d.Height = size;
+            d.DepthOrArraySize = 6;
+            d.MipLevels = static_cast<UINT16>(mips);
+            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d.SampleDesc.Count = 1;
+            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_ldrCube.res))))
+            {
+                m_ldrCube.res = nullptr;
+                m_ldrCube.width = 0;
+                return;
+            }
+            m_ldrCube.width = m_ldrCube.height = size;
+            m_ldrCube.depthOrArray = 6;
+            m_ldrCube.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            m_ldrCube.samples = 1;
+            m_ldrCube.mips = mips;
+            m_ldrCube.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            if (!m_ldrCubeSrv.ptr)
+                m_ldrCubeSrv = g_srvCpu.Alloc();
+            D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
+            vd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            vd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            vd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            vd.TextureCube.MipLevels = mips;
+            g.dev->CreateShaderResourceView(m_ldrCube.res, &vd, m_ldrCubeSrv);
+            for (UINT m = 0; m < mips; m++)
+            {
+                if (!m_ldrCubeUav[m].ptr)
+                    m_ldrCubeUav[m] = g_srvCpu.Alloc();
+                D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+                ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                ud.Texture2DArray = {m, 0, 6, 0};
+                g.dev->CreateUnorderedAccessView(m_ldrCube.res, nullptr, &ud, m_ldrCubeUav[m]);
+            }
+            Log("engine cube for the materials: %ux%u, %u levels", size, size, mips);
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu0;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu0;
+        while (!m_srvRing.TryAlloc(3 * mips, cpu0, gpu0))
+        {
+            Submit();
+            WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
+            PollFence();
+            m_srvRing.Reclaim();
+        }
+        Require(&m_ldrCube, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        FlushBarriers();
+        m_list->SetComputeRootSignature(m_cubeRoot);
+        m_list->SetPipelineState(m_cubeEncodePso);
+        for (UINT m = 0; m < mips; m++)
+        {
+            const UINT dsize = std::max(1u, size >> m);
+            const D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu0.ptr + 3 * m * g.srvInc};
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu0.ptr + 3 * m * g.srvInc};
+            D3D12_SHADER_RESOURCE_VIEW_DESC av{};
+            av.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            av.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            av.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            av.Texture2DArray = {m, 1, 0, 6, 0, 0.0f};
+            g.dev->CreateShaderResourceView(m_hdrCube.res, &av, cpu);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_ldrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            const uint32_t k[4] = {dsize, 0, 0, 0};
+            m_list->SetComputeRoot32BitConstants(0, 4, k, 0);
+            m_list->SetComputeRootDescriptorTable(1, gpu);
+            m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, 6);
+        }
+        Require(&m_ldrCube, kSrvState);
+        FlushBarriers();
+        m_ldrCubeReady = true;
     }
 
     bool PsReads(const ResourceInfo* placeholder) const
@@ -9821,14 +9967,7 @@ public:
         static const char* const names[kPanelTabs] = {"GI|GI", "AO|AO", "Воксели|Voxels", "Отражения|Reflections", "Движок|Engine", "Время|Time"};
         return names[t];
     }
-    static bool EnvDefaultOn()
-    {
-        static const bool on = [] {
-            char v[16] = {};
-            return GetEnvironmentVariableA("CRYMT_ENVMAP", v, sizeof(v)) && _stricmp(v, "voxels") == 0;
-        }();
-        return on;
-    }
+    static bool EnvDefaultOn() { return EnvModeBase() == 1; }
     static int BaseParticleOut()
     {
         static const int values[5] = {50, 70, 100, 150, 200};
@@ -9883,7 +10022,7 @@ public:
         static const char* const geometry[] = {"ВЫКЛ|OFF", "ВКЛ|ON", "ВКЛ + ЛИСТВА|ON + FOLIAGE"};
         static const char* const opacity[] = {"ЭКРАН И ГЕОМЕТРИЯ|SCREEN+GEOMETRY", "ГЕОМЕТРИЯ|GEOMETRY"};
         static const char* const cache[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "КАЖДЫЙ 4-Й|EVERY 4TH"};
-        static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE"};
+        static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE", "КУБ ДВИЖКА|ENGINE CUBE"};
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
         static const char* const waterSource[] = {"ВОКСЕЛИ|VOXELS", "ДВИЖОК|ENGINE"};
         static const char* const cubeCull[] = {"КАК В ДВИЖКЕ|ENGINE'S", "НЕТ|NONE", "ОБРАТНОЕ|INVERTED"};
@@ -9961,8 +10100,8 @@ public:
              [] { const int v = g_giControl.geomCache; return v < 0 ? (GiBase().geometryCache ? 1 : 0) : v; },
              [] { return GiBase().geometryCache ? 1 : 0; }, [](int v) { g_giControl.geomCache = v; }, true, nullptr},
             // Reflections
-            {3, "Отражения|Reflections", 0, 1, 1, true, env, 0, nullptr,
-             [] { const int v = g_giControl.env; return v < 0 ? (EnvDefaultOn() ? 1 : 0) : v; }, [] { return EnvDefaultOn() ? 1 : 0; },
+            {3, "Отражения|Reflections", 0, 2, 1, true, env, 0, nullptr,
+             [] { const int v = g_giControl.env; return v < 0 ? EnvModeBase() : v; }, [] { return EnvModeBase(); },
              [](int v) { g_giControl.env = v; }, true, nullptr},
             {3, "Отражение воды|Water reflection", 0, 2, 1, true, water, 0, nullptr, [] { return WaterMode(); },
              [] { return 0; },
@@ -11381,6 +11520,11 @@ private:
     ID3D12RootSignature* m_cubeRoot = nullptr;
     ID3D12PipelineState* m_cubeDecodePso = nullptr;
     ID3D12PipelineState* m_cubeDownPso = nullptr;
+    ID3D12PipelineState* m_cubeEncodePso = nullptr;
+    // The materials' copy of it (cubeEncode: as the voxel cube, 1 - exp(-0.5 x), all levels): what their reflections read.
+    TextureCore m_ldrCube{};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_ldrCubeSrv{}, m_ldrCubeUav[12]{};
+    bool m_ldrCubeReady = false;
     bool m_cubeFailed = false;
     bool m_hdrFaceValid[6] = {};
     int m_engineCubeLastFace = -1; // the face drawn in this cube render (AfterDraw)
@@ -11696,7 +11840,7 @@ void Device::PassName(const char* text)
         }
         m_engineCubePass = !end;
         m_psoDirty = true; // its culling (EngineCubeCull)
-        if (end && m_engineCubeLastFace >= 0 && EngineCubeOn())
+        if (end && m_engineCubeLastFace >= 0 && (EngineCubeOn() || EnvEngineOn()))
         {
             PassName("CryMT cube HDR");
             RunCubeUpdate(m_engineCubeLastFace, m_engineCubeFresh);
@@ -12205,11 +12349,24 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
         }
     if (s == kPS && m_giSrv)
         Require(m_giSrv->info, kSrvState);
-    Srv12* envSub[2] = {};
-    Srv12* envAll = s == kPS && EnvOn() && m_envReady && (!g_giControl.active || g_giControl.envAll) && m_ps && !m_ps->refractive
-                        ? m_envCubeAll : nullptr; // fragLib's, every material but water and glass (black placeholder there)
-    if (envAll && st.srvDirty)
-        Require(envAll->info, kSrvState);
+    EnvView envSub[2] = {};
+    // fragLib's reflection on every material but water, glass, eyes, hair and skin (the black placeholder there).
+    EnvView envAll;
+    if (s == kPS && (!g_giControl.active || g_giControl.envAll) && m_ps && !m_ps->refractive && !m_ps->noEnv)
+    {
+        if (EnvEngineOn() && m_ldrCubeReady)
+        {
+            envAll.info = &m_ldrCube;
+            envAll.cpu = m_ldrCubeSrv;
+        }
+        else if (EnvOn() && m_envReady)
+        {
+            envAll.info = m_envCubeAll->info;
+            envAll.cpu = m_envCubeAll->cpu;
+        }
+    }
+    if (envAll.info && st.srvDirty)
+        Require(envAll.info, kSrvState);
     // The ocean's reflection cube (Water.cfx reads it in place of its placeholder; water is "refractive", so not envAll).
     const EnvView waterEnv = s == kPS ? WaterEnvCube() : EnvView{};
     if (waterEnv.info && st.srvDirty)
@@ -12217,9 +12374,9 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
     if (s == kPS && m_ps && st.srvDirty)
         for (int k = 0; k < 2; k++)
             if (const int slot = k ? m_ps->env2DSlot : m_ps->envCubeSlot; slot >= 0 && slot < static_cast<int>(kTableSrvs) && st.srv[slot])
-                if ((envSub[k] = EnvSubstitute(slot)))
+                if ((envSub[k] = EnvSubstitute(slot)).info)
                 {
-                    Require(envSub[k]->info, kSrvState);
+                    Require(envSub[k].info, kSrvState);
                     m_envBinds++;
                 }
     // The table always holds all bound views (and the GI slot), so a later shader reading further slots finds them.
@@ -12247,14 +12404,14 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = m_jitterCpu;
             if (v && s == kPS && m_fplusCpu.ptr && v->info == g_fplusPlaceholder)
                 src[i] = m_fplusCpu;
-            if (v && envSub[0] && static_cast<int>(i) == m_ps->envCubeSlot)
-                src[i] = envSub[0]->cpu;
-            if (v && envAll && v->info == g_envPlaceholder)
-                src[i] = envAll->cpu;
+            if (v && envSub[0].info && static_cast<int>(i) == m_ps->envCubeSlot)
+                src[i] = envSub[0].cpu;
+            if (v && envAll.info && v->info == g_envPlaceholder)
+                src[i] = envAll.cpu;
             if (v && waterEnv.info && v->info == g_waterEnvPlaceholder)
                 src[i] = waterEnv.cpu;
-            if (v && envSub[1] && static_cast<int>(i) == m_ps->env2DSlot)
-                src[i] = envSub[1]->cpu;
+            if (v && envSub[1].info && static_cast<int>(i) == m_ps->env2DSlot)
+                src[i] = envSub[1].cpu;
             if (v && s == kPS && m_foliageSrv && v->info == g_foliagePlaceholder)
                 src[i] = m_foliageSrv->cpu;
             if (v && s == kPS && v->info == g_sssPlaceholder && m_sssFrame == m_frame)
@@ -14385,7 +14542,7 @@ void Dx12DumpEngineCube()
 
 bool Dx12WantsEngineEnvCube()
 {
-    return dx12::g_device && dx12::Device::WaterCubeOn() && dx12::Device::EngineCubeOn();
+    return dx12::g_device && ((dx12::Device::WaterCubeOn() && dx12::Device::EngineCubeOn()) || dx12::Device::EnvEngineOn());
 }
 
 void Dx12EngineEnvCube(ID3D10Resource* cube)

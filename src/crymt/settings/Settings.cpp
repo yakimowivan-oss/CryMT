@@ -88,7 +88,10 @@ const char* const kEnvAll = R"(#if D3D10
     half crymtF = 1 - saturate(pPass.fNdotE);
     crymtF *= crymtF;
     crymtF *= crymtF;
-    pPass.cEnvironment = texCUBE(CryMT_EnvSampler, pPass.vReflVec.xyz).rgb * (0.04 + 0.96 * crymtF) * 0.35;
+    // The level by the gloss (the engine's cube has its mips; the voxel cube one level): the specular lobe's width
+    // (sqrt(2 / (n + 2)) radians) against a texel of a 256 cube's level (0.0061 x 2^L), two levels sharper.
+    half crymtLod = clamp(log2(sqrt(2 / (pPass.fSpecPow + 2)) / 0.0061) - 2, 0, 7);
+    pPass.cEnvironment = texCUBElod(CryMT_EnvSampler, float4(pPass.vReflVec.xyz, crymtLod)).rgb * (0.04 + 0.96 * crymtF) * 0.35;
     pPass.nReflectionMapping = 3;
   }
 #endif
@@ -296,7 +299,7 @@ samplerCUBE CryMT_EnvSampler = sampler_state
   Texture = Textures/CryMT/env.dds;
   MinFilter = LINEAR;
   MagFilter = LINEAR;
-  MipFilter = POINT;
+  MipFilter = LINEAR;
   AddressU = Clamp;
   AddressV = Clamp;
 };
