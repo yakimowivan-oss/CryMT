@@ -31,5 +31,10 @@ Bend Studio Screen Space Shadows (bend_sss_cpu.h, bend_sss_gpu.h; SIGGRAPH 2023)
            Direct3D shader model 5 and CryMT's depth; the changes are listed in the source.
   License: Apache License 2.0, Copyright 2023 Sony Interactive Entertainment (bend_sss.license.txt)
 
+AMD FidelityFX SDK 1.1.4: Stochastic Screen Space Reflections (ffx_sssr_intersect.h)
+  Use:     the hierarchical ray march, ported to shader model 4 for the water's screen-space
+           reflections (CryMT's patch of Water.cfx, written by CryMTSettings.exe).
+  License: MIT, Copyright (C) 2024 Advanced Micro Devices, Inc. (fidelityfx.license.txt)
+
 Crysis
   Crysis and CryEngine are trademarks of Crytek. The package contains no game files.

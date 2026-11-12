@@ -38,8 +38,8 @@ struct GiControl
     std::atomic<int> geomCache{-1};    // unchanged objects voxelized every 4th frame 1, every frame 0; -1 as CRYMT_GI_GEOMCACHE
     std::atomic<int> env{-1};          // environment maps 1 from the voxel grid, 0 the game's; -1 as CRYMT_ENVMAP says
     std::atomic<bool> envAll{true};    // the reflection on every material (fragLib), not only those with their own map
-    std::atomic<int> waterCube{-1};    // the ocean's reflection 1 from the environment cube (the planar pass off), 0 planar;
-                                       // -1 as CRYMT_WATERCUBE says
+    std::atomic<int> waterCube{-1};    // the ocean's reflection: 0 planar, 1 the environment cube, 2 SSR + the cube (the
+                                       // planar pass off for 1 and 2); -1 as CRYMT_WATERCUBE says
     std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // their strengths
 };
 extern GiControl g_giControl;

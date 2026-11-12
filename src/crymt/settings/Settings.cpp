@@ -98,9 +98,13 @@ const char* const kEnvAll = R"(#if D3D10
   // do custom pass setup
   frag_custom_begin(pPass);)";
 
-// The ocean's reflection (Water.cfx WaterPS) from CryMT's environment cube: the D3D12 back end binds it in place of
-// Textures/CryMT/waterenv.dds (alpha 0 everywhere: the planar reflection stays) when the water cube is on (CRYMT_WATERCUBE,
-// the reflections page; the engine's planar pass then off: r_WaterReflections 0).
+// The ocean's reflection (Water.cfx WaterPS) by CryMT (CRYMT_WATERCUBE, the reflections page "Water reflection"; the
+// engine's planar pass then off: r_WaterReflections 0): 1 the environment cube the D3D12 back end binds in place of
+// Textures/CryMT/waterenv.dds (alpha 0 everywhere: the planar reflection stays); 2 screen-space reflections first: AMD
+// FidelityFX SSSR's hierarchical ray march (ffx_sssr_intersect.h, FidelityFX SDK 1.1.4, Copyright (C) 2024 Advanced Micro
+// Devices, Inc., MIT license: licenses\fidelityfx.license.txt) over the back end's depth pyramid (Textures/CryMT/hiz.dds:
+// near / view depth, 0 for the sky and the first-person view, the largest of 2x2 per level, 7 levels), the scene before
+// the water (envMapSamplerRefr) at the hit, the cube where it misses. Ported to SM4 for inverted depth and mirror rays.
 const char* const kWaterEnvDecl = R"(#if D3D10
 samplerCUBE CryMT_WaterEnvSampler = sampler_state
 {
@@ -112,16 +116,132 @@ samplerCUBE CryMT_WaterEnvSampler = sampler_state
   AddressV = Clamp;
 };
 
-// The reflection towards the mirrored view direction (world) from the cube, which holds 1 - exp(-0.5 x): back to HDR.
-half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal)
+// CryMT's frame texture (as ShadowMaskGen's): 0 the jitter (fractions of the screen), 2..5 the columns of the unjittered
+// view-projection, 7 the depth pyramid's size, the camera's near plane, w 2 when the water's SSR is on.
+sampler2D CryMT_WaterFrameSampler = sampler_state
 {
-  half3 n = normalize(normal);
+  Texture = Textures/CryMT/jitter.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
+sampler2D CryMT_HiZSampler = sampler_state
+{
+  Texture = Textures/CryMT/hiz.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
+float4 CryMT_WaterFrame(float i)
+{
+  return tex2Dlod(CryMT_WaterFrameSampler, float4((i + 0.5) / 8, 0.5, 0, 0));
+}
+
+float CryMT_HiZLoad(float2 mipPos, float mip, float2 mipRes)
+{
+  return tex2Dlod(CryMT_HiZSampler, float4((floor(mipPos) + 0.5) / mipRes, 0, mip)).r;
+}
+
+// FFX_SSSR_HierarchicalRaymarch: origin and direction in screen space ([0, 1]^2 and the pyramid's depth); true where the
+// march came down to level 0 at a surface.
+float3 CryMT_HiZMarch(float3 origin, float3 direction, float2 screenSize, out bool valid)
+{
+  const float big = 3.402823466e+38;
+  float3 invDir = float3(direction.x != 0 ? 1 / direction.x : big, direction.y != 0 ? 1 / direction.y : big, direction.z != 0 ? 1 / direction.z : big);
+  float mip = 0;
+  float2 mipRes = screenSize;
+  float2 mipResInv = 1 / mipRes;
+  float2 uvOffset = 0.005 / screenSize;
+  uvOffset.x = direction.x < 0 ? -uvOffset.x : uvOffset.x;
+  uvOffset.y = direction.y < 0 ? -uvOffset.y : uvOffset.y;
+  float2 floorOffset = float2(direction.x < 0 ? 0 : 1, direction.y < 0 ? 0 : 1);
+  float2 mipPos = mipRes * origin.xy;
+  float2 xyPlane = (floor(mipPos) + floorOffset) * mipResInv + uvOffset;
+  float2 t2 = xyPlane * invDir.xy - origin.xy * invDir.xy;
+  float t = min(t2.x, t2.y);
+  float3 pos = origin + t * direction;
+  int i = 0;
+  while (i < 96 && mip >= 0)
+  {
+    mipPos = mipRes * pos.xy;
+    float surfaceZ = CryMT_HiZLoad(mipPos, mip, mipRes);
+    float3 planes = float3((floor(mipPos) + floorOffset) * mipResInv + uvOffset, surfaceZ);
+    float3 tt = planes * invDir - origin * invDir;
+    tt.z = direction.z < 0 ? tt.z : big; // inverted depth: the z plane only when the ray goes away from the camera
+    float tMin = min(min(tt.x, tt.y), tt.z);
+    bool above = surfaceZ < pos.z;
+    bool skipped = asuint(tMin) != asuint(tt.z) && above;
+    t = above ? tMin : t;
+    pos = origin + t * direction;
+    if (!(skipped && mip >= 6))
+    {
+      mip += skipped ? 1 : -1;
+      mipRes *= skipped ? 0.5 : 2;
+      mipResInv *= skipped ? 2 : 0.5;
+    }
+    i++;
+  }
+  valid = mip < 0;
+  return pos;
+}
+
+// FFX_SSSR_ValidateHit: on screen, away from the start, not the sky, the ray close to the surface there (metres), faded
+// at the screen's borders.
+float CryMT_HiZConfidence(float3 hit, float2 uv, float2 screenSize, float nearZ)
+{
+  if (hit.x < 0 || hit.y < 0 || hit.x > 1 || hit.y > 1)
+    return 0;
+  float2 m = abs(hit.xy - uv);
+  if (m.x < 2 / screenSize.x && m.y < 2 / screenSize.y)
+    return 0;
+  float surfaceZ = tex2Dlod(CryMT_HiZSampler, float4(hit.xy, 0, 0)).r;
+  if (surfaceZ <= 0)
+    return 0;
+  float wSurface = nearZ / surfaceZ, wHit = nearZ / max(hit.z, 1e-7);
+  float confidence = 1 - smoothstep(0, 0.3 + 0.02 * wSurface, abs(wHit - wSurface));
+  confidence *= confidence;
+  float2 fov = 0.05 * float2(screenSize.y / screenSize.x, 1);
+  float2 border = smoothstep(0, fov, hit.xy) * (1 - smoothstep(1 - fov, 1, hit.xy));
+  return confidence * border.x * border.y;
+}
+
+// The reflection towards the mirrored view direction (world): the cube (it holds 1 - exp(-0.5 x): back to HDR) or the
+// planar one; with SSR the scene where the ray meets it. screenProj: the pixel's (u, v) * w and w (Water.cfx's).
+half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj)
+{
+  half3 n = normalize(half3(normal.xy * 0.5, normal.z));
   half3 r = 2 * dot(viewVec, n) * n - viewVec;
   half4 c = texCUBE(CryMT_WaterEnvSampler, r);
-  return c.a > 0.5 ? half4(-2 * log(max(1 - c.rgb, 0.001)), planar.a) : planar;
+  half4 base = c.a > 0.5 ? half4(-2 * log(max(1 - c.rgb, 0.001)), planar.a) : planar;
+  float4 hz = CryMT_WaterFrame(7);
+  if (hz.w < 1.5 || hz.x < 1)
+    return base;
+  float4 f0 = CryMT_WaterFrame(0), c0 = CryMT_WaterFrame(2), c1 = CryMT_WaterFrame(3), c3 = CryMT_WaterFrame(5);
+  float wP = screenProj.w;
+  float2 uvP = screenProj.xy / wP;
+  // The ray's direction as a homogeneous screen point (u w, v w, w) with the jitter; its far end where it stays in front.
+  float xR = dot(r, c0.xyz), yR = dot(r, c1.xyz), wR = dot(r, c3.xyz);
+  float3 Rh = float3(0.5 * xR + (0.5 + f0.x) * wR, -0.5 * yR + (0.5 + f0.y) * wR, wR);
+  float t0 = wR < 0 ? 0.5 * wP / -wR : wP;
+  float3 Eh = float3(uvP * wP, wP) + t0 * Rh;
+  float3 origin = float3(uvP, hz.z / wP);
+  float3 endPoint = float3(Eh.xy / Eh.z, hz.z / Eh.z);
+  bool valid;
+  float3 hit = CryMT_HiZMarch(origin, endPoint - origin, hz.xy, valid);
+  float confidence = valid ? CryMT_HiZConfidence(hit, uvP, hz.xy, hz.z) : 0;
+  if (confidence <= 0)
+    return base;
+  half3 seen = tex2Dlod(envMapSamplerRefr, float4(hit.xy, 0, 0)).rgb;
+  return half4(lerp(base.rgb, seen, confidence), base.a);
 }
 #else
-half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal)
+half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj)
 {
   return planar;
 }
@@ -758,9 +878,9 @@ std::wstring InstallGi()
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
                                "  float tcIterParam = LightInfoTC_DB.w;\n  for (int i=0; i<LightsNum_DB; i++, tcLI.x+=tcIter)\n#else\n";
     const bool ok = // The ocean's reflection from CryMT's cube when it is bound (kWaterEnvDecl).
-                    Replace(water, "sampler2D envMapSamplerRefr : register(s1)\n", std::string(kWaterEnvDecl) + "sampler2D envMapSamplerRefr : register(s1)\n") &&
+                    Replace(water, "// Anisotropic not working ..\nsampler2D oceanBumpMapSampler\n", std::string(kWaterEnvDecl) + "// Anisotropic not working ..\nsampler2D oceanBumpMapSampler\n") &&
                     Replace(water, "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n\n//  OUT.Color = reflectColor;",
-                            "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n  reflectColor = CryMT_WaterReflection(reflectColor, viewVec, bumpNormal); // CryMT\n\n//  OUT.Color = reflectColor;") &&
+                            "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n  reflectColor = CryMT_WaterReflection(reflectColor, viewVec, bumpNormal, IN.screenProj); // CryMT\n\n//  OUT.Color = reflectColor;") &&
                     Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl) &&
                     // The sun's shadow mask with CryMT's screen-space shadows, also beyond the shadow maps.
                     Replace(frag, "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);",
@@ -874,6 +994,11 @@ std::wstring InstallGi()
     const unsigned int wcaps[] = {0x1008, 0xFE00}; // complex texture; cube map with all six faces
     memcpy(&waterEnv[108], wcaps, sizeof(wcaps));
     waterEnv[128 + 4] = waterEnv[128 + 5] = waterEnv[128 + 6] = 0x3D;
+    // The depth pyramid's placeholder (the water's SSR): 2x1, red zero in both texels in either byte order (no surface),
+    // the second texel 007C007C (the mark).
+    std::string hiz = foliage;
+    memset(&hiz[132], 0, 4);
+    hiz[133] = hiz[135] = 0x7C;
     // The screen-space shadows' placeholder: 2x1, the first texel zero (no shadow), the second 005C005C (the mark: its
     // red is zero in either byte order, as fragLib reads the whole screen from it).
     std::string sss = foliage;
@@ -896,6 +1021,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/Vegetation.cfx", Crlf(vegetation)},
                               {"Shaders/HWScripts/CryFX/Water.cfx", Crlf(water)},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
+                              {"Textures/CryMT/hiz.dds", hiz},
                               {"Textures/CryMT/env.dds", env},
                               {"Textures/CryMT/gi.dds", dds},
                               {"Textures/CryMT/jitter.dds", jitter},

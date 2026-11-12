@@ -1117,6 +1117,53 @@ const ResourceInfo* g_fplusPlaceholder;   // Textures/CryMT/fplus.dds, see IsFPl
 const ResourceInfo* g_sssPlaceholder;     // Textures/CryMT/sss.dds (ShadowMaskGen's CryMT_SSSSampler), see IsSssPlaceholder
 const ResourceInfo* g_envPlaceholder;     // Textures/CryMT/env.dds (fragLib's CryMT_EnvSampler), see IsEnvPlaceholder
 const ResourceInfo* g_waterEnvPlaceholder; // Textures/CryMT/waterenv.dds (Water.cfx's CryMT_WaterEnvSampler), see IsWaterEnvPlaceholder
+const ResourceInfo* g_hizPlaceholder;      // Textures/CryMT/hiz.dds (Water.cfx's CryMT_HiZSampler), see IsHizPlaceholder
+
+// The depth pyramid for screen-space reflections (RunHiz): level 0 = near / view depth from the z-prepass's linear depth
+// (w / far), 0 for the sky and the first-person view (the hardware depth under 0.1: rays pass it); each further level the
+// largest of 2x2 (inverted depth: the nearest). Constants: x, y the level's size, z, w the source level's size, near / far,
+// 1 with the hardware depth.
+const char* const kHizShader = R"(
+Texture2D<float> zTex : register(t0);
+Texture2D<float> hwDepth : register(t1);
+RWTexture2D<float> dst : register(u0);
+RWTexture2D<float> src : register(u1);
+cbuffer C : register(b0)
+{
+  uint2 dstSize;
+  uint2 srcSize;
+  float nearOverFar;
+  float hasHw;
+};
+
+[numthreads(8, 8, 1)]
+void hizInit(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= dstSize.x || id.y >= dstSize.y)
+    return;
+  float L = zTex.Load(int3(id.xy, 0));
+  float d = L > 0 && L < 0.999 ? nearOverFar / L : 0;
+  if (hasHw > 0.5 && hwDepth.Load(int3(id.xy, 0)) < 0.1)
+    d = 0;
+  dst[id.xy] = d;
+}
+
+[numthreads(8, 8, 1)]
+void hizDown(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= dstSize.x || id.y >= dstSize.y)
+    return;
+  uint2 s = id.xy * 2;
+  uint2 last = srcSize - 1;
+  float d = max(max(src[min(s, last)], src[min(s + uint2(1, 0), last)]), max(src[min(s + uint2(0, 1), last)], src[min(s + 1, last)]));
+  // An odd source: its last column / row goes into the last texel.
+  if ((srcSize.x & 1) && id.x == dstSize.x - 1)
+    d = max(d, max(src[min(uint2(last.x, s.y), last)], src[min(uint2(last.x, s.y + 1), last)]));
+  if ((srcSize.y & 1) && id.y == dstSize.y - 1)
+    d = max(d, max(src[min(uint2(s.x, last.y), last)], src[min(uint2(s.x + 1, last.y), last)]));
+  dst[id.xy] = d;
+}
+)";
 SerializeRootSignatureFn g_serializeRoot;
 
 // CryMT GI compute pass (Device::RunGi). Root constants b0 (kGiConstants floats), t0 scene depth, t1 previous HDR colour,
@@ -4174,6 +4221,7 @@ struct Stats
     double voxShadowMapCover[8];                        // their cover summed
     uint64_t giStampTicks[5], giStampRuns; // GI pass timers: trace, filter, upsample, voxel geometry, voxel update
     uint64_t sssRuns, sssDispatches, sssNoDepth; // RunSss: frames made, their dispatches, frames without the z-prepass target
+    uint64_t hizRuns; // RunHiz: frames whose depth pyramid was built (the water's SSR)
 };
 
 // GPU busy time: a timestamp at the start and the end of every main list, resolved with the list.
@@ -4797,16 +4845,19 @@ public:
         return g_giControl.active && key >= 0 ? key == 1 : on == 1;
     }
 
-    // The ocean's reflection from the environment cube (reflections phase 0): CRYMT_WATERCUBE=1 or the reflections page.
-    static bool WaterCubeOn()
+    // The ocean's reflection (reflections phases 0 and 1): 0 planar, 1 the environment cube, 2 SSR + the cube;
+    // CRYMT_WATERCUBE=1/2 or the reflections page.
+    static int WaterMode()
     {
-        static const bool env = [] {
+        static const int env = [] {
             wchar_t v[8] = {};
-            return GetEnvironmentVariableW(L"CRYMT_WATERCUBE", v, 8) && v[0] == L'1';
+            return GetEnvironmentVariableW(L"CRYMT_WATERCUBE", v, 8) ? std::min(std::max(_wtoi(v), 0), 2) : 0;
         }();
         const int panel = g_giControl.waterCube;
-        return panel < 0 ? env : panel > 0;
+        return panel < 0 ? env : std::min(panel, 2);
     }
+    static bool WaterCubeOn() { return WaterMode() >= 1; }
+    static bool WaterSsrOn() { return WaterMode() == 2; }
 
     bool EnsureEnvTargets()
     {
@@ -6454,6 +6505,12 @@ public:
         data[25] = 0.5f;
         data[26] = 50.0f;
         data[27] = s.contactFoliage ? 1.0f : 0.0f;
+        // Texel 7: the depth pyramid for the water's SSR (its last size; 0 before the first), the near plane, 2 when on.
+        data[28] = static_cast<float>(m_hiz.width);
+        data[29] = static_cast<float>(m_hiz.height);
+        data[30] = info->nearZ;
+        data[31] = WaterSsrOn() && !m_hizFailed ? 2.0f : 0.0f;
+        m_hizNearOverFar = info->farZ > 0 ? info->nearZ / info->farZ : 0.0f;
         // The sun for RunSss: its clip position through the unjittered view-projection (a direction: w 0), moved by the
         // frame's jitter as the depth was drawn (the image shifted +x right, +y down: x + 2 shiftU w, y - 2 shiftV w).
         m_sssSun = info->sun[3] > 0;
@@ -7286,6 +7343,194 @@ public:
         if (logged++ < 3)
             Log("screen-space shadows: sun at %.1f, %.1f px (w %+.0f), %d dispatches, far %.1f m, %ux%u", list.LightCoordinate_Shader[0],
                 list.LightCoordinate_Shader[1], list.LightCoordinate_Shader[3], list.DispatchCount, m_sssFar, w, h);
+    }
+
+    // The depth pyramid (kHizShader): R32F with 7 levels at the z-prepass target's size, all levels as unordered access
+    // while it is built, then read by the water's pixel shader (CryMT_HiZSampler).
+    bool EnsureHizPipeline()
+    {
+        if (m_hizInitPso || m_hizFailed)
+            return m_hizInitPso != nullptr;
+        m_hizFailed = true;
+        using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+        auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+        if (!compile || !g_serializeRoot)
+            return false;
+        ID3DBlob* code[2] = {};
+        const char* entries[2] = {"hizInit", "hizDown"};
+        for (int i = 0; i < 2; i++)
+        {
+            ID3DBlob* errors = nullptr;
+            if (FAILED(compile(kHizShader, strlen(kHizShader), "CryMT_HiZ", nullptr, nullptr, entries[i], "cs_5_0", 1 << 15, 0, &code[i], &errors)))
+            {
+                Log("depth pyramid shader %s: %s", entries[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
+                if (errors)
+                    errors->Release();
+                return false;
+            }
+            if (errors)
+                errors->Release();
+        }
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 2}};
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.Num32BitValues = 6;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable = {2, ranges};
+        D3D12_ROOT_SIGNATURE_DESC rd{};
+        rd.NumParameters = 2;
+        rd.pParameters = params;
+        ID3DBlob* blob = nullptr;
+        ID3DBlob* rootErrors = nullptr;
+        HRESULT hr = g_serializeRoot(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rootErrors);
+        if (SUCCEEDED(hr))
+            hr = g.dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                            reinterpret_cast<void**>(&m_hizRoot));
+        if (blob)
+            blob->Release();
+        if (rootErrors)
+            rootErrors->Release();
+        ID3D12PipelineState** psos[2] = {&m_hizInitPso, &m_hizDownPso};
+        for (int i = 0; i < 2; i++)
+        {
+            if (SUCCEEDED(hr))
+            {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+                pd.pRootSignature = m_hizRoot;
+                pd.CS = {code[i]->GetBufferPointer(), code[i]->GetBufferSize()};
+                hr = g.dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(psos[i]));
+            }
+            code[i]->Release();
+        }
+        if (FAILED(hr))
+        {
+            if (m_hizInitPso)
+                m_hizInitPso->Release();
+            m_hizInitPso = nullptr;
+        }
+        m_hizFailed = FAILED(hr);
+        Log("depth pyramid pipeline: %s", SUCCEEDED(hr) ? "ready" : "failed");
+        return SUCCEEDED(hr);
+    }
+
+    void RunHiz()
+    {
+        TextureCore* z = m_zTargetFrame == m_frame ? m_zTarget : nullptr;
+        if (!z || !z->res || z->samples != 1 || !z->width || !z->height || !EnsureHizPipeline())
+            return;
+        const UINT w = z->width, h = z->height;
+        if (!m_hiz.res || m_hiz.width != w || m_hiz.height != h)
+        {
+            DeferRelease(m_hiz.res);
+            m_hiz.res = nullptr;
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = w;
+            d.Height = h;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = kHizLevels;
+            d.Format = DXGI_FORMAT_R32_FLOAT;
+            d.SampleDesc.Count = 1;
+            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_hiz.res))))
+            {
+                m_hiz.res = nullptr;
+                m_hiz.width = m_hiz.height = 0;
+                return;
+            }
+            m_hiz.width = w;
+            m_hiz.height = h;
+            m_hiz.format = DXGI_FORMAT_R32_FLOAT;
+            m_hiz.samples = 1;
+            m_hiz.mips = kHizLevels;
+            m_hiz.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            if (!m_hizSrv.ptr)
+                m_hizSrv = g_srvCpu.Alloc();
+            g.dev->CreateShaderResourceView(m_hiz.res, nullptr, m_hizSrv);
+            for (UINT m = 0; m < kHizLevels; m++)
+            {
+                if (!m_hizUav[m].ptr)
+                    m_hizUav[m] = g_srvCpu.Alloc();
+                D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+                ud.Format = DXGI_FORMAT_R32_FLOAT;
+                ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                ud.Texture2D.MipSlice = m;
+                g.dev->CreateUnorderedAccessView(m_hiz.res, nullptr, &ud, m_hizUav[m]);
+            }
+            Log("depth pyramid %ux%u, %u levels", w, h, kHizLevels);
+        }
+        TextureCore* hw = m_dsv ? static_cast<TextureCore*>(m_dsv->info) : nullptr;
+        if (hw && (hw->width != w || hw->height != h || hw->samples != 1 || !hw->res))
+            hw = nullptr;
+        Require(z, kSrvState);
+        if (hw)
+            Require(hw, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu0;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu0;
+        while (!m_srvRing.TryAlloc(4 * kHizLevels, cpu0, gpu0))
+        {
+            Submit();
+            WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
+            PollFence();
+            m_srvRing.Reclaim();
+        }
+        Require(&m_hiz, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        FlushBarriers();
+        m_list->SetComputeRootSignature(m_hizRoot);
+        UINT sw = w, sh = h;
+        for (UINT m = 0; m < kHizLevels; m++)
+        {
+            const UINT dw = std::max(1u, w >> m), dh = std::max(1u, h >> m);
+            const D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu0.ptr + 4 * m * g.srvInc};
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu0.ptr + 4 * m * g.srvInc};
+            if (m == 0)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+                sd.Format = DXGI_FORMAT_R32_FLOAT;
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sd.Texture2D.MipLevels = 1;
+                g.dev->CreateShaderResourceView(z->res, &sd, cpu);
+                if (hw)
+                {
+                    sd.Format = DepthSrvFormat(hw->format);
+                    g.dev->CreateShaderResourceView(hw->res, &sd, {cpu.ptr + g.srvInc});
+                }
+                else
+                    g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
+            else
+            {
+                g.dev->CopyDescriptorsSimple(1, cpu, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            }
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_hizUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 3 * g.srvInc}, m_hizUav[m ? m - 1 : 0], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            uint32_t k[6] = {dw, dh, sw, sh, 0, hw ? 1u : 0u};
+            memcpy(&k[4], &m_hizNearOverFar, sizeof(float));
+            const float one = 1.0f, zero = 0.0f;
+            memcpy(&k[5], hw ? &one : &zero, sizeof(float));
+            if (m > 0)
+            {
+                D3D12_RESOURCE_BARRIER uav{};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav.UAV.pResource = m_hiz.res;
+                m_list->ResourceBarrier(1, &uav);
+            }
+            m_list->SetPipelineState(m ? m_hizDownPso : m_hizInitPso);
+            m_list->SetComputeRoot32BitConstants(0, 6, k, 0);
+            m_list->SetComputeRootDescriptorTable(1, gpu);
+            m_list->Dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
+            sw = dw;
+            sh = dh;
+        }
+        RestoreListState();
+        m_hizFrame = m_frame;
+        m_stats.hizRuns++;
     }
 
     bool PsReads(const ResourceInfo* placeholder) const
@@ -9055,7 +9300,7 @@ public:
         static const char* const opacity[] = {"ЭКРАН И ГЕОМЕТРИЯ|SCREEN+GEOMETRY", "ГЕОМЕТРИЯ|GEOMETRY"};
         static const char* const cache[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "КАЖДЫЙ 4-Й|EVERY 4TH"};
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE"};
-        static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP"};
+        static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
         static const std::vector<PanelItem> items = {
             // GI
@@ -9127,7 +9372,7 @@ public:
             {3, "Отражения|Reflections", 0, 1, 1, true, env, 0, nullptr,
              [] { const int v = g_giControl.env; return v < 0 ? (EnvDefaultOn() ? 1 : 0) : v; }, [] { return EnvDefaultOn() ? 1 : 0; },
              [](int v) { g_giControl.env = v; }, true, nullptr},
-            {3, "Отражение воды|Water reflection", 0, 1, 1, true, water, 0, nullptr, [] { return WaterCubeOn() ? 1 : 0; },
+            {3, "Отражение воды|Water reflection", 0, 2, 1, true, water, 0, nullptr, [] { return WaterMode(); },
              [] { return 0; },
              [](int v) {
                  g_giControl.waterCube = v;
@@ -10240,6 +10485,18 @@ private:
     bool m_sssSun = false;
     TextureCore* m_zTarget = nullptr;
     uint64_t m_zTargetFrame = ~0ull;
+    // The depth pyramid for the water's SSR (RunHiz): the texture with all levels, its view, a UAV per level, the
+    // pipelines, the frames it was tried and made in, near / far from the frame's camera.
+    static constexpr UINT kHizLevels = 7;
+    TextureCore m_hiz{};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_hizSrv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_hizUav[kHizLevels] = {};
+    ID3D12RootSignature* m_hizRoot = nullptr;
+    ID3D12PipelineState* m_hizInitPso = nullptr;
+    ID3D12PipelineState* m_hizDownPso = nullptr;
+    bool m_hizFailed = false;
+    uint64_t m_hizTriedFrame = ~0ull, m_hizFrame = ~0ull;
+    float m_hizNearOverFar = 0;
     ID3D12PipelineState* m_giPso = nullptr;       // trace
     ID3D12PipelineState* m_giPsoFilter = nullptr; // blur + temporal blend
     ID3D12Resource* m_giRaw = nullptr;            // traced result before the filter (unordered access between passes)
@@ -10889,6 +11146,17 @@ bool Device::ApplyOnce(bool indexed)
     // Bend's screen-space shadows: made once a frame, before the first draw reading them after the frame's z-prepass
     // (the deferred shadow pass). fragLib's materials read them too, some before the z-prepass (they get none): the
     // first such draw took the frame's turn and found no depth (0 frames made).
+    // The water's depth pyramid: once a frame, before the first draw reading it (the ocean), after the z-prepass.
+    if (m_ps && g_hizPlaceholder && m_hizTriedFrame != m_frame && m_zTargetFrame == m_frame && PsReads(g_hizPlaceholder))
+    {
+        m_hizTriedFrame = m_frame;
+        if (WaterSsrOn())
+        {
+            PassName("CryMT HiZ");
+            RunHiz();
+            PassNameEnd();
+        }
+    }
     if (m_ps && g_sssPlaceholder && m_sssTriedFrame != m_frame && m_zTargetFrame == m_frame && PsReads(g_sssPlaceholder))
     {
         m_sssTriedFrame = m_frame;
@@ -11090,6 +11358,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                     Require(m_foliageSrv->info, kSrvState);
                 if (s == kPS && v->info == g_sssPlaceholder && m_sssFrame == m_frame)
                     Require(&m_sss, kSrvState);
+                if (s == kPS && v->info == g_hizPlaceholder && m_hizFrame == m_frame)
+                    Require(&m_hiz, kSrvState);
                 // The deferred shadow pass (patched ShadowMaskGen: it reads the frame texture) draws into the screen's
                 // shadow mask (the sun in red, as the shaders read it): kept for GTAO.
                 if (s == kPS && v->info == g_jitterPlaceholder && m_rtv[0] && m_rtv[0]->samples == 1 && m_rtv[0] != m_shadowMaskRtv)
@@ -11161,6 +11431,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = m_foliageSrv->cpu;
             if (v && s == kPS && v->info == g_sssPlaceholder && m_sssFrame == m_frame)
                 src[i] = m_sssSrv;
+            if (v && s == kPS && v->info == g_hizPlaceholder && m_hizFrame == m_frame)
+                src[i] = m_hizSrv;
             if (v && s == kPS && m_pvolBuilt && m_pvolCpu.ptr && v->info == g_pvolPlaceholder && Gi().on && Gi().particlesGi)
                 src[i] = m_pvolCpu;
         }
@@ -11690,6 +11962,21 @@ bool IsSssPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DAT
     return true;
 }
 
+// Textures/CryMT/hiz.dds: CryMT's 2x1 placeholder for the water's depth pyramid (patched Water.cfx): red zero in both
+// texels (no surface), the second texel 007C007C (the mark).
+bool IsHizPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
+{
+    if (!init || !init->pSysMem || d.Width != 2 || d.Height != 1 || d.ArraySize != 1 ||
+        (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+         d.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
+        return false;
+    const auto* p = static_cast<const uint8_t*>(init->pSysMem);
+    for (int i = 0; i < 8; i++)
+        if (p[i] != (i == 5 || i == 7 ? 0x7C : 0))
+            return false;
+    return true;
+}
+
 // Textures/CryMT/waterenv.dds: CryMT's placeholder for the water's reflection cube (patched Water.cfx): a 2x2 cube, alpha 0
 // everywhere, face 0's second texel 003D3D3D (the mark).
 bool IsWaterEnvPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
@@ -11770,6 +12057,11 @@ HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SU
     {
         g_sssPlaceholder = Info(t);
         Log("screen-space shadows placeholder texture recognized");
+    }
+    else if (IsHizPlaceholder(*desc, init))
+    {
+        g_hizPlaceholder = Info(t);
+        Log("depth pyramid placeholder texture recognized");
     }
     else if (desc->Width == 4 && desc->Height <= 4 && Gi().on)
     {
@@ -13342,6 +13634,7 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  drawn: %.2f M vertices/indices per frame (all passes; triangle lists: / 3)\n", s.vertices / frames / 1e6);
     fprintf(f, "  foliage mask: written in %llu frames; R32F draws with depth %.1f per frame, with SV_Target1 %.1f\n", static_cast<unsigned long long>(s.foliageFrames),
             s.zpassDraws / frames, s.zpassTarget1 / frames);
+    fprintf(f, "  water SSR: depth pyramid built in %llu frames\n", static_cast<unsigned long long>(s.hizRuns));
     fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu\n",
             static_cast<unsigned long long>(s.sssRuns), s.sssRuns ? static_cast<double>(s.sssDispatches) / s.sssRuns : 0.0,
             static_cast<unsigned long long>(s.sssNoDepth));

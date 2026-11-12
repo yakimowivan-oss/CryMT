@@ -44,6 +44,7 @@ $files = [ordered]@{
     'CryMT/licenses/streamline.license.txt'   = "$root\sdk\streamline-v2.14.16\license.txt"
     'CryMT/licenses/webview2.license.txt'     = "$root\sdk\webview2\pkg\LICENSE.txt"
     'CryMT/licenses/bend_sss.license.txt'     = "$root\src\crymt\BendSss.LICENSE.txt"
+    'CryMT/licenses/fidelityfx.license.txt'   = "$root\src\crymt\FidelityFX.LICENSE.txt"
 }
 foreach ($ui in Get-ChildItem "$root\src\launcher\ui" -File) { $files["CryMT/ui/$($ui.Name)"] = $ui.FullName }
 $keep = [ordered]@{ 'CryMT/cache/d3d12_psos.bin' = "$root\cache\d3d12_psos.bin" }

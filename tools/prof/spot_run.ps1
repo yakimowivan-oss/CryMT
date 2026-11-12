@@ -43,6 +43,10 @@ $defs = [ordered]@{
     full_early = @{Gi = '1'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}} # main released before shadow prep
     nogi_early = @{Gi = '0'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}}
     full_nojitter = @{Gi = '1'; Env = @{CRYMT_DLSS_JITTER = '0'}} # DLAA without the camera jitter (water update test)
+    # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
+    water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
+    water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}
+    water_ssr = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '2'}}
     nogi_gpu = @{Gi = '0'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
 }
 $focus = "$g\CryMT\logs\mt\crymt_focus.txt"
