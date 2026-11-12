@@ -612,6 +612,8 @@ uint8_t* g_fake;
 uint8_t* g_fakeMvStack;
 uint8_t* g_fakeProjStack;
 alignas(16) float g_snapMv[16];
+bool g_bfIdentity = true; // CRYMT_BFIDENTITY=0: BeginFrame invalidates the fake's matrices again (A/B, see TrackViewState)
+bool g_sfQueue = true;    // CRYMT_SFQUEUE=0: the HUD's Scaleform draws stay sync points (A/B, see QueueSfDraw)
 alignas(16) float g_snapProj[16];
 std::atomic<uint64_t> g_snapSeq{0};
 bool g_snapInvalid;
@@ -790,6 +792,8 @@ uint64_t g_permQueued;
 uint64_t g_levelLightQueries;
 uint32_t g_fogContribs; // main's count of the renderer's fog volume contributions this frame
 uint64_t g_fogQueued, g_fogChecks, g_fogMismatch;
+uint64_t g_fillLightsQueued; // EF_ADDFillLight calls queued with a copy (kAddFillLight)
+uint64_t g_sfQueued, g_sfBytes, g_sfFallbacks, g_sfClears; // QueueSfDraw, ClearBuffer queued
 struct ParticleGs // EF_AddParticlesToScene's canUseGS in the fill window
 {
     uint8_t value;  // what the render thread passes and gets back
@@ -1212,8 +1216,11 @@ void WriteStats()
         fprintf(f, "fill polygons queued=%llu, permanent objects queued=%llu, level light queries answered=%llu\n",
                 static_cast<unsigned long long>(g_polysQueued), static_cast<unsigned long long>(g_permQueued),
                 static_cast<unsigned long long>(g_levelLightQueries));
-        fprintf(f, "fill fog contributions queued=%llu checked=%llu mismatches=%llu\n", static_cast<unsigned long long>(g_fogQueued),
-                static_cast<unsigned long long>(g_fogChecks), static_cast<unsigned long long>(g_fogMismatch));
+        fprintf(f, "fill fog contributions queued=%llu checked=%llu mismatches=%llu; fill lights queued=%llu\n", static_cast<unsigned long long>(g_fogQueued),
+                static_cast<unsigned long long>(g_fogChecks), static_cast<unsigned long long>(g_fogMismatch),
+                static_cast<unsigned long long>(g_fillLightsQueued));
+        fprintf(f, "scaleform draws queued=%llu (%.1f KB a frame) fallbacks=%llu, ClearBuffer queued=%llu\n", static_cast<unsigned long long>(g_sfQueued),
+                g_sfBytes / 1024.0 / frames, static_cast<unsigned long long>(g_sfFallbacks), static_cast<unsigned long long>(g_sfClears));
         fprintf(f, "fill mesh SetIndices queued=%llu SetChunk queued=%llu, resource AddRef/Release queued=%llu (releases %llu)\n",
                 static_cast<unsigned long long>(g_meshIndicesQueued), static_cast<unsigned long long>(g_meshChunksQueued),
                 static_cast<unsigned long long>(g_resourceAddRefsQueued), static_cast<unsigned long long>(g_resourceReleasesQueued));
@@ -3552,8 +3559,20 @@ void TrackViewState(uint32_t slot, const CallFrame* f)
         g_invalidReason = static_cast<int>(slot);
         break;
     case kBeginFrame: // measured: changes the modelview matrix every frame, never viewport, camera or projection
-        g_snapMatrixInvalid = true;
-        g_invalidReason = static_cast<int>(slot);
+        // BeginFrame (0x380E4860) loads the identity into the modelview stack's top (FUN_380F0B80) first thing; the
+        // fake's modelview (g_snapMv) does the same, so the snapshot stays usable. The 3D engine's light scissors
+        // (3D+0xFE5A4, before this frame's SetCamera) asked GetProjection/GetModelView twice a frame, a sync point
+        // each at the user's village spot (2026-11-12). Inside 2D mode or font state the top is another matrix.
+        if (g_bfIdentity && g_matrixDepth == 0)
+        {
+            static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            memcpy(g_snapMv, kIdentity, sizeof(kIdentity));
+        }
+        else
+        {
+            g_snapMatrixInvalid = true;
+            g_invalidReason = static_cast<int>(slot);
+        }
         break;
     }
 }
@@ -3673,7 +3692,8 @@ bool IsSpecialMutator(uint32_t idx)
         const int slot = static_cast<int>(idx) - kAuxBase;
         return slot == kAuxFlush || kAuxSpecs[slot].copy;
     }
-    return idx == kBeginFrame || idx == kSwapFogFlag || idx == kDrawDynVB || idx == kGetDynVBPtr || idx == kDraw2dLabel;
+    return idx == kBeginFrame || idx == kSwapFogFlag || idx == kDrawDynVB || idx == kGetDynVBPtr || idx == kDraw2dLabel ||
+           (g_sfQueue && (idx == kSfDrawTriList || idx == kSfDrawLineStrip || idx == kSfDrawGlyphClear || idx == kClearBuffer));
 }
 
 namespace
@@ -4277,6 +4297,58 @@ uintptr_t MirrorCall(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
     return kHandled;
 }
 
+// Scaleform draws (the HUD's Flash movies, GRendererXRender in CrySystem): queued with a copy of their parameters and of
+// what those point to (vertices, 16-bit indices, the transform), so the HUD no longer stops main mid-update until the
+// render thread finished the frame before (2026-11-12, the user's village spot: 5.7 ms a frame, 49 -> 76 FPS without the
+// HUD). Textures are referenced by id; SF_CreateTexture and SF_UpdateTexture stay sync points, which run in order.
+
+bool QueueSfDraw(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
+{
+    const uintptr_t paramsAt = idx == kSfDrawTriList ? rbp[8] : idx == kSfDrawLineStrip ? f->r9 : f->rdx;
+    const auto* src = reinterpret_cast<const uint8_t*>(paramsAt);
+    if (!src)
+        return false;
+    const int fmt = *reinterpret_cast<const int*>(src + 4);
+    const size_t stride = fmt == 1 ? 4 : fmt == 2 ? 8 : fmt == 3 ? 12 : fmt == 4 ? 20 : 0;
+    const void* verts = *reinterpret_cast<const void* const*>(src + 8);
+    const size_t vertBytes = verts ? stride * *reinterpret_cast<const uint32_t*>(src + 0x10) : 0;
+    const void* indices = *reinterpret_cast<const void* const*>(src + 0x18);
+    const size_t indexBytes = indices ? 2 * size_t{*reinterpret_cast<const uint32_t*>(src + 0x20)} : 0;
+    const void* matrix = *reinterpret_cast<const void* const*>(src + 0x28);
+    if ((verts && !stride) || vertBytes > (4u << 20) || indexBytes > (4u << 20))
+        return false;
+    auto* params = static_cast<uint8_t*>(ArenaAlloc(kSfParamsBytes));
+    void* vertCopy = vertBytes ? ArenaAlloc(vertBytes) : nullptr;
+    void* indexCopy = indexBytes ? ArenaAlloc(indexBytes) : nullptr;
+    void* matrixCopy = matrix ? ArenaAlloc(kSfMatrixBytes) : nullptr;
+    if (!params || (vertBytes && !vertCopy) || (indexBytes && !indexCopy) || (matrix && !matrixCopy))
+        return false;
+    memcpy(params, src, kSfParamsBytes);
+    if (vertCopy)
+        memcpy(vertCopy, verts, vertBytes);
+    if (indexCopy)
+        memcpy(indexCopy, indices, indexBytes);
+    if (matrixCopy)
+        memcpy(matrixCopy, matrix, kSfMatrixBytes);
+    *reinterpret_cast<void**>(params + 8) = verts ? vertCopy : nullptr;
+    *reinterpret_cast<void**>(params + 0x18) = indices ? indexCopy : nullptr;
+    *reinterpret_cast<void**>(params + 0x28) = matrixCopy;
+    Command& c = BeginCommand(idx);
+    c.regs = *f;
+    memcpy(c.stack, rbp + 6, sizeof(c.stack));
+    if (idx == kSfDrawTriList)
+        c.stack[2] = reinterpret_cast<uint64_t>(params);
+    else if (idx == kSfDrawLineStrip)
+        c.regs.r9 = reinterpret_cast<uint64_t>(params);
+    else
+        c.regs.rdx = reinterpret_cast<uint64_t>(params);
+    PublishCommand();
+    g_sfQueued++;
+    g_sfBytes += kSfParamsBytes + vertBytes + indexBytes;
+    f->rax = 0;
+    return true;
+}
+
 uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
 {
     if (idx >= static_cast<uint32_t>(kAuxBase))
@@ -4315,6 +4387,30 @@ uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
     case kGetFrameID:
         f->rax = static_cast<uint32_t>((f->rdx & 0xFF) ? g_shadowFrameIdAll : g_shadowFrameId);
         return kHandled;
+    case kSfDrawTriList:
+    case kSfDrawLineStrip:
+    case kSfDrawGlyphClear:
+        if (QueueSfDraw(idx, f, rbp))
+            return kHandled;
+        g_sfFallbacks++;
+        break;
+    case kClearBuffer: // queued, with a copy of the colour when there is one
+    {
+        void* color = f->r8 ? ArenaAlloc(16) : nullptr;
+        if (f->r8 && !color)
+            break;
+        if (color)
+            memcpy(color, reinterpret_cast<const void*>(f->r8), 16);
+        Command& c = BeginCommand(idx);
+        c.regs = *f;
+        if (color)
+            c.regs.r8 = reinterpret_cast<uint64_t>(color);
+        memcpy(c.stack, rbp + 6, sizeof(c.stack));
+        PublishCommand();
+        g_sfClears++;
+        f->rax = 0;
+        return kHandled;
+    }
     case kDraw2dLabel:
     {
         // Draw2dLabel(x, y, size, float* color, bool center, fmt, ...) formats into 256 bytes and
@@ -4579,6 +4675,23 @@ extern "C" uintptr_t GateC(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
                     memcpy(c.stack, rbp + 6, sizeof(c.stack));
                     c.stack[0] = reinterpret_cast<uint64_t>(color);
                     PublishCommand();
+                    f->rax = 0;
+                    return kHandled;
+                }
+            break;
+        case kAddFillLight:
+            // C3DEngine::PrepareLightSourcesForRendering (3D+0x102DD3) once a fill light; it was a sync point every frame
+            // at the user's village spot (2026-11-12). Queued with a copy of the light, as the render thread appends it.
+            if (g_async && f->rdx)
+                if (auto* light = static_cast<uint8_t*>(ArenaAlloc(kFillLightBytes)))
+                {
+                    memcpy(light, reinterpret_cast<const void*>(f->rdx), kFillLightBytes);
+                    Command& c = BeginCommand(idx);
+                    c.regs = *f;
+                    c.regs.rdx = reinterpret_cast<uint64_t>(light);
+                    memcpy(c.stack, rbp + 6, sizeof(c.stack));
+                    PublishCommand();
+                    g_fillLightsQueued++;
                     f->rax = 0;
                     return kHandled;
                 }
@@ -5388,6 +5501,14 @@ void SetPolicies()
     for (int s : {kBeginFrame, kGetDynVBPtr, kDrawDynVB, kEfQuery, kGetFrameID, kSwapFogFlag, kDraw2dLabel, kGetViewport,
                   kGetCamera, kProjectToScreen, kUnProjectFromScreen, kGetModelView, kGetProjection})
         g_policy[s] = kSpecial;
+    // The HUD's Flash draws (QueueSfDraw); CRYMT_SFQUEUE=0 keeps them sync points (A/B).
+    if (g_sfQueue)
+    {
+        for (int s : {kSfDrawTriList, kSfDrawLineStrip, kSfDrawGlyphClear, kClearBuffer})
+            g_policy[s] = kSpecial;
+        for (int s : {kSfConfigMask, kSfFlush})
+            g_policy[s] = kDefer;
+    }
     g_policy[kGetIRenderAuxGeom] = kDirect;
     for (int s = 0; s < kAuxSlots; s++)
         if (kAuxSpecs[s].copy || s == kAuxGetFlags || s == kAuxNoOp || s == kAuxFlush)
@@ -7754,12 +7875,16 @@ bool GameHasFocus()
 // IConsole::ExecuteString is slot 31 (Mod SDK order); the console is gEnv->pConsole (+0x30) of CryAction's gEnv
 // (0x30964AE0, read by IsGamePaused).
 constexpr uintptr_t kCryActionEnv = 0x30964AE0;
+// Waits inside a queue (fast tests): "crymt_wait <seconds>" before the next command instead of the interval;
+// "crymt_waitlevel" until 100 3D scenes were handed over (a level is running; at most 2 minutes).
 struct CommandQueue
 {
     char text[1024];
     size_t next;
     int interval;
     DWORD last;
+    bool hasDelay, waitLevel;
+    DWORD delayMs;
 };
 CommandQueue g_startCommands, g_testCommands;
 
@@ -7847,9 +7972,18 @@ void RunTestCommands()
     const DWORD now = GetTickCount();
     if (!q.last)
         q.last = now;
-    if (now - q.last < static_cast<DWORD>(q.interval) * 1000)
+    if (q.waitLevel)
+    {
+        if (g_dlssFrame < 100 && now - q.last < 120000)
+            return;
+        FocusLog("frame %llu: test commands: level running (scenes %u)", static_cast<unsigned long long>(g_frame), g_dlssFrame);
+        q.waitLevel = false;
+        q.last = now;
+    }
+    if (now - q.last < (q.hasDelay ? q.delayMs : static_cast<DWORD>(q.interval) * 1000))
         return;
     q.last = now;
+    q.hasDelay = false;
     char command[256];
     size_t n = 0;
     while (q.text[q.next] && q.text[q.next] != ';' && n + 1 < sizeof(command))
@@ -7857,6 +7991,17 @@ void RunTestCommands()
     command[n] = 0;
     if (q.text[q.next] == ';')
         q.next++;
+    if (_strnicmp(command, "crymt_wait ", 11) == 0)
+    {
+        q.hasDelay = true;
+        q.delayMs = static_cast<DWORD>(atof(command + 11) * 1000.0);
+        return;
+    }
+    if (_stricmp(command, "crymt_waitlevel") == 0)
+    {
+        q.waitLevel = true;
+        return;
+    }
     // The loader turns the game's edge anti-aliasing off in DLAA mode; that is right only when DLAA runs. Without an RTX
     // card (AMD, Intel, older NVIDIA) Streamline reports no DLSS, and the game keeps its own anti-aliasing.
     // CryMT's own test commands: crymt_statsreset counts the census from here on (a test's place, not the session). Before a
@@ -9155,6 +9300,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         wchar_t level[8] = {};
         if (GetEnvironmentVariableW(L"CRYMT_LEVEL", level, 8))
             g_level = _wtoi(level);
+        g_sfQueue = !(GetEnvironmentVariableW(L"CRYMT_SFQUEUE", level, 8) && wcscmp(level, L"0") == 0);
         SetPolicies();
         if (g_mode == 2 && !GetEnvironmentVariableW(L"CRYMT_NODEFERFREE", level, 8))
             InstallDeferredFree();
@@ -9180,6 +9326,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         if (GetEnvironmentVariableW(L"CRYMT_GI_TIMESPEED", level, 8))
             g_giTimeSpeed = static_cast<float>(_wtof(level));
         GetEnvironmentVariableA("CRYMT_STARTCMD", g_startCommands.text, sizeof(g_startCommands.text));
+        g_bfIdentity = !(GetEnvironmentVariableW(L"CRYMT_BFIDENTITY", level, 8) && wcscmp(level, L"0") == 0);
         if (GetEnvironmentVariableA("CRYMT_TESTCMD", g_testCommands.text, sizeof(g_testCommands.text)))
             g_testCommands.interval = GetEnvironmentVariableW(L"CRYMT_TESTCMDSEC", level, 8) ? _wtoi(level) : 60;
         g_frameLogOn = GetEnvironmentVariableW(L"CRYMT_FRAMELOG", level, 8) != 0 || g_gpuProf;

@@ -329,6 +329,8 @@ enum Slot : int
     kIsFakeDLight = 116,  // 0x380FD720, reads kLightFlags
     kAddDLight = 117,     // 0x38103E10: id = level light count (-1 when fake or past 32), stores the CDLight* in kRdLevelLights
     kUpdateDLight = 118,  // 0x381008E0, updates the light's projector animation
+    kAddFillLight = 119,  // 0x381041E0 (const SFillLight&, 24 bytes): appended to the level's list (renderer+0x17A0+level*16)
+                          // when its cvar (0x382E99C8) is on and the list holds < 512; only the flush reads the list
     kEfQuery = 121,       // 0x3810A730 (id, param)
     kSetClearColor = 124,
     kCreateRenderMesh = 126, // 0x381042E0, 17 arguments
@@ -350,7 +352,15 @@ enum Slot : int
     kResetToDefault = 156,
     kSetMaterialColor = 157,
     kFlushTextMessages = 160,
+    kClearBuffer = 165,      // 0x380DE420 (flags, const ColorF* or null, depth in xmm3); GRendererXRender::BeginSubmitMask
+                             // clears the stencil (4, null) for every Flash mask
     kSet2DMode = 171,
+    // Scaleform (GFx) renderer calls of GRendererXRender (CrySystem), the HUD's Flash movies:
+    kSfConfigMask = 183,     // 0x380FDCB0 (mask op, stencil ref): stencil state only
+    kSfDrawTriList = 184,    // 0x380ACB10 (base vertex, min vertex, vertex count, start index, triangles, params)
+    kSfDrawLineStrip = 185,  // 0x380AD140 (base vertex, lines, params)
+    kSfDrawGlyphClear = 186, // 0x380AD620 (params)
+    kSfFlush = 187,          // 0x380ADB80, no arguments
     // 0x38109690 PushFogVolumeContribution(const ColorF&): appends to kRdFogContributions, returns the index or
     // 0xFFFF when full.
     kPushFogContrib = 194,
@@ -371,6 +381,13 @@ constexpr uint32_t kQueryConstFlag = 0x17;
 constexpr int kRendererSlot201 = 201;
 constexpr uintptr_t kReturnFalseStub = 0x38091100;
 constexpr uintptr_t kQueryFlag17 = 0x382E9BEC;
+constexpr size_t kFillLightBytes = 24; // SFillLight as EF_ADDFillLight copies it (6 floats)
+// SSF_GlobalDrawParams as the Scaleform draws (and the shader parameter setter FUN_3803E670 through renderer+0x28FC0)
+// read it: +0 fill type, +4 vertex format (1/2/3/4: 4/8/12/20-byte vertices), +8 vertices, +0x10 vertex count,
+// +0x18 16-bit indices, +0x20 index count, +0x28 transform matrix pointer (64 bytes, inside GRendererXRender),
+// +0x30/+0x68 texture ids each with a texgen matrix after it, +0xA0 colour transform, +0xC0..+0xCC flags.
+constexpr size_t kSfParamsBytes = 0xD0;
+constexpr size_t kSfMatrixBytes = 64;
 
 // CD3DRenderAuxGeom slots.
 constexpr int kAuxSetFlags = 0;
