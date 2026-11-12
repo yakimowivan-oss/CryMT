@@ -131,6 +131,17 @@ sampler2D CryMT_WaterFrameSampler = sampler_state
   AddressV = Clamp;
 };
 
+// The scene's linear depth (as Water.cfx's sceneDepthSampler, declared after this): 1 for the sky.
+sampler2D CryMT_WaterDepthSampler = sampler_state
+{
+  Texture = $ZTarget;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
 sampler2D CryMT_HiZSampler = sampler_state
 {
   Texture = Textures/CryMT/hiz.dds;
@@ -241,6 +252,17 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   float xR = dot(r, c0.xyz), yR = dot(r, c1.xyz), wR = dot(r, c3.xyz);
   float3 Rh = float3(0.5 * xR + (0.5 + f0.x) * wR, -0.5 * yR + (0.5 + f0.y) * wR, wR);
   float t0 = wR < 0 ? 0.5 * wP / -wR : wP;
+  // The sky and its clouds lie at infinity: the mirrored direction itself is the screen point to look at. Where that point
+  // is on the screen and the scene there is the sky (linear depth 1; not the weapon, which is near), its colour as the
+  // screen shows it (no seams of the cube's faces, the clouds as drawn for this view); faded at the screen's borders.
+  if (wR > 0)
+  {
+    float2 uvSky = Rh.xy / Rh.z;
+    float2 skyEdge = smoothstep(0, 0.04, uvSky) * (1 - smoothstep(0.96, 1, uvSky));
+    float wSky = skyEdge.x * skyEdge.y;
+    if (wSky > 0 && tex2Dlod(CryMT_WaterDepthSampler, float4(uvSky, 0, 0)).r >= 0.999)
+      base.rgb = lerp(base.rgb, tex2Dlod(envMapSamplerRefr, float4(uvSky, 0, 0)).rgb, wSky);
+  }
   float3 Eh = float3(uvP * wP, wP) + t0 * Rh;
   float3 origin = float3(uvP, hz.z / wP);
   float3 endPoint = float3(Eh.xy / Eh.z, hz.z / Eh.z);

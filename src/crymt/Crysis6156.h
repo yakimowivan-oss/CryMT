@@ -58,6 +58,8 @@ constexpr uintptr_t kEnvCubeNoEntities = 0x380D5218;
 // DrawCubeSide's one load of its near plane: movss xmm1, [rip + disp32] (F3 0F 10 0D, 8 bytes) of the 0.25 at 0x3824D628.
 constexpr uintptr_t kEnvCubeNearLoad = 0x380D001B;
 constexpr uintptr_t kEnvCubeNearConst = 0x3824D628;
+// CTerrain (kTerrainGlobal below): its ocean level, the float at +0x1E0 (what I3DEngine::GetWaterLevel(NULL) returns).
+constexpr uintptr_t kTerrainOceanLevel = 0x1E0;
 constexpr uintptr_t kRdCameraX = 0x28D14;            // the camera's position: floats at +0x28D14, +0x28D24, +0x28D34
 // The renderer's temporary depth surfaces (FUN_380212B0 FX_GetDepthSurface(w, h, aa): the first free one of that size,
 // else a new D3D texture and view): pointers at +0x2D848, count +0x2D850; each {int w, h; char busy at +8; ...}. The

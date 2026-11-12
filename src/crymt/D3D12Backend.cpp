@@ -3859,6 +3859,7 @@ public:
     int diffuseSlot = -1; // the texture diffuseMapSampler (the z-prepass's alpha test reads its alpha), -1 none
     bool refractive = false; // water, glass, ice, liquids (no CryMT reflection): see IsRefractiveResource
     int envCubeSlot = -1, env2DSlot = -1; // envMapSamplerCUBE ($EnvironmentCubeMap) / envMapSampler ($Env): the material's env map
+    int waterEnvSamplerSlot = -1;         // Water.cfx's CryMT_WaterEnvSampler (its sampler state: the back end's trilinear clamp)
     bool water = false; // a vertex shader with the constant WaterLevel (WaterOcean.cfx, its z-prepass too): not voxel geometry
     bool discards = false;
     bool writesTarget1 = false; // a pixel shader writing SV_Target1 (the patched z-prepass: the foliage mask)
@@ -3924,6 +3925,8 @@ public:
                 envCubeSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "envMapSampler") == 0)
                 env2DSlot = static_cast<int>(b.BindPoint);
+            if (b.Type == D3D10_SIT_SAMPLER && b.Name && strcmp(b.Name, "CryMT_WaterEnvSampler") == 0)
+                waterEnvSamplerSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_CBUFFER)
                 cbMask |= ((1u << b.BindCount) - 1) << b.BindPoint;
             else if (b.Type == D3D10_SIT_SAMPLER)
@@ -11305,6 +11308,7 @@ private:
     bool m_engineCubeFresh = false; // this render's face replaces the old one (after a jump, a change of the time of day)
     uint64_t m_hdrCubeRuns = 0;
     bool m_engineCubeDumpWanted = false;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_trilinearClamp{}; // the water's sampler for CryMT's cube
     bool m_engineCubePass = false; // between CryMT's "CryMT engine cube" marks (PassName), stream order
     bool m_envReady = false, m_envFailed = false;
     ID3D12Resource* m_pvol = nullptr;         // its atlas: 1024 x 513 RGBA32F (fine, coarse; shares, place row, tints), pvol.dds
@@ -12191,6 +12195,25 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
     }
 
     samplerEnd = std::min(samplerEnd, kTableSamplers);
+    // The water reading CryMT's cube: its sampler is a trilinear clamp of ours (the engine's state for the placeholder was
+    // point: the reflection came out in steps on calm water, and the mips need a linear blend).
+    const int waterSampler = waterEnv.info && m_ps && m_ps->waterEnvSamplerSlot >= 0 && m_ps->waterEnvSamplerSlot < static_cast<int>(samplerEnd)
+                                 ? m_ps->waterEnvSamplerSlot : -1;
+    if (waterSampler >= 0)
+    {
+        st.samplerDirty = true;
+        if (!m_trilinearClamp.ptr)
+        {
+            m_trilinearClamp = g_samplerCpu.Alloc();
+            D3D12_SAMPLER_DESC sd{};
+            sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            sd.MaxAnisotropy = 1;
+            sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+            sd.MaxLOD = D3D12_FLOAT32_MAX;
+            g.dev->CreateSampler(&sd, m_trilinearClamp);
+        }
+    }
     if (samplerEnd && (st.samplerDirty || samplerEnd > st.samplerApplied))
     {
         SamplerKey key;
@@ -12198,6 +12221,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
         key.count = samplerEnd;
         for (UINT i = 0; i < samplerEnd; i++)
             key.ids[i] = st.sampler[i] ? st.sampler[i]->Id() : 0;
+        if (waterSampler >= 0)
+            key.ids[waterSampler] = 0xFFFFFFF0u; // m_trilinearClamp
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
         const auto found = m_samplerTables.find(key);
         if (found != m_samplerTables.end())
@@ -12218,6 +12243,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
             D3D12_CPU_DESCRIPTOR_HANDLE src[kTableSamplers];
             for (UINT i = 0; i < samplerEnd; i++)
                 src[i] = st.sampler[i] ? st.sampler[i]->cpu : g_defaultSampler;
+            if (waterSampler >= 0)
+                src[waterSampler] = m_trilinearClamp;
             const UINT count = samplerEnd;
             g.dev->CopyDescriptors(1, &cpu, &count, samplerEnd, src, nullptr, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
             m_samplerTables.emplace(key, gpu);

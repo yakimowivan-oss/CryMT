@@ -5720,7 +5720,15 @@ void EnvCubeUpdate()
     const float hourStep = hours >= 0 && lastHours >= 0 ? std::fabs(hours - lastHours) : 0.0f;
     const bool timeJump = std::min(hourStep, 24.0f - hourStep) > 0.1f;
     lastHours = hours;
-    if (dx * dx + dy * dy + dz * dz > jump * jump || timeJump)
+    // Under the ocean (the camera below its level) the water is seen from below: its reflections look down at the sea
+    // floor, so the -Z face is drawn, and crossing the level draws the whole cube again.
+    const auto* terrain = *reinterpret_cast<const uint8_t* const*>(kTerrainGlobal);
+    const float ocean = terrain ? *reinterpret_cast<const float*>(terrain + kTerrainOceanLevel) : -1e9f;
+    const bool underwater = cam[2] < ocean;
+    static bool wasUnderwater;
+    const bool waterCrossed = underwater != wasUnderwater;
+    wasUnderwater = underwater;
+    if (dx * dx + dy * dy + dz * dz > jump * jump || timeJump || waterCrossed)
     {
         *reinterpret_cast<int*>(entry + 8) = 0;
         facesDrawn = 0;
@@ -5732,7 +5740,7 @@ void EnvCubeUpdate()
     *reinterpret_cast<int*>(0x382E984C) = 0; // the renderer's "all faces next time" (FUN_380D4F00 clears it after a render)
     // The -Z face only once after a start (the water's reflections look up): CRYMT_ENVCUBE_DOWN=1 / the panel draws it always.
     static const int downBase = EnvCubeSetting("CRYMT_ENVCUBE_DOWN", 0) != 0 ? 1 : 0;
-    const bool downOn = (g_giControl.envCubeDown >= 0 ? g_giControl.envCubeDown.load() : downBase) != 0;
+    const bool downOn = (g_giControl.envCubeDown >= 0 ? g_giControl.envCubeDown.load() : downBase) != 0 || underwater;
     if (*reinterpret_cast<int*>(entry + 8) == 5 && facesDrawn >= 6 && !downOn)
         *reinterpret_cast<int*>(entry + 8) = 0;
     // The face's render target view: made anew for this face (the engine keeps the first one for all).
