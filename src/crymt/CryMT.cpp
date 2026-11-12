@@ -7847,10 +7847,9 @@ void RunTestCommands()
     ConsoleCommand(command);
 }
 
-// GI test keys (CRYMT_GI_KEYS=1, Bin64\CryMT_GI_Test*.bat): the numpad on main while the game has focus (NumLock on);
-// the D3D12 back end applies the switches (GiControl.h) and shows them in a panel. Num0 GI, Num1 voxel cones, Num2 voxel
-// view (off, wire, solid), Num4/Num7 occlusion under cover -/+, Num5/Num8 bounce light -/+, Num9 fast time of day on/off, Num6
-// the start time (CRYMT_GI_STARTTIME, else 11:30) and stopped, Num+/Num- time +/- 1 hour, Num* reset the scales, Num/ panel. CRYMT_GI_STARTTIME sets the
+// The panel's keys (CRYMT_GI_KEYS=1, the launcher's in-game keys): the numpad on main while the game has focus (NumLock
+// on), passed to the panel's item table (D3D12Backend.cpp, Device::PanelKey: tabs, rows, values; GiControl.h holds
+// them, the back end applies them and draws the panel); Num+/Num- the time of day +/- 1 hour. CRYMT_GI_STARTTIME sets the
 // time once 300 world frames in (a level sets its own after the start configs), CRYMT_GI_TIMESPEED the fast speed in
 // game hours per second.
 // The time of day goes through ITimeOfDay (gEnv->p3DEngine (+0x40) vtable 161 GetTimeOfDay; SetTime slot 3, GetTime 4,
@@ -7904,153 +7903,55 @@ void GiHotkeys()
         SetTimeOfDay(hours, false);
     }
     g_giControl.timeOfDay = hours;
-    // e_gsm_cache: Cry3DEngine's CVars object (*0x3022B8E0) +0x368 (registered at 0x3012DDF0).
+    // e_gsm_cache: Cry3DEngine's CVars object (*0x3022B8E0) +0x368, a float (registered at 0x3012DDF0 with its default in
+    // xmm3; read as an int it was never 1, so the old panel key sent "e_gsm_cache 1" every time). The value the loader /
+    // launcher set at the start is the panel's default.
     if (const auto cvars = *reinterpret_cast<const uintptr_t*>(0x3022B8E0))
-        g_giControl.gsmCache = *reinterpret_cast<const int*>(cvars + 0x368);
-    // Home, PgDn, 6 8 9 0 (the main row's digits), "-" and "=": keys the game binds only in multiplayer or not at all.
-    static const int kKeys[24] = {VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4, VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7,
-                                  VK_NUMPAD8, VK_NUMPAD9, VK_MULTIPLY, VK_ADD, VK_SUBTRACT, VK_DIVIDE, VK_DECIMAL,
-                                  VK_HOME, VK_NEXT, '6', '8', '9', '0', VK_OEM_MINUS, VK_OEM_PLUS, VK_OEM_6};
-    const bool focus = GameHasFocus();
-    const auto step = [](std::atomic<float>& v, float by, float most) {
-        const float n = static_cast<float>(static_cast<int>((v + by) * 10.0f + (v + by >= 0 ? 0.5f : -0.5f))) / 10.0f;
-        v = n < 0 ? 0.0f : n > most ? most : n;
-    };
-    for (int i = 0; i < 24; i++)
     {
-        const bool down = focus && (GetAsyncKeyState(kKeys[i]) & 0x8000) != 0;
-        const bool pressed = down && !g_giKeyDown[i];
+        g_giControl.gsmCache = *reinterpret_cast<const float*>(cvars + 0x368) > 0.5f ? 1 : 0;
+        if (g_giControl.gsmDefault < 0 && g_frame >= 120)
+            g_giControl.gsmDefault = g_giControl.gsmCache.load();
+    }
+    // The panel's keys (Device::PanelKey: Num/ show / hide, Num7 / Num9 tab, Num8 / Num2 row, Num4 / Num6 value, Num5
+    // default; the arrows and the value keys repeat while held) and the time of day on Num+ / Num- on any tab.
+    struct Key
+    {
+        int vk, action; // action < 0: the time of day -1 later, -2 earlier
+        bool repeat;
+    };
+    static const Key kKeys[] = {{VK_DIVIDE, kPanelShow, false},  {VK_NUMPAD7, kPanelTabPrev, false}, {VK_NUMPAD9, kPanelTabNext, false},
+                                {VK_NUMPAD8, kPanelUp, true},     {VK_NUMPAD2, kPanelDown, true},     {VK_NUMPAD4, kPanelLess, true},
+                                {VK_NUMPAD6, kPanelMore, true},   {VK_NUMPAD5, kPanelDefault, false}, {VK_ADD, -1, false},
+                                {VK_SUBTRACT, -2, false}};
+    static ULONGLONG downSince[std::size(kKeys)], lastRepeat[std::size(kKeys)];
+    g_giControl.numLockOff = (GetKeyState(VK_NUMLOCK) & 1) == 0;
+    const bool focus = GameHasFocus();
+    const ULONGLONG ms = GetTickCount64();
+    for (size_t i = 0; i < std::size(kKeys); i++)
+    {
+        const bool down = focus && (GetAsyncKeyState(kKeys[i].vk) & 0x8000) != 0;
+        bool fire = false;
+        if (down && !g_giKeyDown[i])
+        {
+            fire = true;
+            downSince[i] = lastRepeat[i] = ms;
+        }
+        else if (down && kKeys[i].repeat && ms - downSince[i] > 400 && ms - lastRepeat[i] >= 110)
+        {
+            fire = true;
+            lastRepeat[i] = ms;
+        }
         g_giKeyDown[i] = down;
-        if (!pressed)
+        if (!fire)
             continue;
-        const float tod = g_giControl.timeOfDay;
-        // The environment maps' page: its own numpad switches (the time keys stay).
-        if (g_giControl.panel && g_giControl.page == 1)
+        if (kKeys[i].action >= 0)
+            Dx12PanelKey(kKeys[i].action);
+        else if (const float tod = g_giControl.timeOfDay; tod >= 0)
         {
-            // The voxels page.
-            bool done = true;
-            switch (kKeys[i])
-            {
-            case VK_NUMPAD0: g_giControl.voxOpacity = g_giControl.voxOpacity == 1 ? 0 : 1; break;
-            case VK_NUMPAD1: g_giControl.geomCache = g_giControl.geomCache == 1 ? 0 : 1; break;
-            case VK_NUMPAD2: g_giControl.view = (g_giControl.view + 1) % 3; break;
-            case VK_NUMPAD3: g_giControl.geometry = g_giControl.geometry > 0 ? 0 : 1; break;
-            default: done = false; break;
-            }
-            if (done)
-            {
-                FocusLog("frame %llu: voxels key %d", static_cast<unsigned long long>(g_frame), kKeys[i]);
-                continue;
-            }
+            const float t = tod + (kKeys[i].action == -1 ? 1.0f : -1.0f);
+            SetTimeOfDay(t >= 24.0f ? t - 24.0f : t < 0.0f ? t + 24.0f : t);
         }
-        if (g_giControl.panel && g_giControl.page == 3)
-        {
-            // The engine page. Num0: the far shadow cascade cache (e_gsm_cache, CryMT's default 1, launcher option), through
-            // the console so the engine's own handling of the change runs.
-            if (kKeys[i] == VK_NUMPAD0)
-            {
-                ConsoleCommand(g_giControl.gsmCache == 1 ? "e_gsm_cache 0" : "e_gsm_cache 1");
-                continue;
-            }
-            // Num1: the Forward+ test (the shaders read it with r_LightsSinglePass 1).
-            if (kKeys[i] == VK_NUMPAD1)
-            {
-                int v = g_giControl.fplus;
-                if (v < 0)
-                {
-                    wchar_t e[8] = {};
-                    v = GetEnvironmentVariableW(L"CRYMT_FPLUS", e, 8) && e[0] == L'1' ? 1 : 0;
-                }
-                g_giControl.fplus = v ? 0 : 1;
-                FocusLog("frame %llu: Forward+ test %s", static_cast<unsigned long long>(g_frame), v ? "off" : "on");
-                continue;
-            }
-        }
-        if (g_giControl.panel && g_giControl.page == 2)
-        {
-            bool done = true;
-            switch (kKeys[i])
-            {
-            case VK_NUMPAD0: g_giControl.env = g_giControl.env == 1 ? 0 : 1; break;
-            case VK_NUMPAD1: g_giControl.envAll = !g_giControl.envAll; break;
-            case VK_NUMPAD4: step(g_giControl.envOwnScale, -0.5f, 8.0f); break;
-            case VK_NUMPAD7: step(g_giControl.envOwnScale, 0.5f, 8.0f); break;
-            case VK_NUMPAD5: step(g_giControl.envAllScale, -0.5f, 8.0f); break;
-            case VK_NUMPAD8: step(g_giControl.envAllScale, 0.5f, 8.0f); break;
-            case VK_MULTIPLY:
-                g_giControl.envOwnScale = 1.0f;
-                g_giControl.envAllScale = 1.0f;
-                break;
-            default: done = false; break;
-            }
-            if (done)
-            {
-                FocusLog("frame %llu: env key %d", static_cast<unsigned long long>(g_frame), kKeys[i]);
-                continue;
-            }
-        }
-        switch (kKeys[i])
-        {
-        case VK_NUMPAD0: g_giControl.enabled = !g_giControl.enabled; break;
-        case VK_NUMPAD1: g_giControl.parts = g_giControl.parts == 1 ? 0 : 1; break;
-        case VK_DECIMAL: g_giControl.weapon = !g_giControl.weapon; break;
-        case VK_NUMPAD2: g_giControl.view = (g_giControl.view + 1) % 3; break;
-        case VK_NUMPAD3: g_giControl.geometry = g_giControl.geometry > 0 ? 0 : 1; break;
-        case VK_NUMPAD4: step(g_giControl.occlusionScale, -0.1f, 3.0f); break;
-        case VK_NUMPAD7: step(g_giControl.occlusionScale, 0.1f, 3.0f); break;
-        case VK_NUMPAD5: step(g_giControl.bounceScale, -0.1f, 4.0f); break;
-        case VK_NUMPAD8: step(g_giControl.bounceScale, 0.1f, 4.0f); break;
-        case VK_NUMPAD9: g_giControl.fastTime = !g_giControl.fastTime; break;
-        case VK_NUMPAD6:
-            g_giControl.fastTime = false;
-            SetTimeOfDay(g_giControl.startTime);
-            break;
-        case VK_ADD:
-        case VK_SUBTRACT:
-            if (tod >= 0)
-            {
-                const float t = tod + (kKeys[i] == VK_ADD ? 1.0f : -1.0f);
-                SetTimeOfDay(t >= 24.0f ? t - 24.0f : t < 0.0f ? t + 24.0f : t);
-            }
-            break;
-        case VK_MULTIPLY:
-            g_giControl.occlusionScale = 1.0f;
-            g_giControl.bounceScale = 1.0f;
-            break;
-        case VK_DIVIDE: // the GI page, the environment maps' page, hidden
-            if (!g_giControl.panel)
-            {
-                g_giControl.page = 0;
-                g_giControl.panel = true;
-            }
-            else if (g_giControl.page < 3)
-                g_giControl.page = g_giControl.page + 1;
-            else
-                g_giControl.panel = false;
-            break;
-        case VK_HOME: g_giControl.contact = g_giControl.contact != 0 ? 0 : 1; break; // -1: the default (on) not yet set
-        case VK_NEXT: g_giControl.gtao = g_giControl.gtao != 0 ? 0 : 1; break;
-        case VK_OEM_MINUS: g_giControl.particles = g_giControl.particles != 0 ? 0 : 1; break; // -1: the default (on) not yet set
-        case VK_OEM_6: g_giControl.fixCopies = g_giControl.fixCopies ? 0 : 1; break; // "]" test: DLSS into the scene's copies (F2: debug teleport)
-        case VK_OEM_PLUS: // "=": the particles' darkening outdoors 50 -> 70 -> 100 -> 150 -> 200 -> 50 %
-        {
-            const int v = g_giControl.particleOut;
-            g_giControl.particleOut = v < 70 ? 70 : v < 100 ? 100 : v < 150 ? 150 : v < 200 ? 200 : 50;
-            break;
-        }
-        case '6':
-        case '8':
-        case '9':
-        case '0':
-        {
-            const int bit = kKeys[i] == '6' ? 2 : kKeys[i] == '8' ? 4 : kKeys[i] == '9' ? 8 : 16;
-            const int v = g_giControl.bakedOff;
-            g_giControl.bakedOff = (v < 0 ? 0 : v) ^ bit;
-            break;
-        }
-        default: break;
-        }
-        FocusLog("frame %llu: GI key %d", static_cast<unsigned long long>(g_frame), kKeys[i]);
+        FocusLog("frame %llu: panel key %d", static_cast<unsigned long long>(g_frame), kKeys[i].vk);
     }
 }
 
@@ -8539,6 +8440,10 @@ void InstallDeferredFree()
 }
 
 } // namespace
+
+// For the panel's item table (D3D12Backend.cpp), on main.
+void CryMTConsoleCommand(const char* command) { ConsoleCommand(command); }
+void CryMTSetTimeOfDay(float hours) { SetTimeOfDay(hours, true); }
 
 extern "C" void __cdecl FenceHook(int reason)
 {

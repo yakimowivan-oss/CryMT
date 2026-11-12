@@ -42,6 +42,8 @@
 #include <string>
 
 uint64_t CryMTWorldFrame(); // CryMT.cpp: world frames since start
+void CryMTConsoleCommand(const char* command); // CryMT.cpp, main thread: the panel's engine settings
+void CryMTSetTimeOfDay(float hours);           // CryMT.cpp, main thread: the panel's time of day
 GiControl g_giControl;
 
 namespace dx12
@@ -8484,118 +8486,323 @@ public:
         }
     }
 
-    // The GI test keys' panel: its lines drawn with GDI (Consolas, bold, about 1/60 of the screen height) into a texture
-    // when they change; placed at the left, centred in height. False when there is none.
+    // The panel (CRYMT_GI_KEYS=1, the launcher's in-game keys): tabs of live settings drawn with GDI (Consolas, bold,
+    // about 1/60 of the screen height) into a texture when they change, at the left, centred in height. Num/ shows or
+    // hides it, Num7 / Num9 the tab, Num8 / Num2 the row, Num4 / Num6 its value -/+ (held: repeats), Num5 its default;
+    // Num+ / Num- move the time of day on any tab (CryMT.cpp). A value off its default (the ini's, CryMT's) is orange
+    // with a star. One PanelItem per setting: its value an int in lo..hi (toggles 0..1, lists index `names`, scales
+    // count steps of `scale`); get / def / set read and write g_giControl (set runs on main, on the keys;
+    // GiApplyControl applies the values at present).
+    struct PanelItem
+    {
+        int tab;
+        const char* label; // "русский|English"
+        int lo, hi, step;
+        bool wrap;                // lists and toggles go round, scales stop at their ends
+        const char* const* names; // per value "русский|English", or null: the value times `scale` by `format`
+        float scale;
+        const char* format;
+        int (*get)();
+        int (*def)();
+        void (*set)(int);
+        bool mark;                         // highlighted off its default (not the time of day)
+        std::string (*text)(bool ru);      // its own text, or null
+    };
+    static constexpr int kPanelTabs = 6;
+    static std::string PanelLang(const char* s, bool ru)
+    {
+        const char* bar = strchr(s, '|');
+        return !bar ? std::string(s) : ru ? std::string(s, bar - s) : std::string(bar + 1);
+    }
+    static bool PanelRussian()
+    {
+        static const bool ru = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN;
+        return ru;
+    }
+    static const char* PanelTabName(int t)
+    {
+        static const char* const names[kPanelTabs] = {"GI|GI", "AO|AO", "Воксели|Voxels", "Отражения|Reflections", "Движок|Engine", "Время|Time"};
+        return names[t];
+    }
+    static bool EnvDefaultOn()
+    {
+        static const bool on = [] {
+            char v[16] = {};
+            return GetEnvironmentVariableA("CRYMT_ENVMAP", v, sizeof(v)) && _stricmp(v, "voxels") == 0;
+        }();
+        return on;
+    }
+    static int BaseParticleOut()
+    {
+        static const int values[5] = {50, 70, 100, 150, 200};
+        const int pct = static_cast<int>(GiBase().particleOutdoor * 100.0f + 0.5f);
+        int best = 0;
+        for (int i = 1; i < 5; i++)
+            if (abs(values[i] - pct) < abs(values[best] - pct))
+                best = i;
+        return best;
+    }
+    template <int Bit> static int BakedGet()
+    {
+        const int v = g_giControl.bakedOff;
+        return ((v < 0 ? GiBase().bakedOff : v) & Bit) ? 1 : 0;
+    }
+    template <int Bit> static int BakedDef() { return (GiBase().bakedOff & Bit) ? 1 : 0; }
+    template <int Bit> static void BakedSet(int on)
+    {
+        const int v = g_giControl.bakedOff, cur = v < 0 ? GiBase().bakedOff : v;
+        g_giControl.bakedOff = on ? cur | Bit : cur & ~Bit;
+    }
+    static const std::vector<PanelItem>& PanelItems()
+    {
+        static const char* const onOff[] = {"ВЫКЛ|OFF", "ВКЛ|ON"};
+        static const char* const parts[] = {"ЭКРАН+ВОКСЕЛИ|SCREEN+VOXELS", "ВОКСЕЛИ|VOXELS"};
+        static const char* const ao[] = {"SSAO ИГРЫ|GAME'S SSAO", "GTAO"};
+        static const char* const outdoor[] = {"50%", "70%", "100%", "150%", "200%"};
+        static const char* const baked[] = {"ДВИЖОК|ENGINE", "GI"};
+        static const char* const view[] = {"ВЫКЛ|OFF", "КАРКАС|WIRE", "СПЛОШНОЙ|SOLID"};
+        static const char* const geometry[] = {"ВЫКЛ|OFF", "ВКЛ|ON", "ВКЛ + ЛИСТВА|ON + FOLIAGE"};
+        static const char* const opacity[] = {"ЭКРАН И ГЕОМЕТРИЯ|SCREEN+GEOMETRY", "ГЕОМЕТРИЯ|GEOMETRY"};
+        static const char* const cache[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "КАЖДЫЙ 4-Й|EVERY 4TH"};
+        static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE"};
+        static const int outdoorValues[5] = {50, 70, 100, 150, 200};
+        static const std::vector<PanelItem> items = {
+            // GI
+            {0, "GI|GI", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.enabled ? 1 : 0; }, [] { return 1; },
+             [](int v) { g_giControl.enabled = v != 0; }, true, nullptr},
+            {0, "Части GI|GI parts", 0, 1, 1, true, parts, 0, nullptr,
+             [] { const int v = g_giControl.parts; return v < 0 ? (GiBase().voxelMix == 2 ? 1 : 0) : v; },
+             [] { return GiBase().voxelMix == 2 ? 1 : 0; }, [](int v) { g_giControl.parts = v; }, true, nullptr},
+            {0, "Окклюзия под укрытием|Occlusion under cover", 0, 30, 1, false, nullptr, 0.1f, "x%.1f",
+             [] { return static_cast<int>(lroundf(g_giControl.occlusionScale * 10.0f)); }, [] { return 10; },
+             [](int v) { g_giControl.occlusionScale = v / 10.0f; }, true, nullptr},
+            {0, "Отражённый свет|Bounce light", 0, 40, 1, false, nullptr, 0.1f, "x%.1f",
+             [] { return static_cast<int>(lroundf(g_giControl.bounceScale * 10.0f)); }, [] { return 10; },
+             [](int v) { g_giControl.bounceScale = v / 10.0f; }, true, nullptr},
+            {0, "На оружии и руках|On weapon and hands", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.weapon ? 1 : 0; },
+             [] { return 1; }, [](int v) { g_giControl.weapon = v != 0; }, true, nullptr},
+            {1, "Затенение|Ambient occlusion", 0, 1, 1, true, ao, 0, nullptr,
+             [] { const int v = g_giControl.gtao; return v < 0 ? (GiBase().replaceSsao ? 1 : 0) : v; },
+             [] { return GiBase().replaceSsao ? 1 : 0; }, [](int v) { g_giControl.gtao = v; }, true, nullptr},
+            {1, "Контактные тени|Contact shadows", 0, 1, 1, true, onOff, 0, nullptr,
+             [] { const int v = g_giControl.contact; return v < 0 ? (GiBase().contactShadows ? 1 : 0) : v; },
+             [] { return GiBase().contactShadows ? 1 : 0; }, [](int v) { g_giControl.contact = v; }, true, nullptr},
+            {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
+             [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
+             [] { return GiBase().particlesGi ? 1 : 0; }, [](int v) { g_giControl.particles = v; }, true, nullptr},
+            {0, "Дым снаружи темнее|Smoke darker outdoors", 0, 4, 1, true, outdoor, 0, nullptr,
+             [] {
+                 const int v = g_giControl.particleOut;
+                 if (v < 0)
+                     return BaseParticleOut();
+                 int best = 0;
+                 for (int i = 1; i < 5; i++)
+                     if (abs(outdoorValues[i] - v) < abs(outdoorValues[best] - v))
+                         best = i;
+                 return best;
+             },
+             [] { return BaseParticleOut(); }, [](int v) { g_giControl.particleOut = outdoorValues[v]; }, true, nullptr},
+            {1, "Запечённый AO: объекты|Baked AO: objects (RAM)", 0, 1, 1, true, baked, 0, nullptr, BakedGet<2>, BakedDef<2>,
+             BakedSet<2>, true, nullptr},
+            {1, "Запечённый AO: небо|Baked AO: objects' sky", 0, 1, 1, true, baked, 0, nullptr, BakedGet<4>, BakedDef<4>,
+             BakedSet<4>, true, nullptr},
+            {1, "Запечённый AO: деревья|Baked AO: under trees", 0, 1, 1, true, baked, 0, nullptr, BakedGet<8>, BakedDef<8>,
+             BakedSet<8>, true, nullptr},
+            {1, "Запечённый AO: террейн|Baked AO: terrain", 0, 1, 1, true, baked, 0, nullptr, BakedGet<16>, BakedDef<16>,
+             BakedSet<16>, true, nullptr},
+            // Voxels
+            {2, "Вид вокселей|Voxel view", 0, 2, 1, true, view, 0, nullptr, [] { return g_giControl.view.load(); }, [] { return 0; },
+             [](int v) { g_giControl.view = v; }, true, nullptr},
+            {2, "Геометрия в вокселях|Geometry in voxels", 0, 2, 1, true, geometry, 0, nullptr,
+             [] {
+                 const int v = g_giControl.geometry;
+                 return v >= 0 ? v : GiBase().geometry ? (GiBase().geometryFoliage ? 2 : 1) : 0;
+             },
+             [] { return GiBase().geometry ? (GiBase().geometryFoliage ? 2 : 1) : 0; }, [](int v) { g_giControl.geometry = v; }, true,
+             nullptr},
+            {2, "Непрозрачность из|Opacity from", 0, 1, 1, true, opacity, 0, nullptr,
+             [] { const int v = g_giControl.voxOpacity; return v < 0 ? (GiBase().opacityGeometry ? 1 : 0) : v; },
+             [] { return GiBase().opacityGeometry ? 1 : 0; }, [](int v) { g_giControl.voxOpacity = v; }, true, nullptr},
+            {2, "Неизменные объекты|Unchanged objects", 0, 1, 1, true, cache, 0, nullptr,
+             [] { const int v = g_giControl.geomCache; return v < 0 ? (GiBase().geometryCache ? 1 : 0) : v; },
+             [] { return GiBase().geometryCache ? 1 : 0; }, [](int v) { g_giControl.geomCache = v; }, true, nullptr},
+            // Reflections
+            {3, "Отражения|Reflections", 0, 1, 1, true, env, 0, nullptr,
+             [] { const int v = g_giControl.env; return v < 0 ? (EnvDefaultOn() ? 1 : 0) : v; }, [] { return EnvDefaultOn() ? 1 : 0; },
+             [](int v) { g_giControl.env = v; }, true, nullptr},
+            {3, "На всех материалах|On every material", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.envAll ? 1 : 0; },
+             [] { return 1; }, [](int v) { g_giControl.envAll = v != 0; }, true, nullptr},
+            {3, "Материалы со своей картой|Materials with a map", 0, 16, 1, false, nullptr, 0.5f, "x%.1f",
+             [] { return static_cast<int>(lroundf(g_giControl.envOwnScale * 2.0f)); }, [] { return 2; },
+             [](int v) { g_giControl.envOwnScale = v / 2.0f; }, true, nullptr},
+            {3, "Все материалы|Every material", 0, 16, 1, false, nullptr, 0.5f, "x%.1f",
+             [] { return static_cast<int>(lroundf(g_giControl.envAllScale * 2.0f)); }, [] { return 2; },
+             [](int v) { g_giControl.envAllScale = v / 2.0f; }, true, nullptr},
+            // Engine
+            {4, "Кэш дальних теней|Far shadow cache", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.gsmCache > 0 ? 1 : 0; },
+             [] { const int d = g_giControl.gsmDefault; return d < 0 ? (g_giControl.gsmCache > 0 ? 1 : 0) : d; },
+             [](int v) {
+                 CryMTConsoleCommand(v ? "e_gsm_cache 1" : "e_gsm_cache 0"); // through the console: the engine's own handling
+                 g_giControl.gsmCache = v;
+             },
+             true, [](bool ru) { return std::string(g_giControl.gsmCache < 0 ? "?" : g_giControl.gsmCache ? (ru ? "ВКЛ" : "ON") : (ru ? "ВЫКЛ" : "OFF")); }},
+            {4, "DLAA в копиях кадра|DLAA into the frame's copies", 0, 1, 1, true, onOff, 0, nullptr,
+             [] { return g_giControl.fixCopies ? 1 : 0; },
+             [] {
+                 wchar_t t[8] = {};
+                 return GetEnvironmentVariableW(L"CRYMT_DLSS_FIXCOPIES", t, 8) && wcscmp(t, L"0") == 0 ? 0 : 1;
+             },
+             [](int v) { g_giControl.fixCopies = v; }, true, nullptr},
+            // Time
+            {5, "Время суток|Time of day", 0, 47, 2, true, nullptr, 0, nullptr,
+             [] { const float t = g_giControl.timeOfDay; return t < 0 ? 0 : static_cast<int>(lroundf(t * 2.0f)) % 48; },
+             [] { return static_cast<int>(lroundf(g_giControl.startTime * 2.0f)) % 48; },
+             [](int v) { CryMTSetTimeOfDay(v * 0.5f); }, false,
+             [](bool) {
+                 const float t = g_giControl.timeOfDay;
+                 if (t < 0)
+                     return std::string("?");
+                 const int minutes = static_cast<int>(t * 60.0f + 0.5f) % (24 * 60);
+                 char b[16];
+                 snprintf(b, sizeof(b), "%02d:%02d", minutes / 60, minutes % 60);
+                 return std::string(b);
+             }},
+            {5, "Ускоренное время|Fast time", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.fastTime ? 1 : 0; },
+             [] { return 0; }, [](int v) { g_giControl.fastTime = v != 0; }, true, nullptr},
+        };
+        return items;
+    }
+
+    // A key of the panel (main thread, CryMT.cpp's GiHotkeys).
+    static void PanelKey(int action)
+    {
+        GiControl& c = g_giControl;
+        if (action == kPanelShow)
+        {
+            c.panel = !c.panel;
+            return;
+        }
+        if (!c.panel)
+            return;
+        const int tab = c.tab;
+        if (action == kPanelTabPrev || action == kPanelTabNext)
+        {
+            c.tab = (tab + (action == kPanelTabNext ? 1 : kPanelTabs - 1)) % kPanelTabs;
+            return;
+        }
+        std::vector<const PanelItem*> rows;
+        for (const PanelItem& it : PanelItems())
+            if (it.tab == tab)
+                rows.push_back(&it);
+        if (rows.empty())
+            return;
+        const int n = static_cast<int>(rows.size());
+        int row = std::min(std::max(c.rows[tab].load(), 0), n - 1);
+        if (action == kPanelUp || action == kPanelDown)
+        {
+            c.rows[tab] = (row + (action == kPanelDown ? 1 : n - 1)) % n;
+            return;
+        }
+        const PanelItem& it = *rows[row];
+        int v = it.get();
+        if (action == kPanelDefault)
+            v = it.def();
+        else
+        {
+            v += action == kPanelMore ? it.step : -it.step;
+            const int range = it.hi - it.lo + 1;
+            v = it.wrap ? it.lo + ((v - it.lo) % range + range) % range : std::min(std::max(v, it.lo), it.hi);
+        }
+        it.set(v);
+        Log("panel: %s = %d", PanelLang(it.label, false).c_str(), v);
+    }
+
+    static std::wstring Wide(const std::string& s)
+    {
+        std::wstring w(s.size(), L'\0');
+        const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), &w[0], static_cast<int>(w.size()));
+        w.resize(n > 0 ? n : 0);
+        return w;
+    }
+
+    // The panel into its texture when it changed. False when there is none.
     bool UpdatePanel(UINT screenW, UINT screenH)
     {
         if (!g_giControl.active || !g_giControl.panel)
             return false;
+        const bool ru = PanelRussian();
         const GiSettings& b = GiBase();
-        const GiSettings& live = Gi();
-        const COLORREF white = RGB(235, 235, 235), on = RGB(90, 235, 90), off = RGB(240, 90, 80), value = RGB(250, 210, 90);
+        const COLORREF white = RGB(225, 225, 225), dim = RGB(140, 150, 165), changed = RGB(255, 165, 60), title = RGB(250, 210, 90),
+                       warn = RGB(240, 90, 80), barColour = RGB(28, 46, 78);
         struct Line
         {
-            std::string keys, label, state;
-            COLORREF colour;
+            std::wstring left, right;
+            COLORREF lc, rc;
+            bool bar; // the selected row's background
         };
-        char buf[96];
         std::vector<Line> lines;
-        if (g_giControl.page == 1)
+        const int tab = std::min(std::max(g_giControl.tab.load(), 0), kPanelTabs - 1);
+        if (g_giControl.numLockOff)
+            lines.push_back({Wide(ru ? "NumLock выключен: включите его" : "NumLock is off: turn it on"), L"", warn, warn, false});
+        // The tabs: the current one in brackets.
         {
-            lines.push_back({"", "CryMT voxels", "", value});
-            const bool geomOnly = g_giControl.voxOpacity == 1;
-            lines.push_back({"Num0", "Opacity from", geomOnly ? "GEOMETRY" : "SCREEN+GEOMETRY", geomOnly ? on : value});
-            const bool cache = g_giControl.geomCache == 1;
-            lines.push_back({"Num1", "Unchanged objects", cache ? "EVERY 4TH FRAME" : "EVERY FRAME", cache ? on : value});
-            const int view = g_giControl.view;
-            lines.push_back({"Num2", "Voxel view", view == 0 ? "OFF" : view == 1 ? "WIRE" : "SOLID", view ? on : off});
-            const int geometry = g_giControl.geometry;
-            lines.push_back({"Num3", "Voxel geometry", geometry > 0 ? "ON" : "OFF", geometry > 0 ? on : off});
-            lines.push_back({"", "(GEOMETRY: the screen gives the colour only)", "", white});
-            lines.push_back({"Num/", "reflections", "", white});
+            std::string t = "CryMT ";
+            for (int i = 0; i < kPanelTabs; i++)
+                t += (i == tab ? "[" : " ") + PanelLang(PanelTabName(i), ru) + (i == tab ? "]" : " ");
+            lines.push_back({Wide(t), L"", title, title, false});
         }
-        else if (g_giControl.page == 3)
+        std::vector<const PanelItem*> rows;
+        for (const PanelItem& it : PanelItems())
+            if (it.tab == tab)
+                rows.push_back(&it);
+        const int selected = rows.empty() ? -1 : std::min(std::max(g_giControl.rows[tab].load(), 0), static_cast<int>(rows.size()) - 1);
+        for (int i = 0; i < static_cast<int>(rows.size()); i++)
         {
-            lines.push_back({"", "CryMT engine", "", value});
-            const int gsm = g_giControl.gsmCache;
-            lines.push_back({"Num0", "Far shadow cache", gsm < 0 ? "?" : gsm ? "ON" : "OFF", gsm > 0 ? on : off});
-            lines.push_back({"", "(far cascades redrawn less often)", "", white});
-            const bool fplus = FPlusOn();
-            lines.push_back({"Num1", "Forward+ lamps (test)", !g_fplusPlaceholder ? "NO SHADERS" : fplus ? "ON" : "OFF", fplus ? on : off});
-            snprintf(buf, sizeof(buf), "%u lamps, %u on screen, %u tiles, max %u", m_fplusStats.lamps, m_fplusStats.onScreen,
-                     m_fplusStats.litTiles, m_fplusStats.maxPerTile);
-            lines.push_back({"", fplus ? buf : "(needs r_LightsSinglePass 1)", "", white});
-            lines.push_back({"Num/", "hide panel", "", white});
-        }
-        else if (g_giControl.page == 2)
-        {
-            lines.push_back({"", "CryMT environment maps", "", value});
-            if (!b.on)
-                lines.push_back({"", "They need the GI on (GI=1)", "", off});
-            const bool envOn = EnvOn();
-            lines.push_back({"Num0", "Reflections", envOn ? "VOXEL CUBE" : "GAME'S MAPS", envOn ? on : off});
-            const bool all = g_giControl.envAll;
-            lines.push_back({"Num1", "On every material", all ? "ON" : "OFF", all ? on : off});
-            snprintf(buf, sizeof(buf), "x%.1f", g_giControl.envOwnScale.load());
-            lines.push_back({"Num4 Num7", "Materials with a map -/+", buf, value});
-            snprintf(buf, sizeof(buf), "x%.1f", g_giControl.envAllScale.load());
-            lines.push_back({"Num5 Num8", "Every material -/+", buf, value});
-            lines.push_back({"", "(not vegetation, terrain)", "", white});
-            lines.push_back({"Num*", "Reset   Num/ engine", "", white});
-        }
-        else
-        {
-        lines.push_back({"", "CryMT GI", "", value});
-        if (!b.on)
-            lines.push_back({"", "GI is off in CryMT.ini (GI=1)", "", off});
-        lines.push_back({"Num0", "GI", live.on ? "ON" : "OFF", live.on ? on : off});
-        const int parts = g_giControl.parts;
-        lines.push_back({"Num1", "GI parts", parts == 1 ? "VOXELS" : "SCREEN+VOXELS", parts == 0 ? on : value});
-        const int view = g_giControl.view;
-        lines.push_back({"Num2", "Voxel view", view == 0 ? "OFF" : view == 1 ? "WIRE" : "SOLID", view ? on : off});
-        const int geometry = g_giControl.geometry;
-        lines.push_back({"Num3", "Voxel geometry", geometry > 0 ? "ON" : "OFF", geometry > 0 ? on : off});
-        lines.push_back({"Num.", "GI on weapon/hands", g_giControl.weapon ? "ON" : "OFF", g_giControl.weapon ? on : off});
-        lines.push_back({"PgDn", "Ambient occlusion", g_giControl.gtao > 0 ? "GTAO" : "SSAO", g_giControl.gtao > 0 ? on : value});
-        lines.push_back({"Home", "Contact shadows", g_giControl.contact > 0 ? "ON" : "OFF", g_giControl.contact > 0 ? on : off});
-        lines.push_back({"-", "GI on smoke/dust", g_giControl.particles > 0 ? "ON" : "OFF", g_giControl.particles > 0 ? on : off});
-        lines.push_back({"]", "DLSS into the scene's copies", g_giControl.fixCopies ? "ON" : "OFF", g_giControl.fixCopies ? on : off});
-        snprintf(buf, sizeof(buf), "%d%%", g_giControl.particleOut.load());
-        lines.push_back({"=", "Smoke/dust darkening outdoors", buf, value});
-        {
-            const int bakedOff = g_giControl.bakedOff > 0 ? g_giControl.bakedOff.load() : 0;
-            const char* const names[4] = {"Baked AO: objects (RAM)", "Baked AO: objects' sky", "Baked AO: under trees", "Baked AO: terrain"};
-            const char* const keys[4] = {"6", "8", "9", "0"};
-            for (int i = 0; i < 4; i++)
+            const PanelItem& it = *rows[i];
+            const int v = it.get();
+            std::string value;
+            if (it.text)
+                value = it.text(ru);
+            else if (it.names)
+                value = PanelLang(it.names[std::min(std::max(v, it.lo), it.hi) - it.lo], ru);
+            else
             {
-                const bool kept = (bakedOff & (2 << i)) == 0;
-                lines.push_back({keys[i], names[i], kept ? "ENGINE" : "GI -> BAKED", kept ? off : on});
+                char buf[32];
+                snprintf(buf, sizeof(buf), it.format, v * it.scale);
+                value = buf;
             }
+            const bool off = it.mark && v != it.def();
+            lines.push_back({Wide((i == selected ? "> " : "  ") + PanelLang(it.label, ru) + (off ? " *" : "")), Wide(value),
+                             i == selected ? white : RGB(200, 200, 200), off ? changed : white, i == selected});
         }
-        snprintf(buf, sizeof(buf), "x%.1f", g_giControl.occlusionScale.load());
-        lines.push_back({"Num4 Num7", "Indoor occlusion -/+", buf, value});
-        snprintf(buf, sizeof(buf), "x%.1f", g_giControl.bounceScale.load());
-        lines.push_back({"Num5 Num8", "Bounce light -/+", buf, value});
-        const float tod = g_giControl.timeOfDay;
-        if (tod >= 0)
+        // Notes of the tab, then the keys.
+        std::vector<std::string> notes;
+        if (tab == 0 && !b.on)
+            notes.push_back(ru ? "GI выключен в CryMT.ini (GI=1)" : "GI is off in CryMT.ini (GI=1)");
+        if (tab == 3)
         {
-            const int minutes = static_cast<int>(tod * 60.0f + 0.5f) % (24 * 60);
-            snprintf(buf, sizeof(buf), "%s %02d:%02d", g_giControl.fastTime ? "FAST" : "STOPPED", minutes / 60, minutes % 60);
+            if (!b.on)
+                notes.push_back(ru ? "нужен включённый GI" : "they need the GI on");
+            notes.push_back(ru ? "не растительность и не террейн" : "not vegetation, terrain");
         }
-        else
-            snprintf(buf, sizeof(buf), "%s", g_giControl.fastTime ? "FAST" : "STOPPED");
-        lines.push_back({"Num9", "Time", buf, g_giControl.fastTime ? on : value});
-        const int start = static_cast<int>(g_giControl.startTime * 60.0f + 0.5f) % (24 * 60);
-        snprintf(buf, sizeof(buf), "Time %02d:%02d", start / 60, start % 60);
-        lines.push_back({"Num6", buf, "", white});
-        lines.push_back({"Num+ Num-", "Time +/- 1 hour", "", white});
-        lines.push_back({"Num*", "Reset   Num/ voxels", "", white});
+        if (tab == 4)
+            notes.push_back(ru ? "дальние каскады теней перерисовываются реже" : "far shadow cascades redrawn less often");
+        if (tab == 5)
+        {
+            const int start = static_cast<int>(g_giControl.startTime * 60.0f + 0.5f) % (24 * 60);
+            char buf[96];
+            snprintf(buf, sizeof(buf), ru ? "Num5 на времени: %02d:%02d" : "Num5 on the time: %02d:%02d", start / 60, start % 60);
+            notes.push_back(buf);
         }
-        std::string text;
+        for (const std::string& n : notes)
+            lines.push_back({Wide("  " + n), L"", dim, dim, false});
+        lines.push_back({Wide(ru ? "Num7/9 вкладка  Num8/2 строка  Num4/6 значение" : "Num7/9 tab  Num8/2 row  Num4/6 value"), L"", dim,
+                         dim, false});
+        lines.push_back({Wide(ru ? "Num5 сброс  Num+/- время  Num/ скрыть" : "Num5 default  Num+/- time  Num/ hide"), L"", dim, dim, false});
+        std::wstring text;
         for (const Line& l : lines)
-            text += l.keys + "|" + l.label + "|" + l.state + "\n";
-        snprintf(buf, sizeof(buf), "%ux%u", screenW, screenH);
-        text += buf;
+            text += l.left + L"|" + l.right + (l.rc == changed ? L"*" : L"") + (l.bar ? L"#" : L"") + L"\n";
+        text += std::to_wstring(screenW) + L"x" + std::to_wstring(screenH);
         if (text == m_panelText && m_panelTex)
             return true;
         m_panelText = text;
@@ -8604,17 +8811,23 @@ public:
         HFONT font = CreateFontW(-px, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                                  FIXED_PITCH | FF_MODERN, L"Consolas");
         HGDIOBJ oldFont = SelectObject(dc, font);
-        SIZE ch{};
-        GetTextExtentPoint32A(dc, "M", 1, &ch);
-        size_t keysW = 0, labelW = 0, stateW = 0;
+        int leftW = 0, rightW = 0, wholeW = 0;
         for (const Line& l : lines)
         {
-            keysW = l.keys.size() > keysW ? l.keys.size() : keysW;
-            labelW = l.label.size() > labelW ? l.label.size() : labelW;
-            stateW = l.state.size() > stateW ? l.state.size() : stateW;
+            SIZE s{};
+            GetTextExtentPoint32W(dc, l.left.c_str(), static_cast<int>(l.left.size()), &s);
+            if (l.right.empty())
+                wholeW = std::max(wholeW, static_cast<int>(s.cx));
+            else
+            {
+                leftW = std::max(leftW, static_cast<int>(s.cx));
+                SIZE r{};
+                GetTextExtentPoint32W(dc, l.right.c_str(), static_cast<int>(l.right.size()), &r);
+                rightW = std::max(rightW, static_cast<int>(r.cx));
+            }
         }
-        const int keysX = pad, labelX = keysX + static_cast<int>(keysW + 2) * ch.cx, stateX = labelX + static_cast<int>(labelW + 2) * ch.cx;
-        const int w = stateX + static_cast<int>(stateW) * ch.cx + pad, h = static_cast<int>(lines.size()) * lineH + 2 * pad;
+        const int gap = px * 2, rightX = pad + leftW + gap;
+        const int w = std::max(rightX + rightW, pad + wholeW) + pad, h = static_cast<int>(lines.size()) * lineH + 2 * pad;
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
         bi.bmiHeader.biWidth = w;
@@ -8634,17 +8847,25 @@ public:
         HGDIOBJ oldBmp = SelectObject(dc, bmp);
         memset(bits, 0, static_cast<size_t>(w) * h * 4);
         SetBkMode(dc, TRANSPARENT);
+        HBRUSH barBrush = CreateSolidBrush(barColour);
         for (size_t i = 0; i < lines.size(); i++)
         {
             const int y = pad + static_cast<int>(i) * lineH;
             const Line& l = lines[i];
-            SetTextColor(dc, RGB(150, 190, 255));
-            TextOutA(dc, keysX, y, l.keys.c_str(), static_cast<int>(l.keys.size()));
-            SetTextColor(dc, i == 0 ? value : white);
-            TextOutA(dc, labelX, y, l.label.c_str(), static_cast<int>(l.label.size()));
-            SetTextColor(dc, l.colour);
-            TextOutA(dc, stateX, y, l.state.c_str(), static_cast<int>(l.state.size()));
+            if (l.bar)
+            {
+                RECT r{pad / 2, y - (lineH - px) / 2, w - pad / 2, y - (lineH - px) / 2 + lineH};
+                FillRect(dc, &r, barBrush);
+            }
+            SetTextColor(dc, l.lc);
+            TextOutW(dc, pad, y, l.left.c_str(), static_cast<int>(l.left.size()));
+            if (!l.right.empty())
+            {
+                SetTextColor(dc, l.rc);
+                TextOutW(dc, rightX, y, l.right.c_str(), static_cast<int>(l.right.size()));
+            }
         }
+        DeleteObject(barBrush);
         GdiFlush();
         // Into a texture (B8G8R8A8, as GDI wrote it).
         if (!m_panelTex || m_panelW != static_cast<UINT>(w) || m_panelH != static_cast<UINT>(h))
@@ -9489,7 +9710,7 @@ private:
     ID3D12Resource* m_panelTex = nullptr; // GI test keys' panel (UpdatePanel)
     UINT m_panelW = 0, m_panelH = 0;
     D3D12_RESOURCE_STATES m_panelState = D3D12_RESOURCE_STATE_COPY_DEST;
-    std::string m_panelText;
+    std::wstring m_panelText;
     bool m_voxFailed = false, m_voxValid = false;
     int m_voxGrid[kVoxLevels][3] = {}, m_voxPrevGrid[kVoxLevels][3] = {}; // per level: first cell now, at its last update
     // GI geometry (RunVoxelGeometry): this frame's z-prepass draws, where each vertex shader reads the camera matrices,
@@ -12273,6 +12494,11 @@ void Dx12Camera(const DlssSceneInfo* info)
 {
     if (dx12::g_device)
         dx12::g_device->GiFrameCamera(info);
+}
+
+void Dx12PanelKey(int action)
+{
+    dx12::Device::PanelKey(action);
 }
 
 void Dx12PassMatrices(const float* matrices)
