@@ -117,8 +117,9 @@ samplerCUBE CryMT_WaterEnvSampler = sampler_state
 };
 
 // CryMT's frame texture (as ShadowMaskGen's): 0 the jitter (fractions of the screen), 2..5 the columns of the unjittered
-// view-projection, 7: x the cube's brightness on the water (CRYMT_WATERSKY), z the camera's near plane, w 2 when the
-// water's SSR is on (the depth pyramid has the screen's size: from the screen coordinate's derivatives).
+// view-projection, 7: x the cube's brightness on the water (CRYMT_WATERSKY, CRYMT_ENVCUBE_SCALE), y 1 when the cube is the
+// engine's own capture (RGBK: rgb a 16, as HDRDecode_FromLDR_RGBK), z the camera's near plane, w 2 when the water's SSR is
+// on (the depth pyramid has the screen's size: from the screen coordinate's derivatives).
 sampler2D CryMT_WaterFrameSampler = sampler_state
 {
   Texture = Textures/CryMT/jitter.dds;
@@ -212,8 +213,8 @@ float CryMT_HiZConfidence(float3 hit, float2 uv, float2 screenSize, float nearZ)
   return confidence * border.x * border.y;
 }
 
-// The reflection towards the mirrored view direction (world): the cube (it holds 1 - exp(-0.5 x): back to HDR) or the
-// planar one; with SSR the scene where the ray meets it. screenProj: the pixel's (u, v) * w and w (Water.cfx's).
+// The reflection towards the mirrored view direction (world): the cube (the voxel grid's holds 1 - exp(-0.5 x), alpha 1;
+// the engine's RGBK: back to HDR) or the planar one; with SSR the scene where the ray meets it. screenProj: the pixel's (u, v) * w and w (Water.cfx's).
 half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj)
 {
   float wP = screenProj.w;
@@ -223,7 +224,8 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   half3 r = 2 * dot(viewVec, n) * n - viewVec;
   half4 c = texCUBE(CryMT_WaterEnvSampler, r);
   float4 hz = CryMT_WaterFrame(7);
-  half4 base = c.a > 0.5 ? half4(-2 * log(max(1 - c.rgb, 0.001)) * (hz.x > 0 ? hz.x : 1), planar.a) : planar;
+  half3 cubeHdr = hz.y > 0.5 ? c.rgb * c.a * 16 : -2 * log(max(1 - c.rgb, 0.001));
+  half4 base = hz.y > 0.5 || c.a > 0.5 ? half4(cubeHdr * (hz.x > 0 ? hz.x : 1), planar.a) : planar;
   if (hz.w < 1.5)
     return base;
   float4 f0 = CryMT_WaterFrame(0), c0 = CryMT_WaterFrame(2), c1 = CryMT_WaterFrame(3), c3 = CryMT_WaterFrame(5);

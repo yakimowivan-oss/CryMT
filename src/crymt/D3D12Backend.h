@@ -57,4 +57,8 @@ HRESULT Dx12QueryPoll(ID3D10Asynchronous* query, void* data, UINT size, UINT fla
 // Context thread: submits the list being recorded when it is the given one (a GetData asked for it).
 void Dx12QueryFlush(uint64_t serial);
 // Context thread: a pass name for frame debuggers (RenderDoc, PIX) begins; null or "" ends the innermost one.
+// The engine-captured environment cube (CryMT.cpp EnvCubeUpdate, the render thread): whether the water reads it, and the
+// cube's texture once it has all six faces (null: none). Any thread.
+bool Dx12WantsEngineEnvCube();
+void Dx12EngineEnvCube(ID3D10Resource* cube);
 void Dx12PassName(const char* text);

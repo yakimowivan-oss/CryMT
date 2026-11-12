@@ -41,6 +41,8 @@ struct GiControl
     std::atomic<int> waterCube{-1};    // the ocean's reflection: 0 planar, 1 the environment cube, 2 SSR + the cube (the
                                        // planar pass off for 1 and 2); -1 as CRYMT_WATERCUBE says
     std::atomic<float> waterSky{-1.0f}; // the cube's brightness on the water (where SSR misses: the sky); -1 as CRYMT_WATERSKY
+    std::atomic<int> waterSource{-1};   // the water's cube: 1 the engine's own capture at the camera (CryMT.cpp EnvCubeUpdate),
+                                        // 0 the voxel grid's; -1 as CRYMT_ENVCUBE says
     std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // their strengths
 };
 extern GiControl g_giControl;

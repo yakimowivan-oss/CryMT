@@ -38,6 +38,30 @@ constexpr uintptr_t kPrepareDepthMapSize = 10433;
 // 0x280/8 of g 0x382E6A98, matrix translation at +0xC/+0x1C/+0x2C). The call: mov rax,[rbx]; lea rdx,[rsp+0x2C0];
 // mov rcx,rbx; call [rax+8] at 0x380BE98A (17 bytes).
 constexpr uintptr_t kShadowStaticGlobal = 0x382E9A04;
+// The renderer's environment cubes ($EnvCMap_%d): a pool of 16 SEnvTexture, 200 bytes each (0x38640620..0x386412A0;
+// FUN_3813F840 makes their textures at the start, the 8x8 pool at 0x3863F9A0 and the 2D one at 0x386412A0 alike). +0 char busy (the pool's
+// reuse skips busy ones, its render returns at once), +1 char all faces drawn once, +8 int the next face, +0x18 SDynTexture*
+// (its CTexture at +0x98: the D3D texture at +0x28, its view at +0x38), +0x20 float the time of the last update, +0x24 the position for the pool's nearest-cube
+// lookups (materials with an automatic cube get the nearest), +0x30 the position the render uses when the renderer has no
+// render element (kRdRendElement null; else the element's). FUN_38132490 is the pool (nearest, update interval, budget).
+constexpr uintptr_t kEnvCubePool = 0x38640620;
+constexpr size_t kEnvCubeEntryBytes = 0xC8;
+constexpr int kEnvCubeEntries = 16;
+// FUN_380D4F00(entry, draw flags, -1, small): the cube's faces, all 6 while entry +1 is 0, else the face at +8, each into
+// TempEnvCMap through I3DEngine::RenderWorld(3, camera, "DrawCubeSide", flags & ~DLD_ENTITIES) (FUN_380CF8D0: 90 degrees,
+// the 3D engine's view distance), then Encode_ToLDR into the cube's face (RGBK: rgb / max, a = max / 16). The size from
+// r_EnvCMResolution (0 64, 1 128, 2 256, 3 512). Returns 1.
+constexpr uintptr_t kEnvCubeRenderFn = 0x380D4F00;
+constexpr uintptr_t kRdCameraX = 0x28D14;            // the camera's position: floats at +0x28D14, +0x28D24, +0x28D34
+// The renderer's temporary depth surfaces (FUN_380212B0 FX_GetDepthSurface(w, h, aa): the first free one of that size,
+// else a new D3D texture and view): pointers at +0x2D848, count +0x2D850; each {int w, h; char busy at +8; ...}. The
+// busy flag is set by FX_SetRenderTarget (FUN_3801CF80) and cleared when a target slot gets another depth or is popped.
+constexpr uintptr_t kRdDepthPool = 0x2D848;
+constexpr uintptr_t kRdDepthPoolCount = 0x2D850;
+constexpr uintptr_t kTextureDevice = 0x28;           // CTexture: the D3D texture (ID3D10Resource*); +0x38 its view
+// CTexture +0x30: its render target view, made by FUN_380CC480 (for a cube: the face asked first, as a 1-slice array)
+// and then given for every face: the engine's real-time cube (a feature cut from the shaders) drew all faces into one.
+constexpr uintptr_t kTextureRtv = 0x30;
 constexpr uintptr_t kRenderSystemGlobal = 0x382E6A98;
 constexpr uintptr_t kCasterRenderCall = 0x380BE98A;
 constexpr uint8_t kCasterRenderCode[] = {0x48, 0x8B, 0x03, 0x48, 0x8D, 0x94, 0x24, 0xC0, 0x02, 0x00, 0x00, 0x48, 0x8B, 0xCB, 0xFF, 0x50, 0x08};

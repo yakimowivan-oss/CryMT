@@ -899,6 +899,10 @@ void DrainDebugMessages()
 // ---------------------------------------------------------------------------------------------------------------------
 class Device;
 Device* g_device;
+// The engine-captured environment cube (Dx12EngineEnvCube, the render thread): its texture, referenced; the stream thread
+// makes its view (Device::EngineCube).
+std::mutex g_engineCubeLock;
+ID3D10Resource* g_engineCubePending;
 ID3D10Device* DeviceInterface(); // AddRef'd
 void SubmitMain();               // context thread: submits the main list being recorded
 void PollDone();                 // refreshes the completed serial
@@ -4221,6 +4225,8 @@ struct Stats
     double voxShadowMapCover[8];                        // their cover summed
     uint64_t giStampTicks[5], giStampRuns; // GI pass timers: trace, filter, upsample, voxel geometry, voxel update
     uint64_t sssRuns, sssDispatches, sssNoDepth; // RunSss: frames made, their dispatches, frames without the z-prepass target
+    uint64_t engineCubeDraws, engineCubeFaces[6]; // draws into the engine's environment cube (Dx12EngineEnvCube), per face
+    uint64_t engineCubeUnbinds;                   // its source let go as a render target (ReleaseOutput)
     uint64_t hizRuns; // RunHiz: frames whose depth pyramid was built (the water's SSR)
 };
 
@@ -4874,6 +4880,83 @@ public:
         return panel > 0 ? panel : WaterSkyBase();
     }
     static bool WaterSsrOn() { return WaterMode() == 2; }
+    // The water's cube (reflections phase 4): 1 the engine's own capture at the camera (CryMT.cpp EnvCubeUpdate: one face
+    // a frame, RGBK), 0 the voxel grid's; CRYMT_ENVCUBE or the reflections page. Default the engine's.
+    static bool EngineCubeOn()
+    {
+        static const int env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE", v, 8) ? _wtoi(v) : 1;
+        }();
+        const int panel = g_giControl.waterSource;
+        return (panel < 0 ? env : panel) == 1;
+    }
+    // Its brightness on the water (CRYMT_ENVCUBE_SCALE, default 1: the engine drew it as it draws the planar reflection).
+    static float EngineCubeScale()
+    {
+        static const float env = [] {
+            wchar_t v[16] = {};
+            const float s = GetEnvironmentVariableW(L"CRYMT_ENVCUBE_SCALE", v, 16) ? static_cast<float>(_wtof(v)) : 1.0f;
+            return s > 0 ? s : 1.0f;
+        }();
+        return env;
+    }
+
+    // The engine's cube as the water reads it (stream thread): a cube view of its first level (the engine draws only that)
+    // made when the render thread hands over another texture; null until it has all six faces.
+    Srv12* EngineCube()
+    {
+        ID3D10Resource* res = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(g_engineCubeLock);
+            res = g_engineCubePending;
+        }
+        if (res == m_engineCubeRes)
+            return m_engineCube;
+        if (m_engineCube)
+            m_engineCube->Release();
+        m_engineCube = nullptr;
+        m_engineCubeRes = res;
+        ID3D10Texture2D* tex = nullptr; // Dx12EngineEnvCube is given a 2D texture; asked anyway
+        if (!res || FAILED(res->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void**>(&tex))))
+            return nullptr;
+        D3D10_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+        tex->Release();
+        D3D10_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = td.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS   ? DXGI_FORMAT_R8G8B8A8_UNORM
+                    : td.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                                                 : td.Format;
+        sd.ViewDimension = D3D10_SRV_DIMENSION_TEXTURECUBE;
+        sd.TextureCube.MostDetailedMip = 0;
+        sd.TextureCube.MipLevels = 1;
+        ID3D10ShaderResourceView* view = nullptr;
+        if (td.ArraySize != 6 || !(td.MiscFlags & D3D10_RESOURCE_MISC_TEXTURECUBE) || FAILED(CreateShaderResourceView(res, &sd, &view)))
+        {
+            Log("engine environment cube: no view (%ux%u format %d, array %u, misc %x)", td.Width, td.Height, static_cast<int>(td.Format),
+                td.ArraySize, td.MiscFlags);
+            return nullptr;
+        }
+        m_engineCube = static_cast<Srv12*>(static_cast<ID3D10ShaderResourceView1*>(view));
+        m_engineCubeViews++;
+        Log("engine environment cube for the water: %ux%u format %d, %u levels (the first read)", td.Width, td.Height,
+            static_cast<int>(td.Format), td.MipLevels);
+        return m_engineCube;
+    }
+    // The cube the water reads (Water.cfx's waterenv.dds placeholder), and whether it is the engine's (RGBK).
+    Srv12* WaterEnvCube(bool* engine)
+    {
+        *engine = false;
+        if (!WaterCubeOn())
+            return nullptr;
+        if (EngineCubeOn())
+        {
+            Srv12* cube = EngineCube();
+            *engine = cube != nullptr;
+            return cube;
+        }
+        return m_envReady && m_envCubeAll ? m_envCubeAll : nullptr;
+    }
 
     bool EnsureEnvTargets()
     {
@@ -4943,13 +5026,29 @@ public:
         return slot == m_ps->envCubeSlot ? m_envTestCube : m_envTest2D;
     }
 
+    // In the engine's cube render (m_engineCubePass): its encode pass binds the face's scene (TempEnvCMap) as its input
+    // while it is still the render target (the cube's face is set after, applied at the draw), which D3D10 turns into
+    // no input (the cube came out black). There the target is let go instead: the engine replaces it before the draw.
+    bool ReleaseOutput(Srv12* v)
+    {
+        for (Rtv12*& rtv : m_rtv)
+            if (rtv && rtv->resource == v->resource)
+            {
+                rtv->info->outputBound--;
+                Bind(rtv, static_cast<Rtv12*>(nullptr));
+                m_omDirty = m_psoDirty = true;
+                m_stats.engineCubeUnbinds++;
+            }
+        return v->info->outputBound == 0;
+    }
+
     void SetShaderResources(Stage s, UINT start, UINT n, ID3D10ShaderResourceView* const* views)
     {
         StageState& st = m_stage[s];
         for (UINT i = 0; i < n && start + i < D3D10_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
         {
             auto* v = views ? static_cast<Srv12*>(static_cast<ID3D10ShaderResourceView1*>(views[i])) : nullptr;
-            if (v && v->info->outputBound) // D3D10: a resource bound for output cannot be an input
+            if (v && v->info->outputBound && !(m_engineCubePass && ReleaseOutput(v))) // D3D10: a resource bound for output cannot be an input
                 v = nullptr;
 
             if (st.srv[start + i] != v)
@@ -5435,6 +5534,33 @@ public:
             m_ombFrame = m_frame;
         }
         m_stats.draws++;
+        if (m_engineCubeRes && m_rtv[0] && m_rtv[0]->resource == m_engineCubeRes)
+        {
+            m_stats.engineCubeDraws++;
+            const D3D10_RENDER_TARGET_VIEW_DESC& d = m_rtv[0]->desc;
+            const UINT face = d.ViewDimension == D3D10_RTV_DIMENSION_TEXTURE2DARRAY ? d.Texture2DArray.FirstArraySlice : 0;
+            m_stats.engineCubeFaces[face < 6 ? face : 5]++;
+            if (m_engineCubeDumpWanted)
+            {
+                // The capture key: what the next draw into the cube (the engine's Encode_ToLDR) read, as <tag>_envsrc.
+                m_engineCubeDumpWanted = false;
+                for (int slot = 0; slot < 4; slot++)
+                    if (Srv12* s = m_stage[kPS].srv[slot]; s && s->info && !s->info->buffer)
+                    {
+                        const D3D12_RESOURCE_DESC rd = s->info->res->GetDesc();
+                        Log("engine cube draw (face %u): PS slot %d %llux%u format %d array %u", face, slot,
+                            static_cast<unsigned long long>(rd.Width), rd.Height, static_cast<int>(rd.Format), rd.DepthOrArraySize);
+                        if (slot == 0)
+                        {
+                            Require(s->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                            FlushBarriers();
+                            RecordDump(s->info->res, "envsrc", 0);
+                            Require(s->info, kSrvState);
+                            FlushBarriers();
+                        }
+                    }
+            }
+        }
         if (++m_drawsSinceSubmit >= 2048 && !m_activeQueries)
             Submit();
     }
@@ -6521,9 +6647,12 @@ public:
         data[25] = 0.5f;
         data[26] = 50.0f;
         data[27] = s.contactFoliage ? 1.0f : 0.0f;
-        // Texel 7: the cube's brightness on the water, -, the near plane, 2 when the water's SSR is on.
-        data[28] = WaterSky();
-        data[29] = 0.0f;
+        // Texel 7: the cube's brightness on the water, 1 when the cube is the engine's (RGBK), the near plane, 2 when the
+        // water's SSR is on.
+        bool engineCube = false;
+        WaterEnvCube(&engineCube);
+        data[28] = engineCube ? EngineCubeScale() : WaterSky();
+        data[29] = engineCube ? 1.0f : 0.0f;
         data[30] = info->nearZ;
         data[31] = WaterSsrOn() && !m_hizFailed ? 2.0f : 0.0f;
         m_hizNearOverFar = info->farZ > 0 ? info->nearZ / info->farZ : 0.0f;
@@ -7350,6 +7479,14 @@ public:
             RecordDump(m_sss.res, "sss", 4);
             if (foliage)
                 RecordDump(foliage->info->res, "foliage", 4);
+            if (m_engineCube) // the engine's environment cube: <tag>_envcube<face>.ppm (+x -x +y -y +z -z)
+            {
+                Require(m_engineCube->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                FlushBarriers();
+                static const char* const faces[6] = {"envcube0", "envcube1", "envcube2", "envcube3", "envcube4", "envcube5"};
+                for (UINT face = 0; face < 6; face++)
+                    RecordDump(m_engineCube->info->res, faces[face], 6, face);
+            }
         }
         RestoreListState();
         m_sssFrame = m_frame;
@@ -9317,6 +9454,7 @@ public:
         static const char* const cache[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "КАЖДЫЙ 4-Й|EVERY 4TH"};
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE"};
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
+        static const char* const waterSource[] = {"ВОКСЕЛИ|VOXELS", "ДВИЖОК|ENGINE"};
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
         static const std::vector<PanelItem> items = {
             // GI
@@ -9395,6 +9533,8 @@ public:
                  CryMTConsoleCommand(v ? "r_WaterReflections 0" : "r_WaterReflections 1"); // the engine's planar pass
              },
              true, nullptr},
+            {3, "Кубкарта воды|Water cube map", 0, 1, 1, true, waterSource, 0, nullptr, [] { return EngineCubeOn() ? 1 : 0; },
+             [] { return 1; }, [](int v) { g_giControl.waterSource = v; }, true, nullptr},
             {3, "Небо в отражении воды|Sky in the water's reflection", 2, 20, 1, false, nullptr, 0.1f, "x%.1f",
              [] { return static_cast<int>(lroundf(WaterSky() * 10.0f)); }, [] { return static_cast<int>(lroundf(WaterSkyBase() * 10.0f)); },
              [](int v) { g_giControl.waterSky = v / 10.0f; }, true, nullptr},
@@ -9910,7 +10050,8 @@ public:
     bool m_giDumpWanted = false;
 
     // res is in COPY_SOURCE with the barriers flushed.
-    void RecordDump(ID3D12Resource* res, const char* name, int kind)
+    // kind 6: an RGBK cube face (the engine's environment cube; sub = the face), written decoded as <name>.ppm.
+    void RecordDump(ID3D12Resource* res, const char* name, int kind, UINT sub = 0)
     {
         if (!res)
             return;
@@ -9925,11 +10066,12 @@ public:
         }
         if (rg)
             kind = 3; // motion vectors
-        if (r8 || rgba8)
+        if ((r8 || rgba8) && kind != 6)
             kind = r8 ? 4 : 5; // one channel (the screen-space shadows; the shadow mask's red: the sun)
         PendingDump d{nullptr, {}, name, kind};
         UINT64 total = 0;
-        g.dev->GetCopyableFootprints(&rd, 0, 1, 0, &d.fp, nullptr, nullptr, &total);
+        g.dev->GetCopyableFootprints(&rd, sub, 1, 0, &d.fp, nullptr, nullptr, &total);
+        d.fp.Offset = 0;
         d.rb = CreateBufferResource(D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!d.rb)
             return;
@@ -9939,6 +10081,7 @@ public:
         dst.PlacedFootprint = d.fp;
         src.pResource = res;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = sub;
         NoteCopy("dump readback", dst, 0, 0, 0, src, nullptr);
         m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         m_dumps.push_back(d);
@@ -9950,7 +10093,43 @@ public:
         for (PendingDump& d : m_dumps)
         {
             void* p = nullptr;
-            if ((d.kind == 4 || d.kind == 5) && SUCCEEDED(d.rb->Map(0, nullptr, &p)) && p)
+            if (d.kind == 6 && SUCCEEDED(d.rb->Map(0, nullptr, &p)) && p)
+            {
+                // An RGBK cube face: rgb a 16 (HDRDecode_FromLDR_RGBK), shown as 1 - exp(-x); mean HDR and alpha in the log.
+                const UINT w = d.fp.Footprint.Width, h = d.fp.Footprint.Height;
+                char path[MAX_PATH];
+                snprintf(path, sizeof(path), "%s%s_%s.ppm", CryMTCapture("").c_str(), m_dumpTag.c_str(), d.name.c_str());
+                FILE* f = nullptr;
+                fopen_s(&f, path, "wb");
+                if (f)
+                    fprintf(f, "P6\n%u %u\n255\n", w, h);
+                std::vector<uint8_t> row(static_cast<size_t>(w) * 3);
+                double sum[4] = {};
+                for (UINT y = 0; y < h; y++)
+                {
+                    const uint8_t* src = static_cast<const uint8_t*>(p) + static_cast<size_t>(y) * d.fp.Footprint.RowPitch;
+                    for (UINT x = 0; x < w; x++)
+                    {
+                        const float k = src[x * 4 + 3] / 255.0f * 16.0f;
+                        for (int c = 0; c < 3; c++)
+                        {
+                            const float v = src[x * 4 + c] / 255.0f * k;
+                            sum[c] += v;
+                            row[x * 3 + c] = static_cast<uint8_t>(std::min(1.0f - std::exp(-v), 1.0f) * 255.0f);
+                        }
+                        sum[3] += src[x * 4 + 3] / 255.0;
+                    }
+                    if (f)
+                        fwrite(row.data(), 1, row.size(), f);
+                }
+                if (f)
+                    fclose(f);
+                const double n = double(w) * h;
+                Log("capture: %s mean HDR %.3f %.3f %.3f, alpha %.3f (%ux%u)", d.name.c_str(), sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n, w, h);
+                d.rb->Unmap(0, nullptr);
+                p = nullptr;
+            }
+            else if ((d.kind == 4 || d.kind == 5) && SUCCEEDED(d.rb->Map(0, nullptr, &p)) && p)
             {
                 // One 8-bit channel: <name>.pgm (white = 1), its mean and the share over 0.5 in the log.
                 const UINT w = d.fp.Footprint.Width, h = d.fp.Footprint.Height, step = d.kind == 4 ? 1 : 4;
@@ -10605,6 +10784,11 @@ private:
     Srv12* m_envCube = nullptr;               // the cube and the 2D map the materials get (EnvSubstitute)
     Srv12* m_env2D = nullptr;
     Srv12* m_envCubeAll = nullptr;            // the cube for fragLib's reflection on every material
+    Srv12* m_engineCube = nullptr;            // the engine-captured cube (EngineCube), RGBK
+    ID3D10Resource* m_engineCubeRes = nullptr; // its texture (the view keeps it)
+    uint64_t m_engineCubeViews = 0;
+    bool m_engineCubeDumpWanted = false;
+    bool m_engineCubePass = false; // between CryMT's "CryMT engine cube" marks (PassName), stream order
     bool m_envReady = false, m_envFailed = false;
     ID3D12Resource* m_pvol = nullptr;         // its atlas: 1024 x 513 RGBA32F (fine, coarse; shares, place row, tints), pvol.dds
     D3D12_CPU_DESCRIPTOR_HANDLE m_pvolCpu{};  // its view for the pixel shaders
@@ -10900,6 +11084,12 @@ void Device::RestoreListState()
 
 void Device::PassName(const char* text)
 {
+    // CryMT.cpp EnvCubeUpdate marks the engine's cube render in stream order (with or without pass names).
+    if (strcmp(text, "CryMT engine cube") == 0 || strcmp(text, "CryMT engine cube end") == 0)
+    {
+        m_engineCubePass = text[17] == 0;
+        return;
+    }
     if (!m_passNamesOn)
         return;
     std::wstring name(text, text + strlen(text)); // ASCII
@@ -11402,7 +11592,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
     if (envAll && st.srvDirty)
         Require(envAll->info, kSrvState);
     // The ocean's reflection cube (Water.cfx reads it in place of its placeholder; water is "refractive", so not envAll).
-    Srv12* waterEnv = s == kPS && m_envReady && m_envCubeAll && WaterCubeOn() ? m_envCubeAll : nullptr;
+    bool waterEngine = false;
+    Srv12* waterEnv = s == kPS ? WaterEnvCube(&waterEngine) : nullptr;
     if (waterEnv && st.srvDirty)
         Require(waterEnv->info, kSrvState);
     if (s == kPS && m_ps && st.srvDirty)
@@ -12931,6 +13122,7 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
         g_capture.window = 0;
         m_dumpTag = g_capture.tag;
         m_giDumpWanted = true;
+        m_engineCubeDumpWanted = true;
         g_sceneDumpWanted = true;
     }
     if (g_capture.window < g_capture.starts.size() &&
@@ -13505,6 +13697,23 @@ void Dx12DrawPacket(const uint8_t* packet)
         dx12::g_device->DrawIndexedWithConstants(packet);
 }
 
+bool Dx12WantsEngineEnvCube()
+{
+    return dx12::g_device && dx12::Device::WaterCubeOn() && dx12::Device::EngineCubeOn();
+}
+
+void Dx12EngineEnvCube(ID3D10Resource* cube)
+{
+    std::lock_guard<std::mutex> guard(dx12::g_engineCubeLock);
+    if (cube == dx12::g_engineCubePending)
+        return;
+    if (cube)
+        cube->AddRef();
+    if (dx12::g_engineCubePending)
+        dx12::g_engineCubePending->Release();
+    dx12::g_engineCubePending = cube;
+}
+
 bool Dx12DlssActive()
 {
     return dx12::g_device && dlss::Active() && dx12::g_screenWidth.load() != 0;
@@ -13654,6 +13863,11 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  foliage mask: written in %llu frames; R32F draws with depth %.1f per frame, with SV_Target1 %.1f\n", static_cast<unsigned long long>(s.foliageFrames),
             s.zpassDraws / frames, s.zpassTarget1 / frames);
     fprintf(f, "  water SSR: depth pyramid built in %llu frames\n", static_cast<unsigned long long>(s.hizRuns));
+    fprintf(f, "  engine environment cube: %llu draws into it (faces %llu %llu %llu %llu %llu %llu), its source let go as a target %llu times\n",
+            static_cast<unsigned long long>(s.engineCubeDraws), static_cast<unsigned long long>(s.engineCubeFaces[0]),
+            static_cast<unsigned long long>(s.engineCubeFaces[1]), static_cast<unsigned long long>(s.engineCubeFaces[2]),
+            static_cast<unsigned long long>(s.engineCubeFaces[3]), static_cast<unsigned long long>(s.engineCubeFaces[4]),
+            static_cast<unsigned long long>(s.engineCubeFaces[5]), static_cast<unsigned long long>(s.engineCubeUnbinds));
     fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu\n",
             static_cast<unsigned long long>(s.sssRuns), s.sssRuns ? static_cast<double>(s.sssDispatches) / s.sssRuns : 0.0,
             static_cast<unsigned long long>(s.sssNoDepth));

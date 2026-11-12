@@ -587,6 +587,7 @@ int64_t g_flushStartTick, g_phaseMark;
 uint64_t g_phaseTicks[3], g_phaseFrames;
 uint64_t g_shadowDrawTicks, g_shadowDraws; // nested flushes of PrepareDepthMap (the shadow map draws)
 uint64_t g_preSignals;
+uint64_t g_envCubeFaces, g_envCubeFull, g_envCubeTicks, g_envCubeSkips, g_envCubeSwaps, g_envDepthFreed; // EnvCubeUpdate
 uint64_t g_lateCallbacks;
 uint64_t g_preFallbacks;
 uint64_t g_warmupFrames = 60;
@@ -1227,6 +1228,13 @@ void WriteStats()
                 g_preWaitTicks * g_qpcToMs / frames, static_cast<unsigned long long>(g_preSignals),
                 static_cast<unsigned long long>(g_preFallbacks), static_cast<unsigned long long>(g_lateCallbacks),
                 static_cast<unsigned long long>(g_gcDeferred));
+        if (g_envCubeFaces || g_envCubeSkips)
+            fprintf(f, "engine env cube: %llu renders (%llu with all faces), %.3f ms a render, %.3f ms/frame; %llu flushes without the pool; "
+                       "its texture changed %llu times; depth surfaces freed %llu\n",
+                    static_cast<unsigned long long>(g_envCubeFaces), static_cast<unsigned long long>(g_envCubeFull),
+                    g_envCubeFaces ? g_envCubeTicks * g_qpcToMs / g_envCubeFaces : 0.0, g_envCubeTicks * g_qpcToMs / frames,
+                    static_cast<unsigned long long>(g_envCubeSkips), static_cast<unsigned long long>(g_envCubeSwaps),
+                    static_cast<unsigned long long>(g_envDepthFreed));
         fprintf(f, "early barrier: %s; main waited for shadow prep (times of checks, ms/frame):", g_shadowBarrier ? "off" : "on");
         for (int k = 0; k < 4; k++)
             fprintf(f, " %s %llu of %llu, %.3f;", k == 0 ? "RenderWorld" : k == 1 ? "entity update" : k == 2 ? "terrain" : "AI update",
@@ -5591,6 +5599,160 @@ void SetPolicies()
 
 } // namespace
 
+// The engine-captured environment cube (reflections phase 4: the ocean's reflection where SSR misses, later materials):
+// the renderer's own cube render (kEnvCubeRenderFn) for the last pool entry, kept at the camera, one face per flush
+// (CRYMT_ENVCUBE_RATE flushes a face), all six after a jump (CRYMT_ENVCUBE_JUMP metres). It runs at the top-level flush's
+// preprocess (PrePush), where the water reflection calls back into Cry3DEngine too: main is held there. The content:
+// CRYMT_ENVCUBE_FLAGS (EDrawLowDetailFlags; default terrain, its water and light, static objects, far sprites). The entry
+// stays busy between our updates, so the pool never hands it to another position. The back end gets its device texture.
+bool Dx12WantsEngineEnvCube();                  // D3D12Backend.cpp: the water reflection reads the engine's cube
+void Dx12EngineEnvCube(ID3D10Resource* cube);   // ... this one (null: none)
+float g_envCubePos[3];
+bool g_envCubeLogged;
+
+int EnvCubeSetting(const char* name, int fallback)
+{
+    char v[32] = {};
+    return GetEnvironmentVariableA(name, v, sizeof(v)) ? static_cast<int>(strtol(v, nullptr, 0)) : fallback;
+}
+
+// The cube render leaves the depth surface of its faces marked busy: FUN_380D4F00 then sets the cube's face as the target
+// without depth, and FX_SetRenderTarget clears the old depth's flag only when given another depth (the pop then finds
+// none). So the depth pool made a new 256x256 depth texture every render (1488 in 35 s: video memory ran out, every GPU
+// pass 3-8 times slower). Around our call the flags are put back as they were (new surfaces free).
+std::vector<uint8_t> g_envDepthBusy;
+
+void EnvDepthSnapshot(const uint8_t* renderer)
+{
+    auto* const* list = *reinterpret_cast<uint8_t* const* const*>(renderer + kRdDepthPool);
+    const uint32_t count = *reinterpret_cast<const uint32_t*>(renderer + kRdDepthPoolCount);
+    g_envDepthBusy.resize(list ? count : 0);
+    for (uint32_t i = 0; i < g_envDepthBusy.size(); i++)
+        g_envDepthBusy[i] = list[i] ? list[i][8] : 0;
+}
+
+void EnvDepthRestore(const uint8_t* renderer)
+{
+    auto* const* list = *reinterpret_cast<uint8_t* const* const*>(renderer + kRdDepthPool);
+    const uint32_t count = *reinterpret_cast<const uint32_t*>(renderer + kRdDepthPoolCount);
+    for (uint32_t i = 0; list && i < count; i++)
+    {
+        const uint8_t before = i < g_envDepthBusy.size() ? g_envDepthBusy[i] : 0;
+        if (list[i] && list[i][8] != before)
+        {
+            list[i][8] = before;
+            g_envDepthFreed++;
+        }
+    }
+}
+
+void EnvCubeUpdate()
+{
+    static const int flags = EnvCubeSetting("CRYMT_ENVCUBE_FLAGS", 0x89C);
+    static const int rate = std::max(EnvCubeSetting("CRYMT_ENVCUBE_RATE", 1), 1);
+    static const float jump = static_cast<float>(std::max(EnvCubeSetting("CRYMT_ENVCUBE_JUMP", 25), 1));
+    static uint64_t flushes;
+    if (g_levelChange || !D3DLayerPacketsAvailable() || !Dx12WantsEngineEnvCube())
+        return;
+    auto* entry = reinterpret_cast<uint8_t*>(kEnvCubePool) + (kEnvCubeEntries - 1) * kEnvCubeEntryBytes;
+    auto* texture = *reinterpret_cast<uint8_t**>(entry + 0x18); // SDynTexture
+    auto* renderer = *reinterpret_cast<uint8_t**>(0x382E9B68);
+    // The top-level flush's preprocess runs at recursion level 1 (FUN_380AA200 calls it when the level - 1 is 0).
+    if (!texture || !renderer || *reinterpret_cast<const int*>(kRecurseLevel) != 1)
+    {
+        g_envCubeSkips++;
+        if (!g_envCubeLogged)
+        {
+            g_envCubeLogged = true;
+            FocusLog("frame %llu: engine env cube skipped: texture %p, renderer %p, recursion level %d", static_cast<unsigned long long>(g_frame),
+                     static_cast<void*>(texture), static_cast<void*>(renderer), *reinterpret_cast<const int*>(kRecurseLevel));
+        }
+        return;
+    }
+    if (flushes++ % rate != 0)
+        return;
+    const float cam[3] = {*reinterpret_cast<const float*>(renderer + kRdCameraX), *reinterpret_cast<const float*>(renderer + kRdCameraX + 0x10),
+                          *reinterpret_cast<const float*>(renderer + kRdCameraX + 0x20)};
+    // One face a call, always (entry +1 set, the face at +8 cycles): the engine's six-face pass would draw them all into
+    // one slice (kTextureRtv). After a jump the faces start again from 0; the water reads the cube once it has six.
+    static int facesDrawn;
+    const float dx = cam[0] - g_envCubePos[0], dy = cam[1] - g_envCubePos[1], dz = cam[2] - g_envCubePos[2];
+    if (dx * dx + dy * dy + dz * dz > jump * jump)
+    {
+        *reinterpret_cast<int*>(entry + 8) = 0;
+        facesDrawn = 0;
+        g_envCubeFull++;
+    }
+    entry[1] = 1;
+    *reinterpret_cast<int*>(0x382E984C) = 0; // the renderer's "all faces next time" (FUN_380D4F00 clears it after a render)
+    // The face's render target view: made anew for this face (the engine keeps the first one for all).
+    if (auto* ct = *reinterpret_cast<uint8_t**>(texture + 0x98))
+        if (auto*& rtv = *reinterpret_cast<ID3D10RenderTargetView**>(ct + kTextureRtv))
+        {
+            rtv->Release();
+            rtv = nullptr;
+        }
+    for (int k = 0; k < 3; k++)
+    {
+        g_envCubePos[k] = cam[k];
+        reinterpret_cast<float*>(entry + 0x24)[k] = cam[k];
+        reinterpret_cast<float*>(entry + 0x30)[k] = cam[k];
+    }
+    void*& element = *reinterpret_cast<void**>(renderer + kRdRendElement);
+    void* const savedElement = element;
+    element = nullptr;
+    entry[0] = 0;
+    const int64_t t0 = Now();
+    static bool tableFixed;
+    if (!tableFixed)
+    {
+        // DrawCubeSide's camera per face (filled at the start; 7 floats each: forward, up, roll in degrees): -X has roll +90,
+        // which draws the face turned 180 degrees from what a cube lookup by a world direction expects (2026-11-13: the
+        // cube unwrapped with D3D addressing had that face's horizon upside down, a seam on the water). The engine's
+        // real-time cubes were cut from its shaders, so nothing else reads them. CRYMT_ENVCUBE_ROLL1 sets it (default -90).
+        tableFixed = true;
+        auto* t = reinterpret_cast<float*>(0x382AFB30);
+        const float roll1 = static_cast<float>(EnvCubeSetting("CRYMT_ENVCUBE_ROLL1", -90));
+        FocusLog("engine cube face 1 (-X) roll %.0f -> %.0f", t[7 + 6], roll1);
+        t[7 + 6] = roll1;
+    }
+    EnvDepthSnapshot(renderer);
+    D3DLayerPassName("CryMT engine cube"); // the back end lets the encode pass read its source (Device::ReleaseOutput)
+    reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, static_cast<uint32_t>(flags), ~0ull, 0);
+    D3DLayerPassName("CryMT engine cube end");
+    EnvDepthRestore(renderer);
+    g_envCubeTicks += Now() - t0;
+    g_envCubeFaces++;
+    entry[0] = 1;
+    element = savedElement;
+    // The D3D texture: SDynTexture +0x98 the CTexture (made by the first render), its +0x28. Asked again only when it
+    // changes (the CTexture is the engine's object, not COM: only the D3D one is called).
+    static ID3D10Resource* lastObject;
+    static ID3D10Texture2D* lastCube;
+    auto* ctexture = *reinterpret_cast<uint8_t**>(texture + 0x98);
+    auto* object = ctexture ? *reinterpret_cast<ID3D10Resource**>(ctexture + kTextureDevice) : nullptr;
+    if (object != lastObject)
+    {
+        lastObject = object;
+        if (lastCube)
+            lastCube->Release();
+        lastCube = nullptr;
+        if (object && FAILED(object->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void**>(&lastCube))))
+            lastCube = nullptr;
+        g_envCubeSwaps++;
+        D3D10_TEXTURE2D_DESC d{};
+        if (lastCube)
+            lastCube->GetDesc(&d);
+        if (g_envCubeSwaps <= 4)
+            FocusLog("frame %llu: engine env cube at %.1f %.1f %.1f: device object %p, texture %p %ux%u format %d, %u mips, array %u, misc %x, "
+                     "flags %x, a face every %d flushes",
+                     static_cast<unsigned long long>(g_frame), cam[0], cam[1], cam[2], static_cast<void*>(object), static_cast<void*>(lastCube),
+                     d.Width, d.Height, static_cast<int>(d.Format), d.MipLevels, d.ArraySize, d.MiscFlags, flags, rate);
+    }
+    facesDrawn++;
+    Dx12EngineEnvCube(facesDrawn >= 6 ? lastCube : nullptr);
+}
+
 // PreThunk swaps the return address of the patched call so the callee sees the caller's exact stack
 // frame; PrePost runs when it returns. Return addresses are kept per thread because the preprocess
 // stage re-enters itself through nested flushes.
@@ -5613,6 +5775,7 @@ extern "C" void PrePush(uintptr_t ret)
     {
         g_phaseMark = Now();
         g_phaseTicks[0] += g_phaseMark - g_flushStartTick;
+        EnvCubeUpdate(); // counted in the preprocess phase
     }
     s->ret[s->depth++] = ret;
 }
