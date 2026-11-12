@@ -667,6 +667,8 @@ uint8_t* g_fakeMvStack;
 uint8_t* g_fakeProjStack;
 alignas(16) float g_snapMv[16];
 bool g_bfIdentity = true; // CRYMT_BFIDENTITY=0: BeginFrame invalidates the fake's matrices again (A/B, see TrackViewState)
+bool g_fillLightQueue = true; // CRYMT_FILLLIGHTQ=0: EF_ADDFillLight a sync point again
+bool g_query17 = true;        // CRYMT_Q17=0: EF_Query 0x17 a sync point again
 // CRYMT_SFQUEUE=1: the HUD's Scaleform draws queued (QueueSfDraw). Off by default since 2026-11-12 15:20: with it on the
 // user's play hit two GPU hangs (DRED: a CopyTextureRegion that never finished, no page fault) that none of the static
 // spot runs showed (a HUD that never changes there), and the longer overlap made the particle physics deadlock frequent.
@@ -4521,7 +4523,7 @@ uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
         }
         // A fixed answer (Crysis6156.h): this sync point alone held main ~4.5 ms a frame at the user's village spot
         // (2026-11-12), the game update waiting for the render thread to finish the frame before.
-        if (id == kQueryConstFlag && reinterpret_cast<uintptr_t>(g_orig[kRendererSlot201]) == kReturnFalseStub)
+        if (g_query17 && id == kQueryConstFlag && reinterpret_cast<uintptr_t>(g_orig[kRendererSlot201]) == kReturnFalseStub)
         {
             *reinterpret_cast<volatile uint32_t*>(kQueryFlag17) = 0;
             g_queryHits++;
@@ -4752,7 +4754,8 @@ extern "C" uintptr_t GateC(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
         case kAddFillLight:
             // C3DEngine::PrepareLightSourcesForRendering (3D+0x102DD3) once a fill light; it was a sync point every frame
             // at the user's village spot (2026-11-12). Queued with a copy of the light, as the render thread appends it.
-            if (g_async && f->rdx)
+            // CRYMT_FILLLIGHTQ=0 keeps the sync point (A/B for the GPU hangs of 2026-11-12).
+            if (g_fillLightQueue && g_async && f->rdx)
                 if (auto* light = static_cast<uint8_t*>(ArenaAlloc(kFillLightBytes)))
                 {
                     memcpy(light, reinterpret_cast<const void*>(f->rdx), kFillLightBytes);
@@ -9516,6 +9519,8 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
             g_giTimeSpeed = static_cast<float>(_wtof(level));
         GetEnvironmentVariableA("CRYMT_STARTCMD", g_startCommands.text, sizeof(g_startCommands.text));
         g_bfIdentity = !(GetEnvironmentVariableW(L"CRYMT_BFIDENTITY", level, 8) && wcscmp(level, L"0") == 0);
+        g_fillLightQueue = !(GetEnvironmentVariableW(L"CRYMT_FILLLIGHTQ", level, 8) && wcscmp(level, L"0") == 0);
+        g_query17 = !(GetEnvironmentVariableW(L"CRYMT_Q17", level, 8) && wcscmp(level, L"0") == 0);
         if (GetEnvironmentVariableA("CRYMT_TESTCMD", g_testCommands.text, sizeof(g_testCommands.text)))
             g_testCommands.interval = GetEnvironmentVariableW(L"CRYMT_TESTCMDSEC", level, 8) ? _wtoi(level) : 60;
         g_frameLogOn = GetEnvironmentVariableW(L"CRYMT_FRAMELOG", level, 8) != 0 || g_gpuProf;

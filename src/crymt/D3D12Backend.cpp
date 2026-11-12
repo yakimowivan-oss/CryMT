@@ -744,6 +744,24 @@ bool CreateRootSignature(SerializeRootSignatureFn serialize)
     return SUCCEEDED(hr);
 }
 
+// The last texture copies recorded (LogDred prints them): the user's GPU hangs of 2026-11-12 stopped at a
+// CopyTextureRegion, twice right before a list's end.
+struct CopyRec
+{
+    uint64_t serial; // main list
+    const char* site;
+    uint32_t format, width, height, depthOrArray, mips; // the destination
+    uint32_t sub, x, y, z;
+    uint32_t w, h, d; // the region (source footprint or box)
+    uint32_t srcPlaced;
+};
+CopyRec g_copyRing[64];
+uint32_t g_copyNext;
+
+void NoteCopy(const char* site, const D3D12_TEXTURE_COPY_LOCATION& dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION& src,
+              const D3D12_BOX* box);
+uint64_t g_emptyCopies; // CopyTexture with an empty box, skipped
+
 // After the device was removed: what DRED kept (see the settings at device creation). Unfinished command lists with
 // the operations around the last one the GPU completed, then the page fault address and the allocations there.
 void LogDred()
@@ -806,6 +824,50 @@ void LogDred()
             Log("DRED:   recently freed there: %ls (type %d)", a->ObjectNameW ? a->ObjectNameW : L"-", static_cast<int>(a->AllocationType));
     }
     d->Release();
+    Log("last texture copies (oldest first; destination format WxHxD mips, subresource at x,y,z, region w x h x d):");
+    for (uint32_t i = 0; i < 64; i++)
+    {
+        const CopyRec& c = g_copyRing[(g_copyNext + i) % 64];
+        if (!c.site)
+            continue;
+        Log("  list %llu %-16s fmt %u %ux%ux%u mips %u, sub %u at %u,%u,%u, region %ux%ux%u%s", static_cast<unsigned long long>(c.serial), c.site,
+            c.format, c.width, c.height, c.depthOrArray, c.mips, c.sub, c.x, c.y, c.z, c.w, c.h, c.d, c.srcPlaced ? " from a footprint" : "");
+    }
+}
+
+void NoteCopy(const char* site, const D3D12_TEXTURE_COPY_LOCATION& dst, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION& src,
+              const D3D12_BOX* box)
+{
+    CopyRec& c = g_copyRing[g_copyNext++ % 64];
+    c = {};
+    c.serial = g_mainSerial;
+    c.site = site;
+    if (dst.pResource)
+    {
+        const D3D12_RESOURCE_DESC rd = dst.pResource->GetDesc();
+        c.format = rd.Format;
+        c.width = static_cast<uint32_t>(rd.Width);
+        c.height = rd.Height;
+        c.depthOrArray = rd.DepthOrArraySize;
+        c.mips = rd.MipLevels;
+    }
+    c.sub = dst.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ? dst.SubresourceIndex : ~0u;
+    c.x = x;
+    c.y = y;
+    c.z = z;
+    c.srcPlaced = src.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    if (box)
+    {
+        c.w = box->right - box->left;
+        c.h = box->bottom - box->top;
+        c.d = box->back - box->front;
+    }
+    else if (c.srcPlaced)
+    {
+        c.w = src.PlacedFootprint.Footprint.Width;
+        c.h = src.PlacedFootprint.Footprint.Height;
+        c.d = src.PlacedFootprint.Footprint.Depth;
+    }
 }
 
 // D3D12 debug layer messages (CRYMT_D3D12DEBUG=1), drained after each submission.
@@ -4092,6 +4154,7 @@ struct Stats
     uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, voxPasses, giLateReads, giOtherDepth;
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
     uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
+    uint64_t voxGeomStale; // replays skipped: the draw's list was done, its ring data possibly reused (VoxDraw::serial)
     uint64_t voxGeomAnimated, voxGeomFresh, voxGeomInTurn; // the cache: draws every time, new ones, level draws left to their turn
     uint64_t voxAnimatedWhy[4]; // recorded draws taken as animated: layout (bones, per-instance), a dynamic vertex buffer, no object matrix
     uint64_t voxClass[4]; // z-prepass draws recorded: discard x diffuse map (0 neither, 1 diffuse only, 2 discard only, 3 both = foliage)
@@ -5824,6 +5887,13 @@ public:
     {
         if (dstSub >= dst->subresources || srcSub >= src->subresources)
             return;
+        // An empty box copies nothing in D3D10; D3D12 calls it invalid (undefined behaviour). The texture streamer sends
+        // such copies for BC textures (256x256 fmt 77, region 0x0x0 in the copy journal of a GPU hang, 2026-11-12).
+        if (box && (box->right <= box->left || box->bottom <= box->top || box->back <= box->front))
+        {
+            g_emptyCopies++;
+            return;
+        }
         if (dst->Staging())
             dst->gpuWriteSerial = g_mainSerial;
         else
@@ -5835,6 +5905,7 @@ public:
         FlushBarriers();
         const D3D12_TEXTURE_COPY_LOCATION d = Location(dst, dstSub);
         const D3D12_TEXTURE_COPY_LOCATION s = Location(src, srcSub);
+        NoteCopy("CopyTexture", d, x, y, z, s, reinterpret_cast<const D3D12_BOX*>(box));
         m_list->CopyTextureRegion(&d, x, y, z, &s, reinterpret_cast<const D3D12_BOX*>(box));
     }
 
@@ -5876,6 +5947,7 @@ public:
         s.pResource = p.up.res;
         s.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         s.PlacedFootprint = p.footprint;
+        NoteCopy("UploadPending", d, 0, 0, 0, s, nullptr);
         m_list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
     }
 
@@ -6304,6 +6376,7 @@ public:
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = up.offset;
         src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, 8, 1, 1, 256};
+        NoteCopy("jitter", dst, 0, 0, 0, src, nullptr);
         m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         m_barriers.push_back(Transition(m_jitterTex, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState));
         memcpy(m_frameLast, data, sizeof(data));
@@ -6516,6 +6589,7 @@ public:
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = up.offset;
         src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, kTexW, rows, 1, kTexW * 16};
+        NoteCopy("fplus", dst, 0, 0, 0, src, nullptr);
         m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         m_barriers.push_back(Transition(m_fplusTex, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState));
         m_fplusLast = m_fplusData;
@@ -7204,6 +7278,7 @@ public:
                 src.pResource = cur;
                 const UINT sq = 13 + f;
                 const D3D12_BOX box{sq * kEnvSize, 0, 0, (sq + 1) * kEnvSize, kEnvSize, 1};
+                NoteCopy("voxel view", dst, 0, 0, 0, src, &box);
                 m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
             }
             // This run's atlas is read by the next; the previous one is written then.
@@ -7560,6 +7635,11 @@ public:
         // Dedicated pages are skipped: they are deleted with their buffer, which may happen before the replay.
         BufferPage* pages[17];
         UINT pageCount;
+        // The main list it was recorded in. Its constants, dynamic vertices and texture table live in rings that free a
+        // list's part once the GPU finished that list; a ring running full submits, waits and frees mid-frame. The replay
+        // skips a draw whose list is done: its data may already be overwritten (GPU hangs in dense places, 2026-11-12:
+        // only with the voxel geometry on, 5 of 8 runs at village's start).
+        uint64_t serial;
     };
     struct VoxCameraPatch
     {
@@ -7696,6 +7776,7 @@ public:
             return;
         }
         VoxDraw d{};
+        d.serial = g_mainSerial;
         d.vsCode = &m_vs->code;
         d.vsHash = m_vs->contentHash;
         d.layout = m_layout;
@@ -8281,6 +8362,11 @@ public:
                 const VoxDraw& d = (*job.draws)[di];
                 if (d.foliage != (part == 1))
                     continue;
+                if (d.serial != g_mainSerial && SerialDone(d.serial)) // its list is done: its ring data may be reused
+                {
+                    m_stats.voxGeomStale++;
+                    continue;
+                }
                 if (!job.shadow && !due[di] && (turn + (d.key >> 32)) % turns != 0)
                 {
                     m_stats.voxGeomInTurn++;
@@ -8979,6 +9065,7 @@ public:
                 src.pResource = upload;
                 src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 src.PlacedFootprint = fp;
+                NoteCopy("panel", dst, 0, 0, 0, src, nullptr);
                 m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                 m_barriers.push_back(Transition(m_panelTex, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState));
                 m_panelState = kSrvState;
@@ -9231,6 +9318,7 @@ public:
         dst.PlacedFootprint = d.fp;
         src.pResource = res;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        NoteCopy("dump readback", dst, 0, 0, 0, src, nullptr);
         m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         m_dumps.push_back(d);
     }
@@ -10766,6 +10854,7 @@ void Device::UpdateSubresource(ID3D10Resource* dst, UINT sub, const D3D10_BOX* b
     sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     sl.PlacedFootprint.Offset = up.offset;
     sl.PlacedFootprint.Footprint = {t->format, bc ? (w + 3) & ~3u : w, bc ? (h + 3) & ~3u : h, d, pitch};
+    NoteCopy("UpdateSubresource", dl, x, y, z, sl, nullptr);
     m_list->CopyTextureRegion(&dl, x, y, z, &sl, nullptr);
 }
 
@@ -10990,6 +11079,7 @@ HRESULT FinishTexture(TextureCore* t, const D3D10_SUBRESOURCE_DATA* init)
             sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             sl.PlacedFootprint = layouts[s];
             sl.PlacedFootprint.Offset += up.offset;
+            NoteCopy("initial data", dl, 0, 0, 0, sl, nullptr);
             list->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
         }
         const D3D12_RESOURCE_STATES after = (t->bind & D3D10_BIND_SHADER_RESOURCE)   ? kSrvState
@@ -12037,6 +12127,7 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
             D3D12_TEXTURE_COPY_LOCATION src{};
             src.pResource = backbuffer->res;
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            NoteCopy("stream capture", dst, 0, 0, 0, src, nullptr);
             m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             g_stream.worldFrames[slot] = static_cast<uint32_t>(::CryMTWorldFrame());
             g_stream.filled[slot] = true;
@@ -12076,6 +12167,7 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
             D3D12_TEXTURE_COPY_LOCATION src{};
             src.pResource = backbuffer->res;
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            NoteCopy("capture", dst, 0, 0, 0, src, nullptr);
             m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
             g_capture.buffers.push_back(buffer);
             g_capture.footprints.push_back(fp);
@@ -12727,6 +12819,7 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  GPU busy %.3f ms/frame (%llu lists timed), depth to SRV %.2f, clears RT %.1f DS %.1f per frame\n",
             s.gpuTicks * 1000.0 / static_cast<double>(frequency) / std::max<double>(1.0, static_cast<double>(s.frames)), static_cast<unsigned long long>(s.gpuLists),
             s.depthToSrv / frames, s.rtClears / frames, s.dsClears / frames);
+    fprintf(f, "  texture copies with an empty box skipped: %llu\n", static_cast<unsigned long long>(g_emptyCopies));
     if (g_device->m_passStampsOn)
     {
         const auto& d = *g_device;
@@ -12763,7 +12856,8 @@ void Dx12WriteStats(FILE* f, double frames)
             s.voxGeomDraws / frames, s.voxGeomMaterial / frames, s.voxGeomFoliage / frames, s.voxGeomNoCamera / frames, s.voxGeomSkipped / frames, s.voxGeomNoPso / frames, static_cast<unsigned long long>(s.voxGeomPsos));
     fprintf(f, "  GI geometry, z-prepass draws by their pixel shader: plain %.1f, diffuse map only %.1f, discard only (LOD dissolve) %.1f, discard and diffuse map (alpha test: foliage) %.1f per frame\n",
             s.voxClass[0] / frames, s.voxClass[1] / frames, s.voxClass[2] / frames, s.voxClass[3] / frames);
-    fprintf(f, "  GI geometry: solid draws voxelized into level 0 %.1f per frame\n", s.voxGeomSolid / frames);
+    fprintf(f, "  GI geometry: solid draws voxelized into level 0 %.1f per frame; replays skipped as their list was done %.1f per frame (%llu in all)\n",
+            s.voxGeomSolid / frames, s.voxGeomStale / frames, static_cast<unsigned long long>(s.voxGeomStale));
     fprintf(f, "  GI geometry cache: animated %.1f, new %.1f per frame; level draws left to their turn %.1f per frame\n",
             s.voxGeomAnimated / frames, s.voxGeomFresh / frames, s.voxGeomInTurn / frames);
     fprintf(f, "  GI geometry cache, animated because: layout (bones or per-instance) %.1f, dynamic vertex buffer %.1f, no object buffer %.1f, its matrix not known %.1f per frame\n",

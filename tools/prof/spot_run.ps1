@@ -21,6 +21,11 @@ $defs = [ordered]@{
     nogi_nobf = @{Gi = '0'; Env = @{CRYMT_BFIDENTITY = '0'}}
     nogi_nosf = @{Gi = '0'; Env = @{CRYMT_SFQUEUE = '0'}}
     nogi_nodred = @{Gi = '0'; Env = @{CRYMT_DRED = '0'}}
+    full_safe = @{Gi = '1'; Env = @{CRYMT_BFIDENTITY = '0'; CRYMT_FILLLIGHTQ = '0'; CRYMT_Q17 = '0'}}
+    full_dbg = @{Gi = '1'; Env = @{CRYMT_D3D12DEBUG = '1'}}
+    full_nobf = @{Gi = '1'; Env = @{CRYMT_BFIDENTITY = '0'}}
+    full_nofl = @{Gi = '1'; Env = @{CRYMT_FILLLIGHTQ = '0'}}
+    full_noq17 = @{Gi = '1'; Env = @{CRYMT_Q17 = '0'}}
     nogi_nophys = @{Gi = '0'; Env = @{CRYMT_PHYSTURN = '0'}}
     full_nophys = @{Gi = '1'; Env = @{CRYMT_PHYSTURN = '0'}}
     full_nosf = @{Gi = '1'; Env = @{CRYMT_SFQUEUE = '0'}}
