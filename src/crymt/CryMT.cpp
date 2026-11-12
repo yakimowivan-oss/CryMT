@@ -5607,6 +5607,7 @@ void SetPolicies()
 // stays busy between our updates, so the pool never hands it to another position. The back end gets its device texture.
 bool Dx12WantsEngineEnvCube();                  // D3D12Backend.cpp: the water reflection reads the engine's cube
 void Dx12EngineEnvCube(ID3D10Resource* cube);   // ... this one (null: none)
+void Dx12DumpEngineCube();                      // ... as one picture at the next present (logs\play\cube_*_envcube.bmp)
 float g_envCubePos[3];
 bool g_envCubeLogged;
 
@@ -5682,7 +5683,9 @@ void EnvCubeUpdate()
     {
         *reinterpret_cast<int*>(entry + 8) = 0;
         facesDrawn = 0;
-        g_envCubeFull++;
+        if (++g_envCubeFull <= 10)
+            FocusLog("frame %llu: engine cube moved to %.1f %.1f %.1f: all faces again", static_cast<unsigned long long>(g_frame), cam[0], cam[1],
+                     cam[2]);
     }
     entry[1] = 1;
     *reinterpret_cast<int*>(0x382E984C) = 0; // the renderer's "all faces next time" (FUN_380D4F00 clears it after a render)
@@ -5707,14 +5710,15 @@ void EnvCubeUpdate()
     static bool tableFixed;
     if (!tableFixed)
     {
-        // DrawCubeSide's camera per face (filled at the start; 7 floats each: forward, up, roll in degrees): -X has roll +90,
-        // which draws the face turned 180 degrees from what a cube lookup by a world direction expects (2026-11-13: the
-        // cube unwrapped with D3D addressing had that face's horizon upside down, a seam on the water). The engine's
-        // real-time cubes were cut from its shaders, so nothing else reads them. CRYMT_ENVCUBE_ROLL1 sets it (default -90).
+        // DrawCubeSide's camera per face (filled at the start; 7 floats each: forward, up, roll in degrees). The engine's
+        // table is right as it is: its faces are all flipped vertically against D3D's cube layout, which the lookups undo
+        // (Water.cfx). A -X roll of -90 set here on 2026-11-13 was a mistake made on faces that lacked their front-facing
+        // geometry (the culling, EngineCubeCull). CRYMT_ENVCUBE_ROLL1 still sets that roll for tests.
         tableFixed = true;
         auto* t = reinterpret_cast<float*>(0x382AFB30);
-        const float roll1 = static_cast<float>(EnvCubeSetting("CRYMT_ENVCUBE_ROLL1", -90));
-        FocusLog("engine cube face 1 (-X) roll %.0f -> %.0f", t[7 + 6], roll1);
+        const float roll1 = static_cast<float>(EnvCubeSetting("CRYMT_ENVCUBE_ROLL1", static_cast<int>(t[7 + 6])));
+        if (roll1 != t[7 + 6])
+            FocusLog("engine cube face 1 (-X) roll %.0f -> %.0f", t[7 + 6], roll1);
         t[7 + 6] = roll1;
     }
     EnvDepthSnapshot(renderer);
@@ -8271,6 +8275,20 @@ void RunTestCommands()
         FocusLog("frame %llu: water cube %d", static_cast<unsigned long long>(g_frame), g_giControl.waterCube.load());
         return;
     }
+    if (_strnicmp(command, "crymt_envcubecull ", 18) == 0) // the engine's cube faces' culling: 0 the engine's, 1 none, 2 inverted
+    {
+        g_giControl.envCubeCull = std::min(std::max(atoi(command + 18), 0), 2);
+        g_giControl.active = true;
+        FocusLog("frame %llu: engine cube culling %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeCull.load());
+        return;
+    }
+    if (_stricmp(command, "crymt_cubepic") == 0) // the engine's cube as one picture (as Num0)
+    {
+        Dx12DumpEngineCube();
+        FocusLog("frame %llu: engine cube picture asked; cube at %.1f %.1f %.1f", static_cast<unsigned long long>(g_frame), g_envCubePos[0],
+                 g_envCubePos[1], g_envCubePos[2]);
+        return;
+    }
     if (_strnicmp(command, "crymt_envcuberate ", 18) == 0) // the engine's cube: frames per face (1..8)
     {
         g_giControl.envCubeRate = std::min(std::max(atoi(command + 18), 1), 8);
@@ -8397,7 +8415,7 @@ void GiHotkeys()
     static const Key kKeys[] = {{VK_DIVIDE, kPanelShow, false},  {VK_NUMPAD7, kPanelTabPrev, false}, {VK_NUMPAD9, kPanelTabNext, false},
                                 {VK_NUMPAD8, kPanelUp, true},     {VK_NUMPAD2, kPanelDown, true},     {VK_NUMPAD4, kPanelLess, true},
                                 {VK_NUMPAD6, kPanelMore, true},   {VK_NUMPAD5, kPanelDefault, false}, {VK_ADD, -1, false},
-                                {VK_SUBTRACT, -2, false}};
+                                {VK_SUBTRACT, -2, false},         {VK_NUMPAD0, -3, false}};
     static ULONGLONG downSince[std::size(kKeys)], lastRepeat[std::size(kKeys)];
     g_giControl.numLockOff = (GetKeyState(VK_NUMLOCK) & 1) == 0;
     const bool focus = GameHasFocus();
@@ -8421,6 +8439,19 @@ void GiHotkeys()
             continue;
         if (kKeys[i].action >= 0)
             Dx12PanelKey(kKeys[i].action);
+        else if (kKeys[i].action == -3)
+        {
+            // Num0: the engine's cube as one picture; where it was drawn against the view camera (ISystem slot 0x280/8).
+            Dx12DumpEngineCube();
+            float view[3] = {};
+            if (auto* sys = *reinterpret_cast<uint8_t**>(0x382E6A98))
+            {
+                auto* cam = reinterpret_cast<const float* (*)(void*)>((*reinterpret_cast<void***>(sys))[0x280 / 8])(sys);
+                view[0] = cam[3], view[1] = cam[7], view[2] = cam[11];
+            }
+            FocusLog("frame %llu: engine cube picture asked; cube at %.1f %.1f %.1f, view camera at %.1f %.1f %.1f", static_cast<unsigned long long>(g_frame),
+                     g_envCubePos[0], g_envCubePos[1], g_envCubePos[2], view[0], view[1], view[2]);
+        }
         else if (const float tod = g_giControl.timeOfDay; tod >= 0)
         {
             const float t = tod + (kKeys[i].action == -1 ? 1.0f : -1.0f);

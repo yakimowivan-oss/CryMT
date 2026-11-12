@@ -222,8 +222,13 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   float2 screenSize = floor(1 / max(abs(float2(ddx(uvP.x), ddy(uvP.y))), 1e-6) + 0.5); // before any branch
   half3 n = normalize(half3(normal.xy * 0.5, normal.z));
   half3 r = 2 * dot(viewVec, n) * n - viewVec;
-  half4 c = texCUBE(CryMT_WaterEnvSampler, r);
   float4 hz = CryMT_WaterFrame(7);
+  // The engine's cube has every face flipped vertically against D3D's cube layout (its face cameras' images are mirrored;
+  // measured against screen captures in each direction, 2026-11-13): within the face, y for the X and Z faces, z for the
+  // Y faces.
+  float3 ra = abs(r);
+  float3 rc = hz.y > 0.5 ? (ra.y >= ra.x && ra.y >= ra.z ? float3(r.x, r.y, -r.z) : float3(r.x, -r.y, r.z)) : r;
+  half4 c = texCUBE(CryMT_WaterEnvSampler, rc);
   half3 cubeHdr = hz.y > 0.5 ? c.rgb * c.a * 16 : -2 * log(max(1 - c.rgb, 0.001));
   half4 base = hz.y > 0.5 || c.a > 0.5 ? half4(cubeHdr * (hz.x > 0 ? hz.x : 1), planar.a) : planar;
   if (hz.w < 1.5)

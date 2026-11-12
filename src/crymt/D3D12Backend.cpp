@@ -903,6 +903,7 @@ Device* g_device;
 // makes its view (Device::EngineCube).
 std::mutex g_engineCubeLock;
 ID3D10Resource* g_engineCubePending;
+std::atomic<bool> g_cubeDumpWanted; // Dx12DumpEngineCube (Num0 with the in-game keys): the cube as one picture at the next present
 ID3D10Device* DeviceInterface(); // AddRef'd
 void SubmitMain();               // context thread: submits the main list being recorded
 void PollDone();                 // refreshes the completed serial
@@ -4909,6 +4910,23 @@ public:
             i++;
         return i;
     }
+    // The culling of the engine's cube faces (in its render: m_engineCubePass): 0 as the engine sets it, 1 none, 2 the
+    // other side, the default (2026-11-13: the faces lacked the near terrain and the houses, palms stayed: the face
+    // cameras' images are mirrored, so the winding turns and the front faces were the ones culled; a hint the user was
+    // given: "r->SetCullMode(R_CULL_NONE)"). CRYMT_ENVCUBE_CULL, the reflections page.
+    static int EngineCubeCullBase()
+    {
+        static const int env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_CULL", v, 8) ? std::min(std::max(_wtoi(v), 0), 2) : 2;
+        }();
+        return env;
+    }
+    static int EngineCubeCull()
+    {
+        const int panel = g_giControl.envCubeCull;
+        return panel < 0 ? EngineCubeCullBase() : std::min(panel, 2);
+    }
     // Its brightness on the water (CRYMT_ENVCUBE_SCALE, default 1: the engine drew it as it draws the planar reflection).
     static float EngineCubeScale()
     {
@@ -6683,6 +6701,8 @@ public:
         // water's SSR is on.
         bool engineCube = false;
         WaterEnvCube(&engineCube);
+        if (m_engineCubeDumpWanted) // the capture key: the world direction to the sun, to place it in the cube's dump
+            Log("capture: sun direction %.3f %.3f %.3f (found %.0f)", info->sun[0], info->sun[1], info->sun[2], info->sun[3]);
         data[28] = engineCube ? EngineCubeScale() : WaterSky();
         data[29] = engineCube ? 1.0f : 0.0f;
         data[30] = info->nearZ;
@@ -9487,6 +9507,8 @@ public:
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE"};
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
         static const char* const waterSource[] = {"ВОКСЕЛИ|VOXELS", "ДВИЖОК|ENGINE"};
+        static const char* const cubeCull[] = {"КАК В ДВИЖКЕ|ENGINE'S", "НЕТ|NONE", "ОБРАТНОЕ|INVERTED"};
+        static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
@@ -9572,6 +9594,10 @@ public:
             {3, "Грань кубкарты рисуется|Cube map face drawn", 0, 5, 1, false, cubeRate, 0, nullptr,
              [] { const int v = g_giControl.envCubeRate; return EnvCubeRateIndex(v > 0 ? v : EnvCubeRateBase()); },
              [] { return EnvCubeRateIndex(EnvCubeRateBase()); }, [](int v) { g_giControl.envCubeRate = kEnvCubeRates[v]; }, true, nullptr},
+            {3, "Отсечение в кубкарте|Cube map culling", 0, 2, 1, true, cubeCull, 0, nullptr, [] { return EngineCubeCull(); },
+             [] { return EngineCubeCullBase(); }, [](int v) { g_giControl.envCubeCull = v; }, true, nullptr},
+            {3, "Снимок кубкарты (logs\\play)|Cube map picture (logs\\play)", 0, 1, 1, true, cubePicture, 0, nullptr, [] { return 0; },
+             [] { return 0; }, [](int) { g_cubeDumpWanted = true; }, false, nullptr},
             {3, "Небо в отражении воды|Sky in the water's reflection", 2, 20, 1, false, nullptr, 0.1f, "x%.1f",
              [] { return static_cast<int>(lroundf(WaterSky() * 10.0f)); }, [] { return static_cast<int>(lroundf(WaterSkyBase() * 10.0f)); },
              [](int v) { g_giControl.waterSky = v / 10.0f; }, true, nullptr},
@@ -10141,6 +10167,12 @@ public:
                 if (f)
                     fprintf(f, "P6\n%u %u\n255\n", w, h);
                 std::vector<uint8_t> row(static_cast<size_t>(w) * 3);
+                const int faceIndex = d.name.size() == 8 && d.name.compare(0, 7, "envcube") == 0 ? d.name[7] - '0' : -1;
+                if (faceIndex >= 0 && faceIndex < 6)
+                {
+                    m_cubeFaces[faceIndex].assign(static_cast<size_t>(w) * h * 3, 0.0f);
+                    m_cubeFaceSize = w;
+                }
                 double sum[4] = {};
                 for (UINT y = 0; y < h; y++)
                 {
@@ -10151,6 +10183,8 @@ public:
                         for (int c = 0; c < 3; c++)
                         {
                             const float v = src[x * 4 + c] / 255.0f * k;
+                            if (faceIndex >= 0 && faceIndex < 6 && w == h)
+                                m_cubeFaces[faceIndex][(static_cast<size_t>(y) * w + x) * 3 + c] = v;
                             sum[c] += v;
                             row[x * 3 + c] = static_cast<uint8_t>(std::min(1.0f - std::exp(-v), 1.0f) * 255.0f);
                         }
@@ -10294,6 +10328,117 @@ public:
         if (!m_dumps.empty())
             Log("capture: %zu dumps written (%s)", m_dumps.size(), m_dumpTag.c_str());
         m_dumps.clear();
+        WriteCubePicture();
+    }
+
+    // The engine's cube as one picture (<tag>_envcube.bmp, Windows opens it): what one standing at the cube's place sees
+    // looking +X, -X, +Y (top row), -Y, up, down (bottom row), each labelled; the sides with Z up (horizon level, sky on
+    // top), up and down with +Y at the top. Every pixel is the cube looked up by its world direction as the water does
+    // (D3D cube addressing), so a face stored turned or mirrored shows so. Exposure from the cube's log-average (0.18,
+    // Reinhard, gamma 2.2), as a photo; the HDR is RGBK-decoded.
+    std::vector<float> m_cubeFaces[6];
+    UINT m_cubeFaceSize = 0;
+    void WriteCubePicture()
+    {
+        const UINT s = m_cubeFaceSize;
+        for (auto& face : m_cubeFaces)
+            if (!s || face.size() != static_cast<size_t>(s) * s * 3)
+                return;
+        static const char* const kGlyphs[5][7] = {
+            {".....", "..#..", "..#..", "#####", "..#..", "..#..", "....."}, // +
+            {".....", ".....", ".....", "#####", ".....", ".....", "....."}, // -
+            {"#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"}, // X
+            {"#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."}, // Y
+            {"#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"}, // Z
+        };
+        const UINT gap = 8, W = s * 3 + gap * 4, H = s * 2 + gap * 3, scale = std::max(2u, s / 64);
+        std::vector<uint8_t> img(static_cast<size_t>(W) * H * 3, 40);
+        double logSum = 0;
+        for (const auto& face : m_cubeFaces)
+            for (size_t i = 0; i < face.size(); i += 3)
+                logSum += std::log(1e-4 + 0.2126 * face[i] + 0.7152 * face[i + 1] + 0.0722 * face[i + 2]);
+        const float exposure = static_cast<float>(0.18 / std::exp(logSum / (6.0 * s * s)));
+        // Per panel: forward and up (right = forward x up).
+        static const float kView[6][6] = {{1, 0, 0, 0, 0, 1}, {-1, 0, 0, 0, 0, 1}, {0, 1, 0, 0, 0, 1}, {0, -1, 0, 0, 0, 1}, {0, 0, 1, 0, 1, 0}, {0, 0, -1, 0, 1, 0}};
+        for (int f = 0; f < 6; f++)
+        {
+            const UINT ox = gap + (f % 3) * (s + gap), oy = gap + (f / 3) * (s + gap);
+            const float* fw = kView[f];
+            const float* up = kView[f] + 3;
+            const float rt[3] = {fw[1] * up[2] - fw[2] * up[1], fw[2] * up[0] - fw[0] * up[2], fw[0] * up[1] - fw[1] * up[0]};
+            for (UINT y = 0; y < s; y++)
+                for (UINT x = 0; x < s; x++)
+                {
+                    const float a = 2.0f * (x + 0.5f) / s - 1.0f, bb = 1.0f - 2.0f * (y + 0.5f) / s;
+                    float d[3] = {fw[0] + a * rt[0] + bb * up[0], fw[1] + a * rt[1] + bb * up[1], fw[2] + a * rt[2] + bb * up[2]};
+                    const float ax = std::fabs(d[0]), ay = std::fabs(d[1]), az = std::fabs(d[2]);
+                    if (ay >= ax && ay >= az) // the engine's faces are flipped vertically (as Water.cfx looks them up)
+                        d[2] = -d[2];
+                    else
+                        d[1] = -d[1];
+                    int face;
+                    float sc, tc;
+                    if (ax >= ay && ax >= az)
+                        face = d[0] > 0 ? 0 : 1, sc = (d[0] > 0 ? -d[2] : d[2]) / ax, tc = -d[1] / ax;
+                    else if (ay >= az)
+                        face = d[1] > 0 ? 2 : 3, sc = d[0] / ay, tc = (d[1] > 0 ? d[2] : -d[2]) / ay;
+                    else
+                        face = d[2] > 0 ? 4 : 5, sc = (d[2] > 0 ? d[0] : -d[0]) / az, tc = -d[1] / az;
+                    const UINT u = std::min(s - 1, static_cast<UINT>(std::max(0.0f, (sc + 1) * 0.5f * s)));
+                    const UINT v = std::min(s - 1, static_cast<UINT>(std::max(0.0f, (tc + 1) * 0.5f * s)));
+                    const float* hdr = &m_cubeFaces[face][(static_cast<size_t>(v) * s + u) * 3];
+                    uint8_t* p = &img[(static_cast<size_t>(oy + y) * W + ox + x) * 3];
+                    for (int c = 0; c < 3; c++)
+                    {
+                        const float e = hdr[c] * exposure;
+                        p[c] = static_cast<uint8_t>(255.0f * std::pow(e / (1.0f + e), 1.0f / 2.2f));
+                    }
+                }
+            const int glyphs[2] = {f % 2 == 0 ? 0 : 1, 2 + f / 2};
+            for (int g = 0; g < 2; g++)
+                for (UINT gy = 0; gy < 9 * scale; gy++)
+                    for (UINT gx = 0; gx < 7 * scale; gx++)
+                    {
+                        const int cx = static_cast<int>(gx / scale) - 1, cy = static_cast<int>(gy / scale) - 1;
+                        const bool on = cx >= 0 && cx < 5 && cy >= 0 && cy < 7 && kGlyphs[glyphs[g]][cy][cx] == '#';
+                        uint8_t* p = &img[(static_cast<size_t>(oy + 4 + gy) * W + ox + 4 + g * 7 * scale + gx) * 3];
+                        p[0] = on ? 255 : 0; // RGB here, BGR on writing
+                        p[1] = on ? 255 : 0;
+                        p[2] = on ? 0 : 0;
+                    }
+            m_cubeFaces[f].clear();
+        }
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%s%s_envcube.bmp", CryMTCapture("").c_str(), m_dumpTag.c_str());
+        FILE* file = nullptr;
+        if (fopen_s(&file, path, "wb") != 0 || !file)
+            return;
+        const UINT rowBytes = (W * 3 + 3) & ~3u, size = 54 + rowBytes * H;
+        uint8_t header[54] = {'B', 'M'};
+        const auto put = [&](int at, uint32_t v) { memcpy(header + at, &v, 4); };
+        put(2, size);
+        put(10, 54);
+        put(14, 40);
+        put(18, W);
+        put(22, H);
+        header[26] = 1;
+        header[28] = 24;
+        put(34, rowBytes * H);
+        fwrite(header, 1, 54, file);
+        std::vector<uint8_t> row(rowBytes, 0);
+        for (UINT y = H; y-- > 0;)
+        {
+            for (UINT x = 0; x < W; x++)
+            {
+                const uint8_t* p = &img[(static_cast<size_t>(y) * W + x) * 3];
+                row[x * 3] = p[2];
+                row[x * 3 + 1] = p[1];
+                row[x * 3 + 2] = p[0];
+            }
+            fwrite(row.data(), 1, rowBytes, file);
+        }
+        fclose(file);
+        Log("engine cube picture: %s", path);
     }
 
     // DLAA output (the color's format, unordered access) and the motion vectors (RunMotion; zero until it runs), made
@@ -11127,6 +11272,7 @@ void Device::PassName(const char* text)
     if (strcmp(text, "CryMT engine cube") == 0 || strcmp(text, "CryMT engine cube end") == 0)
     {
         m_engineCubePass = text[17] == 0;
+        m_psoDirty = true; // its culling (EngineCubeCull)
         return;
     }
     if (!m_passNamesOn)
@@ -11258,7 +11404,8 @@ ID3D12PipelineState* Device::Pso(bool indexed)
     k.layout = m_layout ? m_layout->Id() : 0;
     k.blend = m_blend ? m_blend->Id() : 0;
     k.depth = m_depth ? m_depth->Id() : 0;
-    k.raster = m_raster ? m_raster->Id() : 0;
+    const int cubeCull = m_engineCubePass ? EngineCubeCull() : 0;
+    k.raster = (m_raster ? m_raster->Id() : 0) | static_cast<uint32_t>(cubeCull) << 28;
     k.sampleMask = m_sampleMask;
     UINT numRtv = 0;
     for (UINT i = 0; i < 8; i++)
@@ -11293,6 +11440,10 @@ ID3D12PipelineState* Device::Pso(bool indexed)
     SetBlend(r.blend, m_blend ? m_blend->d12 : Blend12From(kDefaultBlend));
     r.sampleMask = m_sampleMask;
     r.raster = m_raster ? m_raster->d12 : Raster12From(kDefaultRaster); // no padding
+    if (cubeCull == 1)
+        r.raster.CullMode = D3D12_CULL_MODE_NONE;
+    else if (cubeCull == 2 && r.raster.CullMode != D3D12_CULL_MODE_NONE)
+        r.raster.CullMode = r.raster.CullMode == D3D12_CULL_MODE_BACK ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
     SetDepth(r.depth, m_depth ? m_depth->d12 : Depth12From(kDefaultDepth));
     if (!m_dsv)
         r.depth.DepthEnable = r.depth.StencilEnable = FALSE;
@@ -13213,6 +13364,26 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
             g_capture.window++;
         }
     }
+    bool cubeDump = false;
+    if (g_cubeDumpWanted.exchange(false))
+    {
+        if (m_engineCube && m_dumps.empty())
+        {
+            SYSTEMTIME t;
+            GetLocalTime(&t);
+            char tag[48];
+            snprintf(tag, sizeof(tag), "cube_%02u%02u_%02u%02u%02u", t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+            m_dumpTag = tag;
+            Require(m_engineCube->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            FlushBarriers();
+            static const char* const faces[6] = {"envcube0", "envcube1", "envcube2", "envcube3", "envcube4", "envcube5"};
+            for (UINT face = 0; face < 6; face++)
+                RecordDump(m_engineCube->info->res, faces[face], 6, face);
+            cubeDump = true;
+        }
+        else
+            Log("engine cube picture: no engine cube now (water reflection CUBE MAP or SSR + CUBE MAP with the engine's cube)");
+    }
     Require(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE);
     m_barriers.push_back(Transition(target, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST));
     FlushBarriers();
@@ -13225,6 +13396,11 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
         Log("Present failed %08lx, device removed reason %08lx", static_cast<unsigned long>(hr), static_cast<unsigned long>(g.dev->GetDeviceRemovedReason()));
         m_removedLogged = true;
         LogDred();
+    }
+    if (cubeDump)
+    {
+        WaitIdle();
+        WriteDumps();
     }
     m_frameFences[m_frame % kFramesInFlight] = g.signaled;
     m_frame++;
@@ -13734,6 +13910,11 @@ void Dx12DrawPacket(const uint8_t* packet)
 {
     if (dx12::g_device)
         dx12::g_device->DrawIndexedWithConstants(packet);
+}
+
+void Dx12DumpEngineCube()
+{
+    dx12::g_cubeDumpWanted = true;
 }
 
 bool Dx12WantsEngineEnvCube()

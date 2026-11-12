@@ -44,6 +44,8 @@ struct GiControl
     std::atomic<int> waterSource{-1};   // the water's cube: 1 the engine's own capture at the camera (CryMT.cpp EnvCubeUpdate),
                                         // 0 the voxel grid's; -1 as CRYMT_ENVCUBE says
     std::atomic<int> envCubeRate{-1};   // the engine's cube: frames per face drawn (1..8); -1 as CRYMT_ENVCUBE_RATE says
+    std::atomic<int> envCubeCull{-1};   // ... its faces' culling: 0 as the engine sets it, 1 none, 2 the other side; -1 as
+                                        // CRYMT_ENVCUBE_CULL says
     std::atomic<float> envOwnScale{1.0f}, envAllScale{1.0f}; // their strengths
 };
 extern GiControl g_giControl;
