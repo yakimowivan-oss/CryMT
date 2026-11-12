@@ -8100,6 +8100,13 @@ void RunTestCommands()
         FocusLog("frame %llu: screen-space shadows reach %d m", static_cast<unsigned long long>(g_frame), g_giControl.sssReach.load());
         return;
     }
+    if (_strnicmp(command, "crymt_watercube ", 16) == 0) // the ocean's reflection 1 from the env cube, 0 planar (the cvar apart)
+    {
+        g_giControl.waterCube = atoi(command + 16);
+        g_giControl.active = true;
+        FocusLog("frame %llu: water cube %d", static_cast<unsigned long long>(g_frame), g_giControl.waterCube.load());
+        return;
+    }
     if (_strnicmp(command, "crymt_sssweapon ", 16) == 0) // the panel's list index: 0.5% 2% 5% 10% 20%
     {
         g_giControl.sssWeapon = atoi(command + 16);

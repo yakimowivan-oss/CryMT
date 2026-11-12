@@ -98,6 +98,37 @@ const char* const kEnvAll = R"(#if D3D10
   // do custom pass setup
   frag_custom_begin(pPass);)";
 
+// The ocean's reflection (Water.cfx WaterPS) from CryMT's environment cube: the D3D12 back end binds it in place of
+// Textures/CryMT/waterenv.dds (alpha 0 everywhere: the planar reflection stays) when the water cube is on (CRYMT_WATERCUBE,
+// the reflections page; the engine's planar pass then off: r_WaterReflections 0).
+const char* const kWaterEnvDecl = R"(#if D3D10
+samplerCUBE CryMT_WaterEnvSampler = sampler_state
+{
+  Texture = Textures/CryMT/waterenv.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
+// The reflection towards the mirrored view direction (world) from the cube, which holds 1 - exp(-0.5 x): back to HDR.
+half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal)
+{
+  half3 n = normalize(normal);
+  half3 r = 2 * dot(viewVec, n) * n - viewVec;
+  half4 c = texCUBE(CryMT_WaterEnvSampler, r);
+  return c.a > 0.5 ? half4(-2 * log(max(1 - c.rgb, 0.001)), planar.a) : planar;
+}
+#else
+half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal)
+{
+  return planar;
+}
+#endif
+
+)";
+
 const char* const kGiDecl = R"(#include "CommonRAM.cfi"
 
 // CryMT GI: the engine binds the placeholder Textures/CryMT/gi.dds (all zero: the ambient stays as it was); CryMT's
@@ -576,6 +607,7 @@ const wchar_t* kZPass = L"Shaders\\HWScripts\\CryFX\\CommonZPass.cfi";
 const wchar_t* kParticles = L"Shaders\\HWScripts\\CryFX\\Particles.cfi";
 const wchar_t* kMetal = L"Shaders\\HWScripts\\CryFX\\Metal.cfx";
 const wchar_t* kVegetation = L"Shaders\\HWScripts\\CryFX\\Vegetation.cfx";
+const wchar_t* kWater = L"Shaders\\HWScripts\\CryFX\\Water.cfx";
 const wchar_t* kPlaceholder = L"Textures\\CryMT\\gi.dds";
 // The patch goes into the game as a pak: without -DEVMODE CryPak reads files only from paks (loose files are ignored)
 // and a later pak by name overrides the earlier ones (as the official ZPatch1.pak does), so zzCryMT.pak's sources
@@ -715,17 +747,21 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
                 particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal)),
-                vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation));
+                vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
                                "  float tcIterParam = LightInfoTC_DB.w;\n  for (int i=0; i<LightsNum_DB; i++, tcLI.x+=tcIter)\n#else\n";
-    const bool ok = Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl) &&
+    const bool ok = // The ocean's reflection from CryMT's cube when it is bound (kWaterEnvDecl).
+                    Replace(water, "sampler2D envMapSamplerRefr : register(s1)\n", std::string(kWaterEnvDecl) + "sampler2D envMapSamplerRefr : register(s1)\n") &&
+                    Replace(water, "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n\n//  OUT.Color = reflectColor;",
+                            "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n  reflectColor = CryMT_WaterReflection(reflectColor, viewVec, bumpNormal); // CryMT\n\n//  OUT.Color = reflectColor;") &&
+                    Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl) &&
                     // The sun's shadow mask with CryMT's screen-space shadows, also beyond the shadow maps.
                     Replace(frag, "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);",
                             "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);\n"
@@ -829,6 +865,15 @@ std::wstring InstallGi()
     // The Forward+ test's placeholder: 2x1, the first texel zero (off), the second 6B6B6B6B.
     std::string fplus = foliage;
     memset(&fplus[132], 0x6B, 4);
+    // The water reflection cube's placeholder: a 2x2 cube (A8R8G8B8, 6 faces), alpha 0 everywhere (the planar reflection
+    // stays); face 0's second texel 003D3D3D (the mark).
+    std::string waterEnv(128 + 6 * 16, '\0');
+    const unsigned int wheader[] = {0x20534444, 124, 0x100F, 2, 2, 8, 0, 1};
+    memcpy(&waterEnv[0], wheader, sizeof(wheader));
+    memcpy(&waterEnv[76], pf, sizeof(pf));
+    const unsigned int wcaps[] = {0x1008, 0xFE00}; // complex texture; cube map with all six faces
+    memcpy(&waterEnv[108], wcaps, sizeof(wcaps));
+    waterEnv[128 + 4] = waterEnv[128 + 5] = waterEnv[128 + 6] = 0x3D;
     // The screen-space shadows' placeholder: 2x1, the first texel zero (no shadow), the second 005C005C (the mark: its
     // red is zero in either byte order, as fragLib reads the whole screen from it).
     std::string sss = foliage;
@@ -849,6 +894,8 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/Particles.cfi", Crlf(particles)},
                               {"Shaders/HWScripts/CryFX/Metal.cfx", Crlf(metal)},
                               {"Shaders/HWScripts/CryFX/Vegetation.cfx", Crlf(vegetation)},
+                              {"Shaders/HWScripts/CryFX/Water.cfx", Crlf(water)},
+                              {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/env.dds", env},
                               {"Textures/CryMT/gi.dds", dds},
                               {"Textures/CryMT/jitter.dds", jitter},

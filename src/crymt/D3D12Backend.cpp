@@ -1116,6 +1116,7 @@ const ResourceInfo* g_pvolPlaceholder;    // Textures/CryMT/pvol.dds, see IsPvol
 const ResourceInfo* g_fplusPlaceholder;   // Textures/CryMT/fplus.dds, see IsFPlusPlaceholder
 const ResourceInfo* g_sssPlaceholder;     // Textures/CryMT/sss.dds (ShadowMaskGen's CryMT_SSSSampler), see IsSssPlaceholder
 const ResourceInfo* g_envPlaceholder;     // Textures/CryMT/env.dds (fragLib's CryMT_EnvSampler), see IsEnvPlaceholder
+const ResourceInfo* g_waterEnvPlaceholder; // Textures/CryMT/waterenv.dds (Water.cfx's CryMT_WaterEnvSampler), see IsWaterEnvPlaceholder
 SerializeRootSignatureFn g_serializeRoot;
 
 // CryMT GI compute pass (Device::RunGi). Root constants b0 (kGiConstants floats), t0 scene depth, t1 previous HDR colour,
@@ -4794,6 +4795,17 @@ public:
         }
         const int key = g_giControl.env;
         return g_giControl.active && key >= 0 ? key == 1 : on == 1;
+    }
+
+    // The ocean's reflection from the environment cube (reflections phase 0): CRYMT_WATERCUBE=1 or the reflections page.
+    static bool WaterCubeOn()
+    {
+        static const bool env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_WATERCUBE", v, 8) && v[0] == L'1';
+        }();
+        const int panel = g_giControl.waterCube;
+        return panel < 0 ? env : panel > 0;
     }
 
     bool EnsureEnvTargets()
@@ -9043,6 +9055,7 @@ public:
         static const char* const opacity[] = {"ЭКРАН И ГЕОМЕТРИЯ|SCREEN+GEOMETRY", "ГЕОМЕТРИЯ|GEOMETRY"};
         static const char* const cache[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "КАЖДЫЙ 4-Й|EVERY 4TH"};
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE"};
+        static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP"};
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
         static const std::vector<PanelItem> items = {
             // GI
@@ -9114,6 +9127,13 @@ public:
             {3, "Отражения|Reflections", 0, 1, 1, true, env, 0, nullptr,
              [] { const int v = g_giControl.env; return v < 0 ? (EnvDefaultOn() ? 1 : 0) : v; }, [] { return EnvDefaultOn() ? 1 : 0; },
              [](int v) { g_giControl.env = v; }, true, nullptr},
+            {3, "Отражение воды|Water reflection", 0, 1, 1, true, water, 0, nullptr, [] { return WaterCubeOn() ? 1 : 0; },
+             [] { return 0; },
+             [](int v) {
+                 g_giControl.waterCube = v;
+                 CryMTConsoleCommand(v ? "r_WaterReflections 0" : "r_WaterReflections 1"); // the engine's planar pass
+             },
+             true, nullptr},
             {3, "На всех материалах|On every material", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.envAll ? 1 : 0; },
              [] { return 1; }, [](int v) { g_giControl.envAll = v != 0; }, true, nullptr},
             {3, "Материалы со своей картой|Materials with a map", 0, 16, 1, false, nullptr, 0.5f, "x%.1f",
@@ -11092,6 +11112,10 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                         ? m_envCubeAll : nullptr; // fragLib's, every material but water and glass (black placeholder there)
     if (envAll && st.srvDirty)
         Require(envAll->info, kSrvState);
+    // The ocean's reflection cube (Water.cfx reads it in place of its placeholder; water is "refractive", so not envAll).
+    Srv12* waterEnv = s == kPS && m_envReady && m_envCubeAll && WaterCubeOn() ? m_envCubeAll : nullptr;
+    if (waterEnv && st.srvDirty)
+        Require(waterEnv->info, kSrvState);
     if (s == kPS && m_ps && st.srvDirty)
         for (int k = 0; k < 2; k++)
             if (const int slot = k ? m_ps->env2DSlot : m_ps->envCubeSlot; slot >= 0 && slot < static_cast<int>(kTableSrvs) && st.srv[slot])
@@ -11129,6 +11153,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = envSub[0]->cpu;
             if (v && envAll && v->info == g_envPlaceholder)
                 src[i] = envAll->cpu;
+            if (v && waterEnv && v->info == g_waterEnvPlaceholder)
+                src[i] = waterEnv->cpu;
             if (v && envSub[1] && static_cast<int>(i) == m_ps->env2DSlot)
                 src[i] = envSub[1]->cpu;
             if (v && s == kPS && m_foliageSrv && v->info == g_foliagePlaceholder)
@@ -11664,6 +11690,19 @@ bool IsSssPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DAT
     return true;
 }
 
+// Textures/CryMT/waterenv.dds: CryMT's placeholder for the water's reflection cube (patched Water.cfx): a 2x2 cube, alpha 0
+// everywhere, face 0's second texel 003D3D3D (the mark).
+bool IsWaterEnvPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
+{
+    if (!init || !init->pSysMem || d.Width != 2 || d.Height != 2 || d.ArraySize != 6 || !(d.MiscFlags & D3D10_RESOURCE_MISC_TEXTURECUBE))
+        return false;
+    const auto* p = static_cast<const uint8_t*>(init->pSysMem);
+    for (int i = 0; i < 8; i++)
+        if (p[i] != (i >= 4 && i < 7 ? 0x3D : 0))
+            return false;
+    return true;
+}
+
 HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SUBRESOURCE_DATA* init, ID3D10Texture2D** out)
 {
     if (!desc)
@@ -11682,6 +11721,11 @@ HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SU
     {
         g_envPlaceholder = Info(t);
         Log("environment placeholder texture recognized");
+    }
+    else if (IsWaterEnvPlaceholder(*desc, init))
+    {
+        g_waterEnvPlaceholder = Info(t);
+        Log("water reflection cube placeholder texture recognized");
     }
     else if (IsEnvCube(*desc, init))
     {
