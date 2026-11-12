@@ -5637,6 +5637,7 @@ void Dx12EngineEnvCube(ID3D10Resource* cube);   // ... this one (null: none)
 void Dx12DumpEngineCube();                      // ... as one picture at the next present (logs\play\cube_*_envcube.bmp)
 float g_envCubePos[3];
 bool g_envCubeEntitiesPatched;
+bool g_envCubeRefill; // EnvCubeUpdate: the cube's texture changed, draw all faces fresh
 bool g_envCubeLogged;
 
 int EnvCubeSetting(const char* name, int fallback)
@@ -5706,6 +5707,11 @@ void EnvCubeUpdate()
     // One face a call, always (entry +1 set, the face at +8 cycles): the engine's six-face pass would draw them all into
     // one slice (kTextureRtv). After a jump the faces start again from 0; the water reads the cube once it has six.
     static int facesDrawn;
+    if (g_envCubeRefill)
+    {
+        g_envCubeRefill = false;
+        facesDrawn = 0;
+    }
     static float lastHours = -1.0f;
     const float dx = cam[0] - g_envCubePos[0], dy = cam[1] - g_envCubePos[1], dz = cam[2] - g_envCubePos[2];
     // A jump of the time of day (the panel's Num+ / Num-, a script) redraws the whole cube too; the fast time's small steps
@@ -5852,6 +5858,11 @@ void EnvCubeUpdate()
     auto* object = ctexture ? *reinterpret_cast<ID3D10Resource**>(ctexture + kTextureDevice) : nullptr;
     if (object != lastObject)
     {
+        if (lastObject) // another size (r_EnvCMResolution): the whole cube again (fresh, from the next render)
+        {
+            *reinterpret_cast<int*>(entry + 8) = 0;
+            g_envCubeRefill = true;
+        }
         lastObject = object;
         if (lastCube)
             lastCube->Release();
@@ -5868,8 +5879,13 @@ void EnvCubeUpdate()
                      static_cast<unsigned long long>(g_frame), cam[0], cam[1], cam[2], static_cast<void*>(object), static_cast<void*>(lastCube),
                      d.Width, d.Height, static_cast<int>(d.Format), d.MipLevels, d.ArraySize, d.MiscFlags, flags, rate);
     }
+    // The water gets the cube once this texture has all its faces; a later refill (a jump, the time of day) keeps it (the old
+    // faces until the new ones come: better than none; the back end's HDR copy swaps them face by face).
+    static ID3D10Resource* filledObject;
     facesDrawn++;
-    Dx12EngineEnvCube(facesDrawn >= 6 ? lastCube : nullptr);
+    if (facesDrawn >= 6)
+        filledObject = object;
+    Dx12EngineEnvCube(filledObject == object ? lastCube : nullptr);
 }
 
 // PreThunk swaps the return address of the patched call so the callee sees the caller's exact stack

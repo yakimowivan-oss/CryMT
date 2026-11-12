@@ -9808,6 +9808,7 @@ public:
         static const char* const cubeCull[] = {"КАК В ДВИЖКЕ|ENGINE'S", "НЕТ|NONE", "ОБРАТНОЕ|INVERTED"};
         static const char* const cubeMip[] = {"АВТО|AUTO", "0", "1", "2", "3", "4", "5", "6", "7", "8"};
         static const char* const cubeBlend[] = {"ВЫКЛ|OFF", "50%", "25%"};
+        static const char* const cubeSize[] = {"64", "128", "256", "512"};
         static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
@@ -9899,6 +9900,15 @@ public:
             {3, "Mip кубкарты (отладка)|Cube map mip (debug)", 0, 9, 1, false, cubeMip, 0, nullptr,
              [] { return std::max(g_giControl.envCubeMip.load(), -1) + 1; }, [] { return 0; }, [](int v) { g_giControl.envCubeMip = v - 1; }, true,
              nullptr},
+            // r_EnvCMResolution, the renderer's int at 0x382E9848 (0 64, 1 128, 2 256, 3 512): the engine makes its cube anew.
+            {3, "Размер кубкарты|Cube map size", 0, 3, 1, false, cubeSize, 0, nullptr,
+             [] { return std::min(std::max(*reinterpret_cast<const int*>(0x382E9848), 0), 3); }, [] { return 2; },
+             [](int v) {
+                 char command[48];
+                 snprintf(command, sizeof(command), "r_EnvCMResolution %d", v);
+                 CryMTConsoleCommand(command);
+             },
+             true, nullptr},
             {3, "Смешивание граней|Face blending", 0, 2, 1, true, cubeBlend, 0, nullptr, [] { return EngineCubeBlendIndex(EngineCubeBlend()); },
              [] { return EngineCubeBlendIndex(EngineCubeBlendBase()); }, [](int v) { g_giControl.envCubeBlend = v; }, true, nullptr},
             {3, "Сущности и облака в кубкарте|Entities and clouds in the cube", 0, 1, 1, true, onOff, 0, nullptr,
