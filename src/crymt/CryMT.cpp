@@ -2527,6 +2527,67 @@ void ApplyJitter(float* proj, uint32_t width, uint32_t height, float scale)
     proj[9] += scale * 2.0f * g_jitterY / static_cast<float>(height);
 }
 
+// Forward+ test (DlssSceneInfo::fplusLamps): the level's point lamps without shadow maps, once a frame at its first main
+// camera (main still waits for the render thread then, so the list is this frame's). Cheap, so taken also while the
+// test is off (the engine page's Num1 turns it on live).
+uint32_t g_fplusFrame;
+void FocusLog(const char* format, ...);
+void FillFPlusLamps(uintptr_t renderer, uint32_t width, uint32_t height)
+{
+    if (g_fplusFrame == g_dlssFrame)
+        return;
+    g_fplusFrame = g_dlssFrame;
+    const auto* r = reinterpret_cast<const uint8_t*>(renderer);
+    const uint8_t* list = r + kRdLevelLights + 16;
+    auto** lights = *reinterpret_cast<uint8_t** const*>(list);
+    const int count = *reinterpret_cast<const int*>(list + 8);
+    const float* cam = reinterpret_cast<const float*>(r + kCameraOffset);
+    const float c4[4] = {cam[3], cam[7], cam[11], 1.0f};
+    memcpy(g_dlssScene.fplusCam, c4, sizeof(c4));
+    g_dlssScene.fplusWidth = width;
+    g_dlssScene.fplusHeight = height;
+    uint32_t n = 0;
+    for (int i = 0; lights && i < count && i < 32; i++)
+    {
+        const uint8_t* l = lights[i];
+        if (!l)
+            continue;
+        const uint32_t flags = *reinterpret_cast<const uint32_t*>(l + kLightFlags);
+        const float radius = *reinterpret_cast<const float*>(l + kLightRadius);
+        // As the engine's light info texture types them: 0x20 omni; 0x10 casts shadow maps (the engine's own then). Only
+        // the level's light entities (0x400000: mine's and harbor's lamps 490020/490030/490050): the dynamic lights
+        // without it (90020 radius 500 m, colour 8.2 on mine, 98020) are applied by the engine to some objects only, and
+        // given to every tile they whitened terrain and buildings.
+        if ((flags & (kLightFlagSun | kLightFlagsFake | kLightFlagProjector | 0x10)) || !(flags & kLightFlagPoint) || !(flags & 0x400000) ||
+            !(radius > 0.01f && radius < 1000.0f))
+            continue;
+        const float* o = reinterpret_cast<const float*>(l + kLightOrigin);
+        const float* c = reinterpret_cast<const float*>(l + kLightColour);
+        const float lamp[8] = {o[0], o[1], o[2], 1.0f / radius, c[0], c[1], c[2], c[3]};
+        memcpy(g_dlssScene.fplusLamps[n++], lamp, sizeof(lamp));
+    }
+    g_dlssScene.fplusCount = n;
+    // Diagnostics: the list as the first main camera sees it, every 600 frames.
+    static uint32_t fills;
+    if (fills++ % 600 == 300)
+    {
+        char flags[160] = {};
+        for (int i = 0, at = 0; lights && i < count && i < 12 && at < 140; i++)
+            if (lights[i])
+                at += snprintf(flags + at, sizeof(flags) - at, " %x", *reinterpret_cast<const uint32_t*>(lights[i] + kLightFlags));
+        FocusLog("frame %llu: Forward+ at the first camera: %d lights, %u lamps taken; flags%s", static_cast<unsigned long long>(g_frame), count, n, flags);
+        for (int i = 0; lights && i < count && i < 12; i++)
+            if (const uint8_t* l = lights[i])
+            {
+                const float* o = reinterpret_cast<const float*>(l + kLightOrigin);
+                const float* c = reinterpret_cast<const float*>(l + kLightColour);
+                FocusLog("  light %d: flags %x radius %.2f colour %.2f %.2f %.2f %.2f, %.1f m from the camera", i,
+                         *reinterpret_cast<const uint32_t*>(l + kLightFlags), *reinterpret_cast<const float*>(l + kLightRadius), c[0], c[1],
+                         c[2], c[3], sqrtf((o[0] - c4[0]) * (o[0] - c4[0]) + (o[1] - c4[1]) * (o[1] - c4[1]) + (o[2] - c4[2]) * (o[2] - c4[2])));
+            }
+    }
+}
+
 void DlssCamera(uintptr_t renderer, const uint8_t* camera, int level)
 {
     uint32_t width, height;
@@ -2565,7 +2626,10 @@ void DlssCamera(uintptr_t renderer, const uint8_t* camera, int level)
         g_dlssScene.shiftU = dlss ? g_jitterX / static_cast<float>(width) : 0.0f;
         g_dlssScene.shiftV = dlss ? g_jitterY / static_cast<float>(height) : 0.0f;
         if (level <= 1) // not a reflection's camera
+        {
+            FillFPlusLamps(renderer, width, height);
             D3DLayerCamera(&g_dlssScene);
+        }
     }
     if (!dlss)
         return;
@@ -2779,6 +2843,15 @@ void DlssBeforeList(uintptr_t renderer)
         const int count = *reinterpret_cast<const int*>(list + 8);
         const float* cam = reinterpret_cast<const float*>(r + kCameraOffset);
         float best = 1e8f; // squared metres: 10 km
+        static uint32_t handovers;
+        if (handovers++ % 600 == 300)
+        {
+            char flags[160] = {};
+            for (int i = 0, at = 0; lights && i < count && i < 12 && at < 140; i++)
+                if (lights[i])
+                    at += snprintf(flags + at, sizeof(flags) - at, " %x", *reinterpret_cast<const uint32_t*>(lights[i] + kLightFlags));
+            FocusLog("frame %llu: Forward+ at the hand-over: %d lights; flags%s", static_cast<unsigned long long>(g_frame), count, flags);
+        }
         memset(g_dlssScene.sun, 0, sizeof(g_dlssScene.sun));
         for (int i = 0; lights && i < count && i < 32; i++)
         {
@@ -7877,6 +7950,19 @@ void GiHotkeys()
             if (kKeys[i] == VK_NUMPAD0)
             {
                 ConsoleCommand(g_giControl.gsmCache == 1 ? "e_gsm_cache 0" : "e_gsm_cache 1");
+                continue;
+            }
+            // Num1: the Forward+ test (the shaders read it with r_LightsSinglePass 1).
+            if (kKeys[i] == VK_NUMPAD1)
+            {
+                int v = g_giControl.fplus;
+                if (v < 0)
+                {
+                    wchar_t e[8] = {};
+                    v = GetEnvironmentVariableW(L"CRYMT_FPLUS", e, 8) && e[0] == L'1' ? 1 : 0;
+                }
+                g_giControl.fplus = v ? 0 : 1;
+                FocusLog("frame %llu: Forward+ test %s", static_cast<unsigned long long>(g_frame), v ? "off" : "on");
                 continue;
             }
         }

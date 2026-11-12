@@ -26,6 +26,7 @@ struct GiControl
     // on all).
     std::atomic<int> page{0};
     std::atomic<int> gsmCache{-1};     // engine page Num0: e_gsm_cache (far shadow cascades cached) as main last read it
+    std::atomic<int> fplus{-1};        // engine page Num1: the Forward+ test 1 / 0; -1 as CRYMT_FPLUS says
     std::atomic<int> voxOpacity{-1};   // voxels page Num0: the cells' opacity 1 from the voxelized geometry only (the screen
                                        // gives their colour), 0 also from the screen; -1 as CRYMT_GI_OCCUPANCY says
     std::atomic<int> geomCache{-1};    // voxels page Num1: unchanged objects voxelized every 4th frame 1, every frame 0; -1 as

@@ -334,6 +334,164 @@ half CryMT_ContactShadow(float3 viewVect, float sceneDepth, float2 screenTC, flo
 #endif
 )";
 
+// Forward+ test (CryMT's D3D12 back end with CRYMT_FPLUS=1 or the engine page's Num1; needs r_LightsSinglePass 1, the
+// single-pass light loop): the loop also takes the frame's point lamps without shadow maps from CryMT's lists per
+// 32-pixel screen tile, and drops the engine's own copies of them (the same position and radius). The placeholder
+// (Textures/CryMT/fplus.dds, texel 0 zero) and cameras other than the frame's (reflections) keep the engine's lights.
+// CryMT's 1024 x 128 texture: texel 0 (on, tiles across, down, lamps); 1 + 2k and 2 + 2k lamp k's position from the
+// camera and 1 / radius, its colour (a the specular multiplier); 65 the camera; from 128 one per tile (its first index
+// texel, its lamp count); then the tiles' lamp indices, 4 a texel.
+const char* const kFPlusDecl = R"(
+struct CryMT_FPlusTile
+{
+  int count;   // the tile's lamps (0: off)
+  float start; // its first index texel
+};
+
+#if D3D10
+// The engine's light count for the loop (LightsNum_DB, an int): under D3D10 the engine writes it as a float, so the int
+// read the float's bits (3.0 = 1077936128 iterations a pixel: the GPU never finished the frame, the game hung on its
+// first frame with r_ShadersDynamicBranching 1). A count that is not small is taken as a float's bits, and the result
+// is held to 0..32 (the level's light list holds 32): the user's mine run still hung the GPU in its second loop (frame
+// 2207) with only the float case handled, so some draws get other values.
+int CryMT_LightsNum(int n)
+{
+  float f = (n < 0 || n > 64) ? asfloat(n) : (float)n;
+  return (int)clamp(f, 0, 32);
+}
+
+sampler2D CryMT_FPlusSampler = sampler_state
+{
+  Texture = Textures/CryMT/fplus.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
+float4 CryMT_FPlusTexel(float t)
+{
+  float row = floor(t / 1024);
+  return tex2Dlod(CryMT_FPlusSampler, float4((t - row * 1024 + 0.5) / 1024, (row + 0.5) / 128, 0, 0));
+}
+
+CryMT_FPlusTile CryMT_FPlusAt(float4 screenProj)
+{
+  CryMT_FPlusTile t;
+  t.count = 0;
+  t.start = 0;
+  float4 h = CryMT_FPlusTexel(0);
+  float4 cam = CryMT_FPlusTexel(65);
+  if (h.x > 0.5 && all(abs(cam.xyz - PS_WorldViewPos.xyz) < 0.05))
+  {
+    float2 tile = min(floor(saturate(screenProj.xy / screenProj.w) * h.yz), h.yz - 1);
+    float4 g = CryMT_FPlusTexel(128 + tile.y * h.y + tile.x);
+    t.count = (int)g.y;
+    t.start = g.x;
+  }
+  return t;
+}
+
+void CryMT_FPlusLamp(CryMT_FPlusTile t, float j, out float4 pos, out float4 colour)
+{
+  float4 ix = CryMT_FPlusTexel(t.start + floor(j / 4));
+  float m = j - 4 * floor(j / 4);
+  float k = m < 0.5 ? ix.x : m < 1.5 ? ix.y : m < 2.5 ? ix.z : ix.w;
+  pos = CryMT_FPlusTexel(1 + 2 * k);
+  colour = CryMT_FPlusTexel(2 + 2 * k);
+}
+
+bool CryMT_FPlusHas(CryMT_FPlusTile t, float4 lightPos)
+{
+  bool found = false;
+  [unroll]
+  for (int j = 0; j < 4; j++)
+  {
+    float4 pos, colour;
+    CryMT_FPlusLamp(t, j, pos, colour);
+    if (j < t.count && all(abs(pos.xyz - lightPos.xyz) < 0.25) && abs(pos.w - lightPos.w) <= 0.01 * lightPos.w)
+      found = true;
+  }
+  return found;
+}
+#else
+int CryMT_LightsNum(int n)
+{
+  return n;
+}
+
+CryMT_FPlusTile CryMT_FPlusAt(float4 screenProj)
+{
+  CryMT_FPlusTile t;
+  t.count = 0;
+  t.start = 0;
+  return t;
+}
+
+void CryMT_FPlusLamp(CryMT_FPlusTile t, float j, out float4 pos, out float4 colour)
+{
+  pos = 0;
+  colour = 0;
+}
+
+bool CryMT_FPlusHas(CryMT_FPlusTile t, float4 lightPos)
+{
+  return false;
+}
+#endif
+)";
+
+// The single-pass light loop with 4 slots for CryMT's tile lamps after the engine's (kFPlusDecl). The loop's count is
+// the engine's constant plus 4, the same for every pixel: a count read from the tile texture varies per pixel, and the
+// gradient samples inside the loop (parallax, terrain layers' per-light code) then failed to compile under D3D10 (X3570),
+// so those passes were not drawn (the user: flat, one-colour textures almost everywhere: terrain detail layers gone).
+const char* const kFPlusLoop = R"(#if %DYN_BRANCHING
+  float2 tcLI = LightInfoTC_DB.xy;
+  float tcIter = LightInfoTC_DB.z;
+  float tcIterParam = LightInfoTC_DB.w;
+  CryMT_FPlusTile cryTile = CryMT_FPlusAt(pPass.IN.screenProj); // CryMT Forward+: this screen tile's lamps
+  int cryLightsDB = CryMT_LightsNum(LightsNum_DB);
+  for (int i=0; i<cryLightsDB+4; i++, tcLI.x+=tcIter)
+#else
+)";
+
+const char* const kFPlusLight = R"(#if %DYN_BRANCHING
+    // We can't index constants in cycle, so get light/shadow info from the texture
+    half4 Diffuse;
+    half4 ShadowChanMask;
+    float nType;
+    if (i < cryLightsDB)
+    {
+      WorldLightPos = tex2Dlod(LightInfoSampler_DB, float4(tcLI, 0, 0));
+      Diffuse = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam, tcLI.y, 0, 0));
+      ShadowChanMask = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam*3, tcLI.y, 0, 0));
+      nType = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam*2, tcLI.y, 0, 0)).w;
+      // CryMT Forward+: the engine's copy of a lamp the tile gives goes (no light, no falloff)
+      if (cryTile.count > 0 && nType == LT_OMNI && CryMT_FPlusHas(cryTile, WorldLightPos))
+      {
+        WorldLightPos.w = 1e6;
+        Diffuse = 0;
+      }
+    }
+    else
+    {
+      float4 cryColour;
+      CryMT_FPlusLamp(cryTile, i - cryLightsDB, WorldLightPos, cryColour); // CryMT Forward+: the tile's lamp
+      Diffuse = cryColour;
+      if (i - cryLightsDB >= cryTile.count)
+      {
+        WorldLightPos.w = 1e6; // an empty slot: no light, no falloff
+        Diffuse = 0;
+      }
+      ShadowChanMask = 0;
+      nType = LT_OMNI;
+    }
+    half4 Specular = Diffuse;
+    Specular.xyz *= Diffuse.w;
+#else
+)";
+
 const char* const kGiAmbient = R"(  // custom ambient pass
   frag_custom_ambient(pPass, amb);
 
@@ -377,6 +535,7 @@ const wchar_t* kShadowMask = L"Shaders\\HWScripts\\CryFX\\ShadowMaskGen.cfx";
 const wchar_t* kZPass = L"Shaders\\HWScripts\\CryFX\\CommonZPass.cfi";
 const wchar_t* kParticles = L"Shaders\\HWScripts\\CryFX\\Particles.cfi";
 const wchar_t* kMetal = L"Shaders\\HWScripts\\CryFX\\Metal.cfx";
+const wchar_t* kVegetation = L"Shaders\\HWScripts\\CryFX\\Vegetation.cfx";
 const wchar_t* kPlaceholder = L"Textures\\CryMT\\gi.dds";
 // The patch goes into the game as a pak: without -DEVMODE CryPak reads files only from paks (loose files are ignored)
 // and a later pak by name overrides the earlier ones (as the official ZPatch1.pak does), so zzCryMT.pak's sources
@@ -516,12 +675,36 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
-                particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal));
-    const bool ok = Replace(frag, "#include \"CommonRAM.cfi\"\n", kGiDecl) &&
+                particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal)),
+                vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation));
+    wchar_t fpv[8] = {};
+    const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
+    const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
+                               "  float tcIterParam = LightInfoTC_DB.w;\n  for (int i=0; i<LightsNum_DB; i++, tcLI.x+=tcIter)\n#else\n";
+    const bool ok = Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl) &&
+                    // The single-pass loop's light count is a float's bits under D3D10 (CryMT_LightsNum): vegetation's
+                    // back shading divides by it (before fragLib is included, so the conversion is written out here).
+                    Replace(vegetation, "  if (LightsNum_DB)\n    fOccFactor = pPass.pCustom.fOcclShadowAcc / LightsNum_DB;\n",
+                            "  if (LightsNum_DB)\n  #if D3D10\n    fOccFactor = saturate(pPass.pCustom.fOcclShadowAcc / max((LightsNum_DB < 0 || LightsNum_DB > 64) ? "
+                            "asfloat(LightsNum_DB) : (float)LightsNum_DB, 1.0)); // CryMT: the count is a float's bits under D3D10\n"
+                            "  #else\n    fOccFactor = pPass.pCustom.fOcclShadowAcc / LightsNum_DB;\n  #endif\n") &&
+                    // Forward+ test: the single-pass light loop also takes CryMT's tile lamps (kFPlusDecl). With
+                    // CRYMT_FPLUS_SHADERS=0 (tests) only the loop's light count is fixed.
+                    (fplusLoop ? Replace(frag, dbLoop, kFPlusLoop) &&
+                                     Replace(frag, "#if %DYN_BRANCHING\n    // We can't index constants in cycle, so get light/shadow info from the texture\n"
+                                                   "    WorldLightPos = tex2Dlod(LightInfoSampler_DB, float4(tcLI, 0, 0));\n"
+                                                   "    half4 Diffuse = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam, tcLI.y, 0, 0));\n"
+                                                   "    half4 Specular = Diffuse;\n    Specular.xyz *= Diffuse.w;\n"
+                                                   "    half4 ShadowChanMask = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam*3, tcLI.y, 0, 0));\n"
+                                                   "    float nType = tex2Dlod(LightInfoSampler_DB, float4(tcLI.x+tcIterParam*2, tcLI.y, 0, 0)).w;\n#else\n",
+                                             kFPlusLight)
+                               : Replace(frag, dbLoop,
+                                         "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
+                                         "  float tcIterParam = LightInfoTC_DB.w;\n  for (int i=0; i<CryMT_LightsNum(LightsNum_DB); i++, tcLI.x+=tcIter) // CryMT: the count\n#else\n")) &&
                     // The environment reflection on materials without their own (not vegetation or terrain): composed as
                     // the engine composes its own (shaded by the light reaching the surface, times the gloss map and the
                     // specular colour), Schlick's fresnel; Metal stronger (it defines CRYMT_ENV_STRENGTH).
@@ -596,6 +779,9 @@ std::wstring InstallGi()
     // The particles' occlusion volume placeholder: 2x1, the first texel zero (cell size 0: no change), the second 3C3C3C3C.
     std::string pvol = foliage;
     memset(&pvol[132], 0x3C, 4);
+    // The Forward+ test's placeholder: 2x1, the first texel zero (off), the second 6B6B6B6B.
+    std::string fplus = foliage;
+    memset(&fplus[132], 0x6B, 4);
     // The environment reflection's placeholder: a 4x4 cube (A8R8G8B8, 6 faces), black; face 0's second texel E7000000.
     std::string env(128 + 6 * 64, '\0');
     const unsigned int eheader[] = {0x20534444, 124, 0x100F, 4, 4, 16, 0, 1};
@@ -610,11 +796,13 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/CommonZPass.cfi", Crlf(zpass)},
                               {"Shaders/HWScripts/CryFX/Particles.cfi", Crlf(particles)},
                               {"Shaders/HWScripts/CryFX/Metal.cfx", Crlf(metal)},
+                              {"Shaders/HWScripts/CryFX/Vegetation.cfx", Crlf(vegetation)},
                               {"Textures/CryMT/env.dds", env},
                               {"Textures/CryMT/gi.dds", dds},
                               {"Textures/CryMT/jitter.dds", jitter},
                               {"Textures/CryMT/foliage.dds", foliage},
-                              {"Textures/CryMT/pvol.dds", pvol}}))
+                              {"Textures/CryMT/pvol.dds", pvol},
+                              {"Textures/CryMT/fplus.dds", fplus}}))
         return T(L"не удалось записать Game\\zzCryMT.pak", L"could not write Game\\zzCryMT.pak");
     // Loose copies from earlier versions: -DEVMODE would read them before the pak.
     DeleteFileW((g_game + L"Game\\" + kFragLib).c_str());

@@ -983,6 +983,7 @@ const ResourceInfo* g_giPlaceholder; // Textures/CryMT/gi.dds, see IsGiPlacehold
 const ResourceInfo* g_jitterPlaceholder; // Textures/CryMT/jitter.dds, see IsJitterPlaceholder
 const ResourceInfo* g_foliagePlaceholder; // Textures/CryMT/foliage.dds, see IsFoliagePlaceholder
 const ResourceInfo* g_pvolPlaceholder;    // Textures/CryMT/pvol.dds, see IsPvolPlaceholder
+const ResourceInfo* g_fplusPlaceholder;   // Textures/CryMT/fplus.dds, see IsFPlusPlaceholder
 const ResourceInfo* g_envPlaceholder;     // Textures/CryMT/env.dds (fragLib's CryMT_EnvSampler), see IsEnvPlaceholder
 SerializeRootSignatureFn g_serializeRoot;
 
@@ -6241,11 +6242,228 @@ public:
         memcpy(m_frameLast, data, sizeof(data));
     }
 
+    // The Forward+ test (CRYMT_FPLUS=1 or the engine page's Num1): -1 until the panel sets it.
+    static bool FPlusOn()
+    {
+        static const bool env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_FPLUS", v, 8) && v[0] == L'1';
+        }();
+        const int panel = g_giControl.fplus;
+        return panel < 0 ? env : panel > 0;
+    }
+
+    // The Forward+ test's texture (the patched fragLib's single-pass light loop reads it, Settings.cpp kFPlusDecl): the
+    // frame's point lamps without shadow maps (DlssSceneInfo::fplusLamps) binned into 32-pixel screen tiles by the
+    // screen rectangle of their sphere's box (the whole screen when the camera is near it or a corner is behind the
+    // camera). Texel 0 (on, tiles across, down, lamps); 1 + 2k, 2 + 2k lamp k's position from the camera and 1 / radius,
+    // its colour; 65 the camera; from 128 one per tile (its first index texel, its lamp count); then the indices, 4 a
+    // texel. Uploaded when it changed (the rows in use).
+    void UpdateFPlus(const DlssSceneInfo* info)
+    {
+        constexpr UINT kTexW = 1024, kTexH = 128, kTile = 32, kGrid = 128;
+        if (!m_fplusTex)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = kTexW;
+            d.Height = kTexH;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            d.SampleDesc.Count = 1;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, kSrvState, nullptr, __uuidof(ID3D12Resource),
+                                                      reinterpret_cast<void**>(&m_fplusTex))))
+            {
+                m_fplusTex = nullptr;
+                return;
+            }
+            m_fplusCpu = g_srvCpu.Alloc();
+            g.dev->CreateShaderResourceView(m_fplusTex, nullptr, m_fplusCpu);
+            Log("Forward+ test texture created (%s)", FPlusOn() ? "on" : "off until Num1 on the engine page");
+        }
+        const UINT sw = info->fplusWidth, sh = info->fplusHeight;
+        const UINT tx = (sw + kTile - 1) / kTile, ty = (sh + kTile - 1) / kTile, tiles = tx * ty;
+        const UINT count = std::min<UINT>(info->fplusCount, 32);
+        const bool on = FPlusOn() && tiles > 0 && tiles <= 16384;
+        m_fplusStats.lamps = count;
+        m_fplusStats.onScreen = m_fplusStats.litTiles = m_fplusStats.maxPerTile = m_fplusStats.indices = 0;
+        if (!on)
+        {
+            m_fplusData.assign(kTexW * 4, 0.0f);
+        }
+        else
+        {
+            float vp[16];
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                {
+                    float v = 0;
+                    for (int k = 0; k < 4; k++)
+                        v += info->view[r * 4 + k] * info->proj[k * 4 + c];
+                    vp[r * 4 + c] = v;
+                }
+            const float* cam = info->fplusCam;
+            const float nearZ = std::max(info->nearZ, 0.05f);
+            struct Rect
+            {
+                int x0, y0, x1, y1;
+            } rects[32];
+            m_fplusCount.assign(tiles, 0);
+            for (UINT i = 0; i < count; i++)
+            {
+                const float* l = info->fplusLamps[i];
+                Rect& q = rects[i];
+                q = {0, 0, -1, -1};
+                const float r = l[3] > 0 ? 1.0f / l[3] : 0.0f;
+                if (!(r > 0))
+                    continue;
+                const float d[3] = {l[0] - cam[0], l[1] - cam[1], l[2] - cam[2]};
+                const float reach = r + 2 * nearZ + 0.5f;
+                bool full = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < reach * reach;
+                float u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f;
+                int behind = 0;
+                for (int k = 0; k < 8 && !full; k++)
+                {
+                    const float p[3] = {l[0] + (k & 1 ? r : -r), l[1] + (k & 2 ? r : -r), l[2] + (k & 4 ? r : -r)};
+                    float clip[4];
+                    for (int c = 0; c < 4; c++)
+                        clip[c] = p[0] * vp[c] + p[1] * vp[4 + c] + p[2] * vp[8 + c] + vp[12 + c];
+                    if (clip[3] < nearZ * 0.5f)
+                    {
+                        behind++;
+                        continue;
+                    }
+                    const float u = clip[0] / clip[3] * 0.5f + 0.5f, v = -clip[1] / clip[3] * 0.5f + 0.5f;
+                    u0 = std::min(u0, u);
+                    u1 = std::max(u1, u);
+                    v0 = std::min(v0, v);
+                    v1 = std::max(v1, v);
+                }
+                if (behind == 8)
+                    continue; // the whole box behind the camera
+                if (full || behind)
+                {
+                    u0 = v0 = 0.0f;
+                    u1 = v1 = 1.0f;
+                }
+                // A pixel's margin (the jitter, the screen coordinate's rounding).
+                u0 -= 1.0f / sw;
+                v0 -= 1.0f / sh;
+                u1 += 1.0f / sw;
+                v1 += 1.0f / sh;
+                if (u1 < 0 || v1 < 0 || u0 > 1 || v0 > 1)
+                    continue;
+                const auto cell = [](float f, UINT n) { return std::min(std::max(static_cast<int>(floorf(f * n)), 0), static_cast<int>(n) - 1); };
+                q = {cell(u0, tx), cell(v0, ty), cell(u1, tx), cell(v1, ty)};
+                m_fplusStats.onScreen++;
+            }
+            // At most 4 lamps a tile (the shader's slots: its loop count must not vary per pixel), the strongest at the
+            // camera first; a lamp left out of a tile keeps the engine's own copy there.
+            UINT order[32];
+            float weight[32];
+            for (UINT i = 0; i < count; i++)
+            {
+                const float* l = info->fplusLamps[i];
+                const float d[3] = {l[0] - cam[0], l[1] - cam[1], l[2] - cam[2]};
+                const float r = l[3] > 0 ? 1.0f / l[3] : 0.0f;
+                weight[i] = (l[4] + l[5] + l[6]) * r * r / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] + 1.0f);
+                order[i] = i;
+            }
+            std::sort(order, order + count, [&](UINT a, UINT b) { return weight[a] > weight[b]; });
+            for (UINT k = 0; k < count; k++)
+            {
+                const Rect& q = rects[order[k]];
+                for (int y = q.y0; y <= q.y1; y++)
+                    for (int x = q.x0; x <= q.x1; x++)
+                        if (m_fplusCount[y * tx + x] < 4)
+                            m_fplusCount[y * tx + x]++;
+            }
+            m_fplusStart.resize(tiles);
+            UINT next = kGrid + tiles;
+            for (UINT t = 0; t < tiles; t++)
+            {
+                m_fplusStart[t] = next;
+                next += (m_fplusCount[t] + 3) / 4;
+                if (m_fplusCount[t])
+                {
+                    m_fplusStats.litTiles++;
+                    m_fplusStats.maxPerTile = std::max(m_fplusStats.maxPerTile, m_fplusCount[t]);
+                    m_fplusStats.indices += m_fplusCount[t];
+                }
+            }
+            if (next > kTexW * kTexH)
+                return; // cannot happen: 16384 tiles + 16384 * 8 index texels fit
+            const UINT rows = (next + kTexW - 1) / kTexW;
+            m_fplusData.assign(static_cast<size_t>(rows) * kTexW * 4, 0.0f);
+            float* o = m_fplusData.data();
+            o[0] = 1.0f;
+            o[1] = static_cast<float>(tx);
+            o[2] = static_cast<float>(ty);
+            o[3] = static_cast<float>(count);
+            for (UINT i = 0; i < count; i++)
+            {
+                const float* l = info->fplusLamps[i];
+                float* p = o + (1 + 2 * i) * 4;
+                p[0] = l[0] - cam[0];
+                p[1] = l[1] - cam[1];
+                p[2] = l[2] - cam[2];
+                p[3] = l[3];
+                memcpy(p + 4, l + 4, 4 * sizeof(float));
+            }
+            memcpy(o + 65 * 4, cam, 4 * sizeof(float));
+            for (UINT t = 0; t < tiles; t++)
+            {
+                o[(kGrid + t) * 4 + 0] = static_cast<float>(m_fplusStart[t]);
+                o[(kGrid + t) * 4 + 1] = static_cast<float>(m_fplusCount[t]);
+                m_fplusCount[t] = 0; // now the fill position
+            }
+            for (UINT k = 0; k < count; k++)
+            {
+                const Rect& q = rects[order[k]];
+                for (int y = q.y0; y <= q.y1; y++)
+                    for (int x = q.x0; x <= q.x1; x++)
+                    {
+                        const UINT t = y * tx + x;
+                        if (m_fplusCount[t] < static_cast<UINT>(o[(kGrid + t) * 4 + 1]))
+                            o[m_fplusStart[t] * 4 + m_fplusCount[t]++] = static_cast<float>(order[k]);
+                    }
+            }
+        }
+        if (m_fplusData == m_fplusLast)
+            return;
+        const UINT rows = static_cast<UINT>(m_fplusData.size() / (kTexW * 4));
+        const uint64_t bytes = static_cast<uint64_t>(rows) * kTexW * 16;
+        const UploadAlloc up = FrameUpload(bytes, 512);
+        if (!up.cpu)
+            return;
+        memcpy(up.cpu, m_fplusData.data(), bytes);
+        m_barriers.push_back(Transition(m_fplusTex, kSrvState, D3D12_RESOURCE_STATE_COPY_DEST));
+        FlushBarriers();
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = m_fplusTex;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = up.res;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = up.offset;
+        src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, kTexW, rows, 1, kTexW * 16};
+        m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        m_barriers.push_back(Transition(m_fplusTex, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState));
+        m_fplusLast = m_fplusData;
+        if (m_fplusStats.uploads++ % 1000 == 0)
+            Log("Forward+ test: %s, %u lamps, %u on screen, %u of %u tiles lit, max %u a tile, %u indices, %u rows", on ? "on" : "off",
+                m_fplusStats.lamps, m_fplusStats.onScreen, m_fplusStats.litTiles, tiles, m_fplusStats.maxPerTile, m_fplusStats.indices, rows);
+    }
+
     void GiFrameCamera(const DlssSceneInfo* info)
     {
         m_pastScene = false;
         if (info->valid && g_jitterPlaceholder)
             UpdateFrameTexture(info);
+        if (info->valid && g_fplusPlaceholder)
+            UpdateFPlus(info);
         g_wantPassMatrices.store(Gi().on && Gi().geometry && Gi().shadowGeometry, std::memory_order_relaxed);
         GiCamera(info);
         m_giInScene = info->valid != 0;
@@ -8302,6 +8520,11 @@ public:
             const int gsm = g_giControl.gsmCache;
             lines.push_back({"Num0", "Far shadow cache", gsm < 0 ? "?" : gsm ? "ON" : "OFF", gsm > 0 ? on : off});
             lines.push_back({"", "(far cascades redrawn less often)", "", white});
+            const bool fplus = FPlusOn();
+            lines.push_back({"Num1", "Forward+ lamps (test)", !g_fplusPlaceholder ? "NO SHADERS" : fplus ? "ON" : "OFF", fplus ? on : off});
+            snprintf(buf, sizeof(buf), "%u lamps, %u on screen, %u tiles, max %u", m_fplusStats.lamps, m_fplusStats.onScreen,
+                     m_fplusStats.litTiles, m_fplusStats.maxPerTile);
+            lines.push_back({"", fplus ? buf : "(needs r_LightsSinglePass 1)", "", white});
             lines.push_back({"Num/", "hide panel", "", white});
         }
         else if (g_giControl.page == 2)
@@ -9174,6 +9397,15 @@ private:
     ID3D12Resource* m_zeroCb = nullptr;
     Srv12* m_giSrv = nullptr;          // CRYMT_GITEST texture
     D3D12_CPU_DESCRIPTOR_HANDLE m_giCpu{}; // the view pixel shaders see in place of the placeholder (none: the placeholder)
+    ID3D12Resource* m_fplusTex = nullptr;     // 1024x128 RGBA32F: the Forward+ test's lamps and tile lists (UpdateFPlus)
+    D3D12_CPU_DESCRIPTOR_HANDLE m_fplusCpu{}; // its view, in place of the Forward+ placeholder
+    std::vector<float> m_fplusData, m_fplusLast;
+    std::vector<uint32_t> m_fplusCount, m_fplusStart;
+    struct FPlusStats
+    {
+        uint32_t lamps = 0, onScreen = 0, litTiles = 0, maxPerTile = 0, indices = 0;
+        uint64_t uploads = 0;
+    } m_fplusStats;
     ID3D12Resource* m_jitterTex = nullptr;    // 8x1 RGBA32F: the frame texture for the shadow mask (UpdateFrameTexture)
     D3D12_CPU_DESCRIPTOR_HANDLE m_jitterCpu{}; // its view, in place of the jitter placeholder
     // The foliage mask (R8, the scene's size): the patched z-prepass's SV_Target1, 1 on alpha-tested surfaces; cleared
@@ -10108,6 +10340,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = m_giCpu; // not a pass of long ago (frames without a main camera: the binoculars' frozen GTAO)
             if (v && s == kPS && m_jitterCpu.ptr && v->info == g_jitterPlaceholder)
                 src[i] = m_jitterCpu;
+            if (v && s == kPS && m_fplusCpu.ptr && v->info == g_fplusPlaceholder)
+                src[i] = m_fplusCpu;
             if (v && envSub[0] && static_cast<int>(i) == m_ps->envCubeSlot)
                 src[i] = envSub[0]->cpu;
             if (v && envAll && v->info == g_envPlaceholder)
@@ -10613,6 +10847,21 @@ bool IsPvolPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DA
     return true;
 }
 
+// Textures/CryMT/fplus.dds: CryMT's 2x1 placeholder for the Forward+ test's tile lists (patched fragLib.cfi): the first
+// texel zero (off), the second 6B6B6B6B (the mark).
+bool IsFPlusPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
+{
+    if (!init || !init->pSysMem || d.Width != 2 || d.Height != 1 || d.ArraySize != 1 ||
+        (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+         d.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
+        return false;
+    const auto* p = static_cast<const uint8_t*>(init->pSysMem);
+    for (int i = 0; i < 8; i++)
+        if (p[i] != (i < 4 ? 0 : 0x6B))
+            return false;
+    return true;
+}
+
 HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SUBRESOURCE_DATA* init, ID3D10Texture2D** out)
 {
     if (!desc)
@@ -10665,6 +10914,11 @@ HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SU
     {
         g_pvolPlaceholder = Info(t);
         Log("particle volume placeholder texture recognized");
+    }
+    else if (IsFPlusPlaceholder(*desc, init))
+    {
+        g_fplusPlaceholder = Info(t);
+        Log("Forward+ placeholder texture recognized");
     }
     else if (desc->Width == 4 && desc->Height <= 4 && Gi().on)
     {

@@ -11,6 +11,8 @@ $testDefs = @{
     gpu = @{Level = 'island'; Cfg = 'crymt_q_gpu'; Log = 'benchmark_gpu.log'}
     village = @{Level = 'village'; Cfg = 'crymt_q_autotest'; Log = 'autotest.log'}
     harbor = @{Level = 'harbor'; Cfg = 'crymt_q_autotest'; Log = 'autotest.log'}
+    mine = @{Level = 'mine'; Cfg = 'crymt_q_autotest'; Log = 'autotest.log'}
+    fleet = @{Level = 'fleet'; Cfg = 'crymt_q_autotest'; Log = 'autotest.log'}
 }
 $variantDefs = [ordered]@{
     default = @{}

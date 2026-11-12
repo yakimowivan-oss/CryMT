@@ -27,4 +27,12 @@ struct DlssSceneInfo
     // without DLAA), set with the camera, before the frame's draws: the deferred shadows rebuild points with it.
     float shiftU, shiftV;
     uint32_t pad4[2];
+    // Forward+ test: the frame's point lamps without shadow maps (not the sun, projectors or fake lights), taken at the
+    // frame's first main camera, world metres: per lamp xyz position, 1 / radius; rgba colour (a the specular
+    // multiplier), as the engine's light info texture has them. The camera position (w 1) and the screen for the tiles.
+    float fplusLamps[32][8];
+    uint32_t fplusCount;
+    uint32_t fplusWidth, fplusHeight;
+    uint32_t pad5;
+    float fplusCam[4];
 };
