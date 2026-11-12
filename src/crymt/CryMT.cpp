@@ -588,6 +588,7 @@ uint64_t g_phaseTicks[3], g_phaseFrames;
 uint64_t g_shadowDrawTicks, g_shadowDraws; // nested flushes of PrepareDepthMap (the shadow map draws)
 uint64_t g_preSignals;
 uint64_t g_envCubeFaces, g_envCubeFull, g_envCubeTicks, g_envCubeSkips, g_envCubeSwaps, g_envDepthFreed; // EnvCubeUpdate
+uint64_t g_envCubeLightLists[4]; // EnvCubeUpdate: renders that changed the renderer's level 0..3 light list
 uint64_t g_lateCallbacks;
 uint64_t g_preFallbacks;
 uint64_t g_warmupFrames = 60;
@@ -1235,6 +1236,10 @@ void WriteStats()
                     g_envCubeFaces ? g_envCubeTicks * g_qpcToMs / g_envCubeFaces : 0.0, g_envCubeTicks * g_qpcToMs / frames,
                     static_cast<unsigned long long>(g_envCubeSkips), static_cast<unsigned long long>(g_envCubeSwaps),
                     static_cast<unsigned long long>(g_envDepthFreed));
+        if (g_envCubeFaces)
+            fprintf(f, "engine env cube: renders that changed the renderer's light list, level 0 %llu, 1 %llu, 2 %llu, 3 %llu\n",
+                    static_cast<unsigned long long>(g_envCubeLightLists[0]), static_cast<unsigned long long>(g_envCubeLightLists[1]),
+                    static_cast<unsigned long long>(g_envCubeLightLists[2]), static_cast<unsigned long long>(g_envCubeLightLists[3]));
         fprintf(f, "early barrier: %s; main waited for shadow prep (times of checks, ms/frame):", g_shadowBarrier ? "off" : "on");
         for (int k = 0; k < 4; k++)
             fprintf(f, " %s %llu of %llu, %.3f;", k == 0 ? "RenderWorld" : k == 1 ? "entity update" : k == 2 ? "terrain" : "AI update",
@@ -4539,6 +4544,28 @@ uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
             f->rax = kQueryFlag17;
             return kHandled;
         }
+        // Diagnosis (2026-11-13, a crash in the editor): EF_Query 0x1B (the light at an index of the current recursion
+        // level's list) gave null to main's CObjManager::GetShadowFrustumsList, which read +0x90 of it. As before (sync,
+        // the original), but a null answer is logged with the level and the list's length first.
+        if ((id & 0xFF) == 0x1B && GetCurrentThreadId() == g_mainThread)
+        {
+            if (g_async)
+                NoteFillSync(-1 - static_cast<int>(idx), rbp[1], f->rdx, f->r8);
+            WaitIdle(static_cast<int>(idx));
+            using QueryPtrFn = uintptr_t (*)(void*, uint64_t, uint64_t);
+            const uintptr_t light = reinterpret_cast<QueryPtrFn>(g_orig[idx])(reinterpret_cast<void*>(f->rcx), f->rdx, f->r8);
+            if (!light)
+            {
+                const int level = *reinterpret_cast<const int*>(kRecurseLevel);
+                const auto* list = reinterpret_cast<const uint8_t*>(f->rcx) + kRdLevelLights;
+                FocusLog("frame %llu: EF_Query 0x1B light %u gave null at recursion level %d; light counts by level %d %d %d %d (caller %p)",
+                         static_cast<unsigned long long>(g_frame), static_cast<uint32_t>(f->r8), level,
+                         *reinterpret_cast<const int*>(list + 8), *reinterpret_cast<const int*>(list + 24), *reinterpret_cast<const int*>(list + 40),
+                         *reinterpret_cast<const int*>(list + 56), reinterpret_cast<void*>(rbp[1])); // FocusLog closes its file
+            }
+            f->rax = light;
+            return kHandled;
+        }
         if (g_snapSeq.load(std::memory_order_acquire) == g_frameSeq)
             for (int q = 0; q < 4; q++)
                 if (id == kSnapQueries[q])
@@ -5721,11 +5748,27 @@ void EnvCubeUpdate()
             FocusLog("engine cube face 1 (-X) roll %.0f -> %.0f", t[7 + 6], roll1);
         t[7 + 6] = roll1;
     }
+    // Diagnosis (2026-11-13, a crash in the editor: main's GetShadowFrustumsList asked EF_Query 0x1B for a light past the
+    // level's list): whether the cube render changes the renderer's per-level light lists (kRdLevelLights).
+    uint64_t lightsBefore[4][2];
+    for (int l = 0; l < 4; l++)
+        memcpy(lightsBefore[l], renderer + kRdLevelLights + l * 16, 16);
     EnvDepthSnapshot(renderer);
     D3DLayerPassName("CryMT engine cube"); // the back end lets the encode pass read its source (Device::ReleaseOutput)
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, static_cast<uint32_t>(flags), ~0ull, 0);
     D3DLayerPassName("CryMT engine cube end");
     EnvDepthRestore(renderer);
+    for (int l = 0; l < 4; l++)
+    {
+        const auto* now = reinterpret_cast<const uint64_t*>(renderer + kRdLevelLights + l * 16);
+        if (now[0] != lightsBefore[l][0] || static_cast<uint32_t>(now[1]) != static_cast<uint32_t>(lightsBefore[l][1]))
+        {
+            g_envCubeLightLists[l]++;
+            if (g_envCubeLightLists[l] <= 3)
+                FocusLog("frame %llu: engine cube render changed the level %d light list: %u -> %u lights", static_cast<unsigned long long>(g_frame), l,
+                         static_cast<uint32_t>(lightsBefore[l][1]), static_cast<uint32_t>(now[1]));
+        }
+    }
     g_envCubeTicks += Now() - t0;
     g_envCubeFaces++;
     entry[0] = 1;
