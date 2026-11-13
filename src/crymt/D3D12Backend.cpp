@@ -4079,6 +4079,7 @@ public:
     bool discards = false;
     bool writesTarget1 = false; // a pixel shader writing SV_Target1 (the patched z-prepass: the foliage mask)
     bool writesTarget2 = false; // ... SV_Target2 (the patched z-prepass: wind-bent vegetation's screen move)
+    bool plainCopy = false;     // a pixel shader that only samples one texture into its output (IsPlainCopy)
 
     // SM4 token stream (the SHDR chunk): opcode in bits 0-10, length in 24-30 (custom data: the next token).
     static bool HasDiscard(const std::vector<uint8_t>& dxbc)
@@ -4106,9 +4107,41 @@ public:
         return false;
     }
 
+    // A pixel shader that only copies a texture: declarations, one sample, ret (SM4 opcodes: 0x45 sample, 0x3E ret, 0x35
+    // custom data, 0x58-0x6A declarations). The engine copies its jittered scene with one (12c069f424600b76) before DLSS.
+    static bool IsPlainCopy(const std::vector<uint8_t>& dxbc)
+    {
+        if (dxbc.size() < 32 || memcmp(dxbc.data(), "DXBC", 4) != 0)
+            return false;
+        const uint32_t chunks = *reinterpret_cast<const uint32_t*>(&dxbc[28]);
+        for (uint32_t c = 0; c < chunks && 32 + c * 4 + 4 <= dxbc.size(); c++)
+        {
+            const uint32_t at = *reinterpret_cast<const uint32_t*>(&dxbc[32 + c * 4]);
+            if (at + 8 > dxbc.size() || (memcmp(&dxbc[at], "SHDR", 4) != 0 && memcmp(&dxbc[at], "SHEX", 4) != 0))
+                continue;
+            const uint32_t bytes = *reinterpret_cast<const uint32_t*>(&dxbc[at + 4]);
+            const uint32_t* t = reinterpret_cast<const uint32_t*>(&dxbc[at + 8]);
+            const size_t n = std::min<size_t>(bytes, dxbc.size() - at - 8) / 4;
+            int samples = 0;
+            for (size_t i = 2; i < n;)
+            {
+                const uint32_t op = t[i] & 0x7FF;
+                if (op == 0x45)
+                    samples++;
+                else if (op != 0x3E && op != 0x35 && (op < 0x58 || op > 0x6A))
+                    return false;
+                const uint32_t len = op == 0x35 && i + 1 < n ? t[i + 1] : (t[i] >> 24) & 0x7F;
+                i += len ? len : 1;
+            }
+            return samples == 1;
+        }
+        return false;
+    }
+
     void Reflect()
     {
         discards = HasDiscard(code);
+        plainCopy = IsPlainCopy(code);
         static const char kName[] = "MotionBlurData";
         motionBlur = std::search(code.begin(), code.end(), kName, kName + sizeof(kName) - 1) != code.end();
         ID3D10ShaderReflection* r = nullptr;
@@ -10961,6 +10994,8 @@ public:
         m_stats.scenes++;
         m_pastScene = true;
         m_doneColour = m_rtv[0] ? m_rtv[0]->info : nullptr;
+        if (CopyLog())
+            m_handOverPass = CurrentPass();
         if (info)
         {
             m_note.jx = info->jitterX;
@@ -11945,6 +11980,21 @@ private:
     };
     const ResourceInfo* m_preCopies[8] = {};
     uint32_t m_preCopyCount = 0;
+    // CRYMT_COPYLOG=1 with CRYMT_MARKERS=1 (diagnosis, 2026-11-13: which of the engine's passes copy the jittered scene
+    // before DLSS and which read the copies after it - the "]" fix's clean form): per copy the pass and how it was made,
+    // per read after the hand-over the pass and the pixel shader; logged every 600 frames.
+    std::string m_preCopyWhere[8];
+    std::string m_handOverPass;
+    std::string m_preCopyReads[8];
+    std::string CurrentPass() const
+    {
+        return m_passNames.empty() ? std::string("(no pass)") : std::string(m_passNames.back().begin(), m_passNames.back().end());
+    }
+    static bool CopyLog()
+    {
+        static const bool on = GetEnvironmentVariableW(L"CRYMT_COPYLOG", nullptr, 0) != 0;
+        return on;
+    }
     // A texture of the scene colour's size and format (the last hand-over's).
     bool LikeSceneColour(const ResourceInfo* info) const
     {
@@ -11954,13 +12004,23 @@ private:
         const auto* b = static_cast<const TextureCore*>(m_doneColour);
         return a->width == b->width && a->height == b->height && a->format == b->format;
     }
-    void NotePreCopy(const ResourceInfo* dst)
+    void NotePreCopy(const ResourceInfo* dst, const char* how = "copy")
     {
         for (uint32_t i = 0; i < m_preCopyCount; i++)
             if (m_preCopies[i] == dst)
                 return;
         if (m_preCopyCount < 8)
+        {
+            if (CopyLog())
+            {
+                char text[160];
+                snprintf(text, sizeof(text), "%s in [%s] ps %016llx", how, CurrentPass().c_str(),
+                         static_cast<unsigned long long>(m_ps ? m_ps->contentHash : 0));
+                m_preCopyWhere[m_preCopyCount] = text;
+                m_preCopyReads[m_preCopyCount].clear();
+            }
             m_preCopies[m_preCopyCount++] = dst;
+        }
         m_note.copies++;
     }
     FrameNote m_note{};
@@ -12969,11 +13029,22 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 if (m_pastScene && v->info != m_doneColour)
                     for (uint32_t c = 0; c < m_preCopyCount; c++)
                         if (m_preCopies[c] == v->info)
+                        {
                             m_note.copyReads++;
-                // Before the hand-over, a full-size draw reading a scene-sized colour into another one: a copy (jittered).
+                            if (CopyLog() && m_preCopyReads[c].size() < 600)
+                            {
+                                char text[200];
+                                snprintf(text, sizeof(text), "\n    read by [%s] stage %d slot %u ps %016llx", CurrentPass().c_str(), static_cast<int>(s), i,
+                                         static_cast<unsigned long long>(m_ps ? m_ps->contentHash : 0));
+                                m_preCopyReads[c] += text;
+                            }
+                        }
+                // Before the hand-over, a full-size draw that only copies a scene-sized colour into another one (a plain
+                // copy shader): a copy of the jittered scene. Other passes reading the scene (the water into the scene
+                // itself) are not copies: DLSS's picture must not replace what they made.
                 if (!m_pastScene && s == kPS && m_rtv[0] && m_rtv[0]->info != v->info && LikeSceneColour(v->info) &&
-                    LikeSceneColour(m_rtv[0]->info))
-                    NotePreCopy(m_rtv[0]->info);
+                    LikeSceneColour(m_rtv[0]->info) && m_ps && m_ps->plainCopy)
+                    NotePreCopy(m_rtv[0]->info, "copy shader");
                 if (s == kPS && m_foliageSrv && v->info == g_foliagePlaceholder)
                     Require(m_foliageSrv->info, kSrvState);
                 if (s == kPS && v->info == g_sssPlaceholder && m_sssFrame == m_frame)
@@ -14529,6 +14600,16 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
 {
     m_note.frame = m_frame;
     m_notes[m_frame % 16] = m_note;
+    if (CopyLog() && m_frame % 600 == 300)
+    {
+        Log("pre-DLSS copies, frame %llu: %u (hand-over in [%s])", static_cast<unsigned long long>(m_frame), m_preCopyCount, m_handOverPass.c_str());
+        for (uint32_t i = 0; i < m_preCopyCount; i++)
+        {
+            const auto* t = static_cast<const TextureCore*>(m_preCopies[i]);
+            Log("  copy %u: %p %ux%u fmt %d, %s%s", i, static_cast<const void*>(t), t->width, t->height, static_cast<int>(t->format),
+                m_preCopyWhere[i].c_str(), m_preCopyReads[i].empty() ? "\n    not read after DLSS" : m_preCopyReads[i].c_str());
+        }
+    }
     m_note = FrameNote{};
     m_preCopyCount = 0;
     GiApplyControl();
