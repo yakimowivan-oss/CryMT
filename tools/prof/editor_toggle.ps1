@@ -1,5 +1,6 @@
-# Starts the Sandbox Editor with CryMT injected and no level (as the user's crashed sessions), toggles game mode with
-# Ctrl+G at the given seconds, stays in game mode, then closes it. Logs go to D:\Games\Crysis-RE\logs\editor\<tag>.*
+# Starts the Sandbox Editor with CryMT injected and sends Ctrl+G (game mode on/off) at the given seconds, then closes it.
+# It does NOT open a level: the editor starts empty. In the 2026-11-13 runs the user opened fleet by hand and went into
+# the game inside a VisArea (the ship) before the toggles. Logs go to D:\Games\Crysis-RE\logs\editor\<tag>.*
 param([string]$Tag = 'etog', [string]$FrameIdSync = '1', [int]$Seconds = 100, [string]$Toggles = '25,35,42,50,57,64', [string]$Extra = '')
 $g = 'D:\Games\Crysis'
 $out = 'D:\Games\Crysis-RE\logs\editor'
