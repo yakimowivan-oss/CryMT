@@ -3367,7 +3367,9 @@ void downsample(uint3 id : SV_DispatchThreadID)
         }
         l1Dst[id] = float4(ws > 1e-6 ? gs / ws : 0, 0);
     }
-    if (voxFlags & 2) // the six directions: premultiplied means, as the colour
+    // The six directions: premultiplied means, as the colour. (An anisotropic front-to-back composite per face was tried
+    // 2026-11-14: the frame went brighter and the stair's 10 -> 15 h change grew from +6.8 to +19: not this way.)
+    if (voxFlags & 2)
         [unroll] for (int f = 0; f < 6; f++)
         {
             float3 s6 = 0;
