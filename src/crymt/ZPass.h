@@ -8,4 +8,6 @@ namespace zpass
 void Install();
 void OnEngineLoaded(); // Cry3DEngine.dll mapped: its hooks
 void WriteStats();
+uint64_t BendBeforeCount(); // the previous vegetation bending written for the z-prepass (motion vectors)
+void BendBeforeStats(char* text, size_t size);
 } // namespace zpass

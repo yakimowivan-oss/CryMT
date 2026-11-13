@@ -1299,6 +1299,11 @@ void WriteStats()
             fprintf(f, "engine env cube: renders that changed the renderer's light list, level 0 %llu, 1 %llu, 2 %llu, 3 %llu\n",
                     static_cast<unsigned long long>(g_envCubeLightLists[0]), static_cast<unsigned long long>(g_envCubeLightLists[1]),
                     static_cast<unsigned long long>(g_envCubeLightLists[2]), static_cast<unsigned long long>(g_envCubeLightLists[3]));
+        {
+            char bend[512];
+            zpass::BendBeforeStats(bend, sizeof(bend));
+            fprintf(f, "vegetation motion (CRYMT_BENDBEFORE): the previous main bending %s\n", bend);
+        }
         fprintf(f, "engine cube: own frame id %d, main's frame id caught up %llu times\n", EnvCubeOwnFrame(),
                 static_cast<unsigned long long>(g_frameIdCaughtUp));
         fprintf(f, "engine cube: light ids put back after its EF_ADDDlight %llu (lights outside the 3D engine's list %llu, overflow %llu)\n",

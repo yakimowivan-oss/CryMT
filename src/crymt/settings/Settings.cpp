@@ -160,7 +160,13 @@ vert2fragZ_cry CryMT_ZPassVS(app2vertZGeneral IN)
   #if %_VT_TYPE || %_VT_TYPE_MODIF
   streamPos cryPos = (streamPos)0;
   streamPos_FromZ(IN, cryPos);
-  OUT.CryBefore = CryMT_PosBentBefore(g_VS_ViewProjZeroMatr, cryPos, 1.0 / 60);
+   #if %_RT_INSTANCING_ATTR
+  OUT.CryBefore = CryMT_PosBentBefore(g_VS_ViewProjZeroMatr, cryPos, 1.0 / 60, float4(0, 0, 0, 0), false);
+   #else
+  // AvgFogVolumeContrib carries the instance's PI_BendInfo of 1/60 s before here: CryMT's back end fills it in the
+  // z-prepass (the engine adds a time wave to the bending on the CPU, which the shader's time cannot see).
+  OUT.CryBefore = CryMT_PosBentBefore(g_VS_ViewProjZeroMatr, cryPos, 1.0 / 60, AvgFogVolumeContrib, true);
+   #endif
   #endif
  #endif
 #endif
@@ -190,8 +196,9 @@ pixout_cryzpass CryMT_ZPassPS(vert2fragZ_cry IN)
 )";
 
 // Pos_VS_General with the vertex bent as fTimeShift seconds before (ModificatorVT.cfi, before Pos_VS_Terrain).
-const char* const kBendBefore = R"(// CryMT (motion vectors): Pos_VS_General with the vertex bent as fTimeShift seconds before.
-float4 CryMT_PosBentBefore(float4x4 VPMatrix, inout streamPos IN, float fTimeShift)
+const char* const kBendBefore = R"(// CryMT (motion vectors): Pos_VS_General with the vertex bent as fTimeShift seconds before (the shader's own waves) and,
+// with bBendBefore, the instance's main bending as the CPU had it then (vBendBefore).
+float4 CryMT_PosBentBefore(float4x4 VPMatrix, inout streamPos IN, float fTimeShift, float4 vBendBefore, bool bBendBefore)
 {
 #if %_RT_OBJ_IDENTITY
   VPMatrix = g_VS_ViewProjMatr;
@@ -202,7 +209,7 @@ float4 CryMT_PosBentBefore(float4x4 VPMatrix, inout streamPos IN, float fTimeShi
   #endif
 #endif
   Matrix_Inst_General(IN);
-  return _pos_Modificators(VPMatrix, IN.InstMatrix, IN, true, false, fTimeShift);
+  return _pos_Modificators(VPMatrix, IN.InstMatrix, IN, true, false, fTimeShift, vBendBefore, bBendBefore);
 }
 
 )";
@@ -1114,13 +1121,16 @@ std::wstring InstallGi()
                     Replace(modificator, "  colorVariation = _DetailBending(worldPos, vPos, vNormal.xyz, vVertexInfo, vBendParams, vBendDetailParams);",
                             "  colorVariation = _DetailBending(worldPos, vPos, vNormal.xyz, vVertexInfo, vBendParams, vBendDetailParams, fTimeShift);") &&
                     Replace(modificator, "void _VTModify(inout float4 inPos, float3 vNorm, float4x4 InstMatrix, streamPos IN, bool bRelativeToCam, int nType)",
-                            "void _VTModify(inout float4 inPos, float3 vNorm, float4x4 InstMatrix, streamPos IN, bool bRelativeToCam, int nType, float fTimeShift = 0)") &&
+                            "void _VTModify(inout float4 inPos, float3 vNorm, float4x4 InstMatrix, streamPos IN, bool bRelativeToCam, int nType, float fTimeShift = 0, float4 vBendBefore = float4(0, 0, 0, 0), bool bBendBefore = false)") &&
+                    // The instance's main bending as it was (the CPU's wave in PI_BendInfo moves it, not the shader's time).
+                    Replace(modificator, "    vBendingInfo  = BendInfo;\n  #endif\n #endif\n    float3 worldPos = float3(InstMatrix[0].w, InstMatrix[1].w, InstMatrix[2].w);\n",
+                            "    vBendingInfo  = BendInfo;\n  #endif\n    if (bBendBefore)\n      vBendingInfo = vBendBefore; // CryMT: the instance's bending 1/60 s before, from the CPU (motion vectors)\n #endif\n    float3 worldPos = float3(InstMatrix[0].w, InstMatrix[1].w, InstMatrix[2].w);\n") &&
                     Replace(modificator, "    _VTBending(inPos, vBendingInfo, vNorm.xyz, vColor, worldPos, vBendDetailParams, bendDetailBranchAmplitudeVal);",
                             "    _VTBending(inPos, vBendingInfo, vNorm.xyz, vColor, worldPos, vBendDetailParams, bendDetailBranchAmplitudeVal, fTimeShift);") &&
                     Replace(modificator, "float4 _pos_Modificators(float4x4 VPMatrix, float4x4 InstMatrix, inout streamPos IN, bool bRelativeToCam=true, bool bPrevFrame=false)",
-                            "float4 _pos_Modificators(float4x4 VPMatrix, float4x4 InstMatrix, inout streamPos IN, bool bRelativeToCam=true, bool bPrevFrame=false, float fTimeShift=0)") &&
+                            "float4 _pos_Modificators(float4x4 VPMatrix, float4x4 InstMatrix, inout streamPos IN, bool bRelativeToCam=true, bool bPrevFrame=false, float fTimeShift=0, float4 vBendBefore=float4(0, 0, 0, 0), bool bBendBefore=false)") &&
                     Replace(modificator, "   _VTModify(InPos, vNorm, InstMatrix, IN, bRelativeToCam, nType);",
-                            "   _VTModify(InPos, vNorm, InstMatrix, IN, bRelativeToCam, nType, fTimeShift);") &&
+                            "   _VTModify(InPos, vNorm, InstMatrix, IN, bRelativeToCam, nType, fTimeShift, vBendBefore, bBendBefore);") &&
                     Replace(modificator, "float4 Pos_VS_Terrain(float fOffsetZ, float4x4 VPMatrix, inout streamPos IN, bool bSG=false)",
                             std::string(kBendBefore) + "float4 Pos_VS_Terrain(float fOffsetZ, float4x4 VPMatrix, inout streamPos IN, bool bSG=false)") &&
                     // Contact shadows in the sun's mask (not the terrain's variance pass).

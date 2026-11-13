@@ -1043,6 +1043,16 @@ void __fastcall DrawObjectsAltHook(uintptr_t renderer, uintptr_t a, uintptr_t b)
     g_drawObjectsAlt(renderer, a, b);
 }
 
+// Motion vectors of the main vegetation sway (CRYMT_BENDBEFORE, 1 the default, 2026-11-13): PI_BendInfo is the object's
+// bending plus two time waves the renderer evaluates on the CPU (FUN_38038AD0: the wave table *0x382E9B88 by object
+// +0xD2, FUN_3816F6D0 at the renderer's time +0xAE4), so the shader's time shift sees only the leaves' detail bending.
+// The patched z-prepass vertex shader (Settings.cpp, CryMT_ZPassVS) reads AvgFogVolumeContrib as the bending of 1/60 s
+// before; here, after the engine's setter, that parameter of a vertex shader in the z-prepass gets FUN_38038AD0's value
+// with the time 1/60 s back (its one-object cache and scratch put back as they were).
+bool g_bendBefore;
+uint64_t g_bendBeforeWrites, g_bendBeforeMemory;
+void WriteBendBefore(uintptr_t params, int count, void* dst, int stage, uint32_t cbVectors); // below ResolveTypes
+
 void* __fastcall SetParamsHook(uintptr_t params, int count, void* dst, int stage, uint32_t slot)
 {
     if (g_tracing && g_zThread == GetCurrentThreadId() && params && count > 0)
@@ -1086,7 +1096,10 @@ void* __fastcall SetParamsHook(uintptr_t params, int count, void* dst, int stage
         }
         ReleaseSRWLockExclusive(&g_lock);
     }
-    return g_setParams(params, count, dst, stage, slot);
+    void* result = g_setParams(params, count, dst, stage, slot);
+    if (g_bendBefore)
+        WriteBendBefore(params, count, dst, stage, slot);
+    return result;
 }
 // ---------------------------------------------------------------------------------------------------------------------
 // Per-instance shader parameters of our own (CRYMT_PIFAST=1): CHWShader_D3D vf12 for group 1 (called per object by
@@ -1103,6 +1116,7 @@ CbWriteFn g_cbWrite = reinterpret_cast<CbWriteFn>(kCbWriteFn);
 bool g_piFast, g_piVerify, g_typesResolved;
 int g_tObjMatrix = -1;
 int g_tBendInfo = -1, g_tAlphaTest = -1, g_tObjectAmbColComp = -1, g_tAmbientOpacity = -1;
+int g_tFogContrib = -1; // PI_AvgFogVolumeContrib: in the z-prepass the carrier of the previous bending (BendBefore)
 uint64_t g_piCalls, g_piFast_, g_piVerified, g_piMismatches, g_piUnseen;
 uint64_t g_piTicks, g_piTimed; // rdtsc cycles of the groups we handle: the original's (verify) or ours (fast)
 std::unordered_map<int, uint64_t> g_piUnsupported; // first unsupported parameter type of a group -> calls
@@ -1137,6 +1151,128 @@ void ResolveTypes()
             g_tObjectAmbColComp = t;
         if (n && strcmp(n, "PI_AmbientOpacity") == 0)
             g_tAmbientOpacity = t;
+        if (n && strcmp(n, "PI_AvgFogVolumeContrib") == 0)
+            g_tFogContrib = t;
+    }
+}
+
+constexpr uintptr_t kBendInfoFn = 0x38038AD0;
+constexpr uintptr_t kBendCacheKey = 0x382AF340; // int: renderer +0xB44 of the object cached
+constexpr uintptr_t kBendCache = 0x382DA590;    // float[4]
+constexpr uintptr_t kParamScratch = 0x382D7690; // float[4]: FUN_38038AD0's result
+constexpr uintptr_t kWaveTimeOwner = 0x382E9B68; // the wave function FUN_3816F6D0 reads its time from *this + 0xAE4
+constexpr uintptr_t kRdWaveTime = 0xAE4;          // (not gRenDev 0x382E7530, which FUN_38038AD0 gets)
+
+// FUN_38038AD0 for the object being drawn, afresh (its one-object cache and the scratch put back).
+void BendInfoNow(uintptr_t r, float* out)
+{
+    float cache[4], scratch[4];
+    memcpy(cache, reinterpret_cast<const void*>(kBendCache), sizeof(cache));
+    memcpy(scratch, reinterpret_cast<const void*>(kParamScratch), sizeof(scratch));
+    auto* key = reinterpret_cast<int*>(kBendCacheKey);
+    const int savedKey = *key;
+    *key = *reinterpret_cast<const int*>(r + 0xB44) ^ 0x40000000; // not the cached object: computed afresh
+    reinterpret_cast<void(__fastcall*)(uintptr_t)>(kBendInfoFn)(r);
+    memcpy(out, reinterpret_cast<const void*>(kParamScratch), 4 * sizeof(float));
+    *key = savedKey;
+    memcpy(reinterpret_cast<void*>(kBendCache), cache, sizeof(cache));
+    memcpy(reinterpret_cast<void*>(kParamScratch), scratch, sizeof(scratch));
+}
+
+// The bending of the instance as it was 1/60 s ago. Measured 2026-11-13: shifting the renderer's wave time changed
+// almost nothing (few objects have waves); the sway comes from the 3D engine rewriting the object's bending (+0xFC,
+// +0x100) every frame. So each instance's last two values are kept, keyed by its position (vegetation does not move;
+// the object matrix's translation in 1/8 m), and the previous one is brought to 1/60 s before by the time between them
+// (the wave time at *0x382E9B68 + 0xAE4).
+struct BendHistory
+{
+    float cur[4], prev[4];
+    float curTime, prevTime;
+};
+std::unordered_map<uint64_t, BendHistory> g_bendHistory;
+float g_bendFrameTime;
+uint64_t g_bendSeen, g_bendMoved, g_bendNoHistory;
+double g_bendDeltaSum;
+
+void BendInfoBefore(uintptr_t r, float* out)
+{
+    float now[4];
+    BendInfoNow(r, now);
+    memcpy(out, now, sizeof(now));
+    const uintptr_t owner = *reinterpret_cast<const uintptr_t*>(kWaveTimeOwner);
+    const float* m = *reinterpret_cast<const float* const*>(r + kRdObjMatrix);
+    if (!owner || !m)
+        return;
+    const float t = *reinterpret_cast<const float*>(owner + kRdWaveTime);
+    if (t != g_bendFrameTime)
+    {
+        g_bendFrameTime = t;
+        if (g_bendHistory.size() > 30000) // instances not drawn for a second go
+            for (auto it = g_bendHistory.begin(); it != g_bendHistory.end();)
+                it = it->second.curTime < t - 1.0f || it->second.curTime > t ? g_bendHistory.erase(it) : std::next(it);
+    }
+    const auto q = [](float v) { return static_cast<uint64_t>(static_cast<int64_t>(lroundf(v * 8.0f)) & 0x1FFFFF); };
+    const uint64_t key = q(m[3]) | q(m[7]) << 21 | q(m[11]) << 42;
+    BendHistory& h = g_bendHistory[key];
+    if (h.curTime != t)
+    {
+        if (h.curTime > 0)
+        {
+            memcpy(h.prev, h.cur, sizeof(h.prev));
+            h.prevTime = h.curTime;
+        }
+        memcpy(h.cur, now, sizeof(h.cur));
+        h.curTime = t;
+    }
+    g_bendSeen++;
+    const float dt = t - h.prevTime;
+    if (h.prevTime <= 0 || dt < 1e-4f || dt > 0.25f)
+    {
+        g_bendNoHistory++;
+        return;
+    }
+    const float k = (1.0f / 60.0f) / dt;
+    for (int c = 0; c < 4; c++)
+        out[c] = now[c] + (h.prev[c] - now[c]) * k;
+    const float dx = h.prev[0] - now[0], dy = h.prev[1] - now[1];
+    if (dx * dx + dy * dy > 1e-8f)
+    {
+        g_bendMoved++;
+        g_bendDeltaSum += sqrtf(dx * dx + dy * dy) * k;
+    }
+}
+
+void WriteBendBefore(uintptr_t params, int count, void* dst, int stage, uint32_t cbVectors)
+{
+    if (stage != 0 || !params || count <= 0)
+        return;
+    const uintptr_t r = *reinterpret_cast<const uintptr_t*>(kRendererGlobal);
+    if (!r || !(*reinterpret_cast<const uint32_t*>(r + kRdBatchFilter) & 8)) // the z-prepass's lists (FB_Z)
+        return;
+    ResolveTypes();
+    if (g_tFogContrib < 0)
+        return;
+    for (int i = 0; i < count; i++)
+    {
+        const uintptr_t p = params + static_cast<uintptr_t>(i) * kParamSize;
+        const uint32_t flags = *reinterpret_cast<const uint32_t*>(p + 8);
+        if (!(flags & 0x40000) || static_cast<int>(*reinterpret_cast<const uint32_t*>(p + 0x18) & 0xFF) != g_tFogContrib)
+            continue;
+        alignas(16) float before[4];
+        BendInfoBefore(r, before);
+        if (dst)
+        {
+            if (count != 1) // a whole instancing group: the patched shaders read it only without instancing
+                continue;
+            memcpy(dst, before, sizeof(before)); // one parameter into memory (the draw packets): its floats first
+            g_bendBeforeMemory++;
+            continue;
+        }
+        const int reg = *reinterpret_cast<const int16_t*>(p + 0xC);
+        if (reg < 0 && !(flags & 8))
+            continue;
+        g_cbWrite(reg, *reinterpret_cast<const int16_t*>(p + 0xE), stage, before, 4, static_cast<int>(cbVectors));
+        g_bendBeforeWrites++;
     }
 }
 
@@ -3356,6 +3492,21 @@ void InstallSpriteCheck()
 }
 } // namespace
 
+uint64_t BendBeforeCount()
+{
+    return g_bendBeforeWrites + g_bendBeforeMemory;
+}
+
+void BendBeforeStats(char* text, size_t size)
+{
+    snprintf(text, size, "written %llu (constants %llu, draw packets %llu); instances seen %llu, without history %llu, bending moved %llu "
+             "(mean |d xy| per 1/60 s %.5f); history %zu",
+             static_cast<unsigned long long>(g_bendBeforeWrites + g_bendBeforeMemory), static_cast<unsigned long long>(g_bendBeforeWrites),
+             static_cast<unsigned long long>(g_bendBeforeMemory), static_cast<unsigned long long>(g_bendSeen),
+             static_cast<unsigned long long>(g_bendNoHistory), static_cast<unsigned long long>(g_bendMoved),
+             g_bendMoved ? g_bendDeltaSum / static_cast<double>(g_bendMoved) : 0.0, g_bendHistory.size());
+}
+
 void OnEngineLoaded()
 {
     InstallProcHooks();
@@ -3433,8 +3584,10 @@ void Install()
     g_packets = g_packets && g_setGroup && g_meshDraw && g_drawObjects;
     if (g_census || g_traceTarget || g_cycles || g_loopCensus || g_mergeCensus || g_objTexCensus)
         g_zPrepass = reinterpret_cast<ZPrepassFn>(detour(kZPrepassFn, kZPrepassHead, sizeof(kZPrepassHead), reinterpret_cast<const void*>(&ZPrepassHook)));
-    if (g_census || g_traceTarget)
+    g_bendBefore = !(GetEnvironmentVariableW(L"CRYMT_BENDBEFORE", text, 16) && _wtoi(text) == 0);
+    if (g_census || g_traceTarget || g_bendBefore)
         g_setParams = reinterpret_cast<SetParamsFn>(detour(kSetParamsFn, kSetParamsHead, sizeof(kSetParamsHead), reinterpret_cast<const void*>(&SetParamsHook)));
+    g_bendBefore = g_bendBefore && g_setParams;
     if (g_traceTarget || g_cycles)
         g_flush = reinterpret_cast<FlushFn>(detour(kFlushShaderFn, kFlushShaderHead, sizeof(kFlushShaderHead), reinterpret_cast<const void*>(&FlushHook)));
     g_setVerify = GetEnvironmentVariableW(L"CRYMT_SETVERIFY", nullptr, 0) != 0;
