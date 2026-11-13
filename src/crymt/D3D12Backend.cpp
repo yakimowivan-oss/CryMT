@@ -625,6 +625,7 @@ CpuDescriptors g_srvCpu, g_rtvCpu, g_dsvCpu, g_samplerCpu;
 D3D12_CPU_DESCRIPTOR_HANDLE g_nullSrv, g_defaultSampler;
 extern std::atomic<int> g_sceneDumpFrames;
 bool MvSequence();
+int MvSequenceLevel(); // CRYMT_MVSEQ: 1 every target, 2 only DLSS's input, output and vectors (lighter at large sizes)
 std::atomic<bool> g_objectMotion{true}; // the engine's object velocities in DLSS's motion vectors (PgDn with the test keys) // the capture key's DLSS input/output dump (defined with the capture)
 
 // Shader-visible CBV/SRV/UAV descriptors, handed out in submission order (main lists only).
@@ -10934,11 +10935,29 @@ public:
             // blur target, raw), mvNN_foliage, NN counting the frames of this capture.
             const bool seq = MvSequence();
             const int index = seq ? m_sceneDumpIndex++ : 0;
+            m_seqDumpIndex = seq ? index : -1;
             char name[32];
             const auto named = [&](const char* what) {
                 snprintf(name, sizeof(name), "mv%02d_%s", index, what);
                 return name;
             };
+            if (seq)
+            {
+                // <tag>_mvinfo.txt: per captured frame the jitter DLSS is told, the reset flag, the projection's offset
+                // terms (0 without jitter) and the camera's place, for tools\prof\dlaa_seq.py.
+                char path[MAX_PATH];
+                snprintf(path, sizeof(path), "%s%s_mvinfo.txt", CryMTCapture("").c_str(), m_dumpTag.c_str());
+                FILE* f = nullptr;
+                if (fopen_s(&f, path, index == 0 ? "w" : "a") == 0 && f)
+                {
+                    float toWorld[16];
+                    RigidInverse(info->view, toWorld);
+                    fprintf(f, "%d jitter %.5f %.5f reset %d proj8 %.7f proj9 %.7f cam %.4f %.4f %.4f fwd %.5f %.5f %.5f time %.5f\n", index, info->jitterX,
+                            info->jitterY, info->reset ? 1 : 0, info->proj[8], info->proj[9], toWorld[12], toWorld[13], toWorld[14], -toWorld[8], -toWorld[9],
+                            -toWorld[10], info->time);
+                    fclose(f);
+                }
+            }
             Require(color, D3D12_RESOURCE_STATE_COPY_SOURCE);
             FlushBarriers();
             RecordDump(color->res, seq ? named("in") : "next_dlss_in", 0);
@@ -10946,7 +10965,7 @@ public:
             m_list->ResourceBarrier(1, &b);
             RecordDump(m_dlssMvec, seq ? named("mvec") : "next_mvec", 3);
             m_barriers.push_back(Transition(m_dlssMvec, D3D12_RESOURCE_STATE_COPY_SOURCE, kSrvState));
-            if (seq)
+            if (seq && MvSequenceLevel() != 2)
             {
                 if (m_ombCopyFrame == m_frame && m_ombCopy.res)
                 {
@@ -11027,7 +11046,11 @@ public:
                 m_note.fixed++;
             }
         if (dumpScene)
-            RecordDump(m_dlssOut, "next_dlss_out", 0);
+        {
+            char name[32];
+            snprintf(name, sizeof(name), "mv%02d_out", m_seqDumpIndex);
+            RecordDump(m_dlssOut, m_seqDumpIndex >= 0 ? name : "next_dlss_out", 0);
+        }
         m_barriers.push_back(Transition(m_dlssOut, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
         m_stats.dlssFrames++;
     }
@@ -11869,6 +11892,7 @@ private:
     Srv12* m_bendSrv = nullptr;
     UINT m_bendW = 0, m_bendH = 0;
     uint64_t m_bendFrame = ~0ull;
+    int m_seqDumpIndex = -1;               // the CRYMT_MVSEQ frame being dumped (-1: a single capture-key frame)
     ID3D10Texture2D* m_objMvTex = nullptr; // BindObjectMotion
     Rtv12* m_objMvRtv = nullptr;
     Srv12* m_objMvSrv = nullptr;
@@ -14267,13 +14291,17 @@ std::atomic<int> g_captureKeyFlags{0}; // what was on, for the name: 1 GI, 2 the
 // Scene hand-overs left to dump DLSS's input and output (the capture key: 1; with CRYMT_MVSEQ=1 every captured frame, for
 // the motion vector check tools\prof\mv_check.py: colour, vectors, the engine's object velocities, the foliage mask).
 std::atomic<int> g_sceneDumpFrames{0};
+int MvSequenceLevel()
+{
+    static const int level = [] {
+        wchar_t v[8] = {};
+        return GetEnvironmentVariableW(L"CRYMT_MVSEQ", v, 8) ? _wtoi(v) : 0;
+    }();
+    return level;
+}
 bool MvSequence()
 {
-    static const bool on = [] {
-        wchar_t v[8] = {};
-        return GetEnvironmentVariableW(L"CRYMT_MVSEQ", v, 8) && _wtoi(v) != 0;
-    }();
-    return on;
+    return MvSequenceLevel() != 0;
 }
 
 // Milliseconds since the process started (capture windows line up with CryMT's comparison schedule).

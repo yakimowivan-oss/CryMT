@@ -47,6 +47,9 @@ $defs = [ordered]@{
     # Motion vector check (crymt_capture N in -Commands dumps N frames: colour, vectors, motion blur target, foliage
     # mask; tools\prof\mv_check.py): no jitter, so a still frame pair differs only by motion and light.
     mvseq = @{Gi = '1'; Env = @{CRYMT_MVSEQ = '1'; CRYMT_DLSS_JITTER = '0'}}
+    # DLAA smear check (tools\prof\dlaa_seq.py): the same sequence with the jitter on as played, and with its sign flipped.
+    mvseqj = @{Gi = '1'; Env = @{CRYMT_MVSEQ = '1'}}
+    mvseqj_flip = @{Gi = '1'; Env = @{CRYMT_MVSEQ = '1'; CRYMT_DLSS_JITTER = '--'}}
     # The engine cube under main's frame id as before 2026-11-13 07:10 (crash A/B).
     cube_oldframe = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_OWNFRAME = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
