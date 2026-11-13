@@ -7,8 +7,10 @@ water, GI noise; a still camera with nothing moving gives the floor).
     python tools\\prof\\mv_check.py <capture dir> <tag> [threshold 0.03] [out dir]
 
 Files: <tag>_mvNN_in.f16 (RGBA16F), _mvNN_mvec.f16 (RG16F: previous minus current, screen fractions), _mvNN_omb.f16 (the
-engine's object motion blur target, RGBA16F; missing when it drew nothing), _mvNN_foliage.pgm (the z-prepass foliage
-mask). Classes: foliage (mask), objects (the motion blur target holds a velocity or an id there), rest.
+engine's object motion blur target, RGBA16F; missing when it drew nothing), _mvNN_objmv.f16 (CryMT's exact object
+motion from the patched pass: xy before minus now, z distance / far, w 1 exact / 0.5 shutter factor in), _mvNN_foliage.pgm
+(the z-prepass foliage mask). Classes: foliage (mask), objects (the motion blur target holds a velocity or an id there, or
+the exact target was written), rest; "exact" lines: the exact target's pixels and their mean move.
 Writes <out>/<tag>_mverr.png for the last pair: grey the current frame, red where the vectors miss (wrong after the move),
 green where they fixed a change, blue outline the motion blur objects."""
 import os
@@ -87,6 +89,16 @@ def main():
             omb = read_f16(omb_path, 4)
             if omb.shape[:2] == (h, w):
                 objects = (np.abs(omb[..., 0]) + np.abs(omb[..., 1]) > 1e-6) | (omb[..., 3] != 0)
+        objmv_path = os.path.join(folder, f'{tag}_mv{n:02d}_objmv.f16')
+        if os.path.exists(objmv_path):
+            om = read_f16(objmv_path, 4)
+            if om.shape[:2] == (h, w):
+                ex = om[..., 3] > 0.75
+                ap = (om[..., 3] > 0.25) & ~ex
+                objects = objects | ex | ap
+                mpx = np.hypot(om[..., 0] * w, om[..., 1] * h)
+                print(f'{n - 1:02d}-{n:02d} exact     {100 * ex.sum() / (h * w):8.2f}% exact, {100 * ap.sum() / (h * w):.2f}% approx; '
+                      f'mean |move| exact {float(mpx[ex].mean()) if ex.any() else 0:.3f} px, max {float(mpx[ex].max()) if ex.any() else 0:.2f} px')
         classes = {'all': np.ones((h, w), bool), 'foliage': foliage & ~objects, 'objects': objects,
                    'rest': ~foliage & ~objects}
         mvpx = np.hypot(mv[..., 0] * w, mv[..., 1] * h)

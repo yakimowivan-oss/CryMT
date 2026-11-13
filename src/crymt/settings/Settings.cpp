@@ -277,6 +277,62 @@ pixout CryMT_ParticlePS(v2f IN)
 
 )";
 
+// Exact object motion for DLSS (2026-11-13). The engine's motion blur pass (CommonMotionBlurPass.cfi) places each moving
+// object as it was with MotionBlurData = lerp(view x world now, previous view x previous world, f) (renderer FUN_3803AFC0,
+// f = r_MotionBlurShutterSpeed x 0.8 / frame time, x min(1, 0.03125 / frame time) with r_MotionBlurFrameTimeScale), so
+// its velocity is the move with the camera's, times f, faded with distance ((1 - d / 200)^8) and zeroed under 0.001 of
+// the screen. HPosToScreenTC is linear in homogeneous coordinates under D3D10, so the true before is (lerped - (1 - f) x
+// now) / f: the vertex shader takes f from AvgFogVolumeContrib (CryMT's setter hook writes x = f, y = -777 in this pass;
+// without it the engine's fog value, no mark: nothing) and puts the before into vNormalWS (the engine's pixel shader does
+// not read it); the pixel shader writes SV_Target1 = (before - now in screen fractions, distance / far, 1), or (lerped -
+// now, distance / far, 0.5) where there was no exact before (instancing: RunMotion divides by the frame's f). Own names:
+// the shared shader cache keeps shaders by name.
+const char* const kMotionBlurExact = R"(// CryMT: exact object motion for DLSS (see the back end's RunMotion).
+#if D3D10
+struct pixout_crymb
+{
+  float4 Color  : COLOR0;
+  float4 Motion : COLOR1;
+};
+#endif
+
+vert2fragMotionBlur CryMT_MotionBlurPassVS(app2vertMotionBlur IN)
+{
+  vert2fragMotionBlur OUT = Common_MotionBlurPassVS(IN);
+#if D3D10
+  OUT.vNormalWS = 0;
+ #if %_RT_INSTANCING_ATTR
+ #else
+  float cryF = AvgFogVolumeContrib.x;
+  if (AvgFogVolumeContrib.y == -777 && cryF > 0.001)
+    OUT.vNormalWS = (OUT.vVelocityPrev - (1 - cryF) * OUT.vVelocity) / cryF;
+ #endif
+#endif
+  return OUT;
+}
+
+#if D3D10
+pixout_crymb CryMT_MotionBlurPassPS(vert2fragMotionBlur IN)
+{
+  pixout c = Common_MotionBlurPassPS(IN);
+  pixout_crymb OUT;
+  OUT.Color = c.Color;
+  float2 cryNow = IN.vVelocity.xy / IN.vVelocity.w;
+  if (IN.vNormalWS.w > 1e-6)
+    OUT.Motion = float4(IN.vNormalWS.xy / IN.vNormalWS.w - cryNow, IN.baseTC.z, 1);
+  else
+    OUT.Motion = float4(IN.vVelocityPrev.xy / IN.vVelocityPrev.w - cryNow, IN.baseTC.z, 0.5);
+  return OUT;
+}
+#else
+pixout CryMT_MotionBlurPassPS(vert2fragMotionBlur IN)
+{
+  return Common_MotionBlurPassPS(IN);
+}
+#endif
+
+)";
+
 // Pos_VS_General with the vertex bent as fTimeShift seconds before (ModificatorVT.cfi, before Pos_VS_Terrain).
 const char* const kBendBefore = R"(// CryMT (motion vectors): Pos_VS_General with the vertex bent as fTimeShift seconds before (the shader's own waves) and,
 // with bBendBefore, the instance's main bending as the CPU had it then (vBendBefore).
@@ -955,6 +1011,7 @@ const wchar_t* kVegetation = L"Shaders\\HWScripts\\CryFX\\Vegetation.cfx";
 const wchar_t* kWater = L"Shaders\\HWScripts\\CryFX\\Water.cfx";
 const wchar_t* kWaterVols = L"Shaders\\HWScripts\\CryFX\\WaterVols.cfx";
 const wchar_t* kModificator = L"Shaders\\HWScripts\\CryFX\\ModificatorVT.cfi";
+const wchar_t* kMotionBlurPass = L"Shaders\\HWScripts\\CryFX\\CommonMotionBlurPass.cfi";
 const wchar_t* kPlaceholder = L"Textures\\CryMT\\gi.dds";
 // The patch goes into the game as a pak: without -DEVMODE CryPak reads files only from paks (loose files are ignored)
 // and a later pak by name overrides the earlier ones (as the official ZPatch1.pak does), so zzCryMT.pak's sources
@@ -1094,13 +1151,14 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
                 particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal)),
                 vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater)),
-                waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols)), modificator = Lf(ReadAll(tmp + L"\\" + kModificator));
+                waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols)), modificator = Lf(ReadAll(tmp + L"\\" + kModificator)),
+                motionBlur = Lf(ReadAll(tmp + L"\\" + kMotionBlurPass));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
@@ -1201,6 +1259,13 @@ std::wstring InstallGi()
                     Replace(waterVols, "//////////////////////////////// technique ////////////////\n\ntechnique General\n",
                             std::string(kWaterVolsMask) + "//////////////////////////////// technique ////////////////\n\ntechnique General\n") &&
                     Replace(particles, "/////////////////////////////////\n// technique\n", std::string(kParticleMask) + "/////////////////////////////////\n// technique\n") &&
+                    // Exact object motion from the motion blur pass (kMotionBlurExact).
+                    Replace(motionBlur, "//////////////////////////////// technique ////////////////\n\ntechnique MotionBlurPass\n",
+                            std::string(kMotionBlurExact) + "//////////////////////////////// technique ////////////////\n\ntechnique MotionBlurPass\n") &&
+                    Replace(motionBlur, "    VertexShader = compile vs_Auto Common_MotionBlurPassVS() MotionBlurVS;\n",
+                            "    VertexShader = compile vs_Auto CryMT_MotionBlurPassVS() MotionBlurVS;\n") &&
+                    Replace(motionBlur, "    PixelShader = compile ps_Auto Common_MotionBlurPassPS() MotionBlurPS;\n",
+                            "    PixelShader = compile ps_Auto CryMT_MotionBlurPassPS() MotionBlurPS;\n") &&
                     // The bending can be asked for an earlier time (default 0: every other caller as before).
                     Replace(modificator, "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams)",
                             "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams, float fTimeShift = 0)") &&
@@ -1290,6 +1355,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/Water.cfx", Crlf(water)},
                               {"Shaders/HWScripts/CryFX/WaterVols.cfx", Crlf(waterVols)},
                               {"Shaders/HWScripts/CryFX/ModificatorVT.cfi", Crlf(modificator)},
+                              {"Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi", Crlf(motionBlur)},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/hiz.dds", hiz},
                               {"Textures/CryMT/env.dds", env},

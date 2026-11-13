@@ -644,6 +644,9 @@ int EnvCubeOwnFrame()
     return on;
 }
 uint64_t g_frameIdCaughtUp;
+int* g_mbGate;            // MotionBlurGates: the int the motion blur pass's tests read
+bool g_mbGateOn;
+uint64_t g_mbGateForced; // frames the pass was let run below r_MotionBlur 3
 bool g_cubeRendering; // render thread, inside the cube's render call
 uint64_t g_cubeIdsRestored, g_cubeIdsOutside, g_cubeIdsOverflow;
 EngineLightState g_cubeLightsAfter;
@@ -1303,6 +1306,9 @@ void WriteStats()
             char bend[512];
             zpass::BendBeforeStats(bend, sizeof(bend));
             fprintf(f, "vegetation motion (CRYMT_BENDBEFORE): the previous main bending %s\n", bend);
+            zpass::MotionBlurStats(bend, sizeof(bend));
+            fprintf(f, "exact object motion (CRYMT_OMB_EXACT): %s; at any preset (CRYMT_OMB_ANYPRESET) %s, frames let run below r_MotionBlur 3: %llu\n",
+                    bend, g_mbGateOn ? "on" : "off", static_cast<unsigned long long>(g_mbGateForced));
         }
         fprintf(f, "engine cube: own frame id %d, main's frame id caught up %llu times\n", EnvCubeOwnFrame(),
                 static_cast<unsigned long long>(g_frameIdCaughtUp));
@@ -5528,10 +5534,79 @@ void DrawOverlay(void* renderer)
             draw(renderer, 10.0f, 120.0f + 20.0f * i, 1.7f, kColor, false, "%s", o.lines[i]);
 }
 
+// Object motion at any preset (CRYMT_OMB_ANYPRESET, 1 the default, with DLSS; 2026-11-13): the engine draws its object
+// motion blur pass (moving objects and the first-person view with their previous transforms: CryMT's motion vectors
+// take them from it) only at r_MotionBlur 3 or more (Very High; High sets 1). The pass's own tests (the pipeline at
+// 0x380AB268 "> 1", FUN_38065C70 at 0x38065CBC ">= 3" and 0x38065F1C "3 or 5", begin and end of the pass) are pointed
+// at an int of ours in a page within 2 GB of the renderer: r_MotionBlur, at least 3. The blur itself (FUN_38069510, the
+// post effect) keeps reading r_MotionBlur, so the picture's blur stays as the preset has it. CryAnimation keeps the
+// characters' previous bones at any r_MotionBlur but 0.
+void MotionBlurGates()
+{
+    constexpr uintptr_t kMotionBlurCvar = 0x382E992C; // int r_MotionBlur
+    static bool tried;
+    if (!tried)
+    {
+        tried = true;
+        wchar_t v[8] = {};
+        const bool wanted = !(GetEnvironmentVariableW(L"CRYMT_OMB_ANYPRESET", v, 8) && _wtoi(v) == 0);
+        const bool dlss = GetEnvironmentVariableW(L"CRYMT_DLSS", v, 8) != 0 && wcscmp(v, L"0") != 0;
+        if (!wanted || !dlss || g_mode != 2)
+            return;
+        struct Site
+        {
+            uintptr_t at;
+            uint8_t op0, op1;
+            int len;
+        };
+        static const Site kSites[] = {{0x380AB268, 0x83, 0x3D, 7}, {0x38065CBC, 0x83, 0x3D, 7}, {0x38065F1C, 0x8B, 0x05, 6}};
+        bool match = true;
+        for (const Site& s : kSites)
+        {
+            const auto* p = reinterpret_cast<const uint8_t*>(s.at);
+            int32_t disp = 0;
+            memcpy(&disp, p + 2, 4);
+            match = match && p[0] == s.op0 && p[1] == s.op1 && s.at + s.len + static_cast<intptr_t>(disp) == kMotionBlurCvar;
+        }
+        uint8_t* page = nullptr;
+        for (uintptr_t hint = kRenderBase + kRenderSize + 0x200000; match && hint < kRenderBase + 0x40000000 && !page; hint += 0x10000)
+            page = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!match || !page)
+        {
+            FocusLog("object motion at any preset: not patched (%s)", match ? "no page near the renderer" : "unexpected bytes");
+            return;
+        }
+        g_mbGate = reinterpret_cast<int*>(page);
+        *g_mbGate = *reinterpret_cast<const int*>(kMotionBlurCvar);
+        for (const Site& s : kSites)
+        {
+            auto* p = reinterpret_cast<uint8_t*>(s.at);
+            const int32_t d32 = static_cast<int32_t>(reinterpret_cast<intptr_t>(page) - static_cast<intptr_t>(s.at + s.len));
+            DWORD old = 0;
+            if (VirtualProtect(p + 2, 4, PAGE_EXECUTE_READWRITE, &old))
+            {
+                memcpy(p + 2, &d32, 4);
+                VirtualProtect(p + 2, 4, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), p, s.len);
+            }
+        }
+        g_mbGateOn = true;
+        FocusLog("object motion at any preset: the motion blur pass's tests read CryMT's value (r_MotionBlur, at least 3)");
+    }
+    if (!g_mbGateOn)
+        return;
+    const int real = *reinterpret_cast<const int*>(kMotionBlurCvar);
+    if (real < 3)
+        g_mbGateForced++;
+    *g_mbGate = real < 3 ? 3 : real;
+}
+
 void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
 {
     g_endEfCalls++;
     g_lastEndEfRet = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    if (g_mainThread && GetCurrentThreadId() == g_mainThread)
+        MotionBlurGates();
     // EF_EndEf3D renders some passes (water reflections) by calling back into RenderScene, so the
     // render thread reaches this hook from the same call site; only the main thread starts a frame.
     if (g_mainThread && GetCurrentThreadId() != g_mainThread)
@@ -8529,7 +8604,7 @@ constexpr uintptr_t kCryActionEnv = 0x30964AE0;
 // "crymt_waitlevel" until 100 3D scenes were handed over (a level is running; at most 2 minutes).
 struct CommandQueue
 {
-    char text[1024];
+    char text[8192]; // 1024 until 2026-11-13: a longer CRYMT_TESTCMD (Lua spawns) left the queue empty
     size_t next;
     int interval;
     DWORD last;
@@ -8634,7 +8709,7 @@ void RunTestCommands()
         return;
     q.last = now;
     q.hasDelay = false;
-    char command[256];
+    char command[1024];
     size_t n = 0;
     while (q.text[q.next] && q.text[q.next] != ';' && n + 1 < sizeof(command))
         command[n++] = q.text[q.next++];

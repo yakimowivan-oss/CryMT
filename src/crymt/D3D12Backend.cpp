@@ -39,6 +39,7 @@
 #include "GiControl.h"
 #include "RenderDocCapture.h"
 #include "BendSss.h"
+#include "ZPass.h"
 
 #include <string>
 
@@ -2202,9 +2203,14 @@ void camera(uint3 id : SV_DispatchThreadID)
     outTex[uint2(0, 0)] = temporal > 0 && Finite(previous) ? lerp(value, previous, 0.9) : value;
 }
 
-// Motion vectors for DLSS (full size, screen units, previous minus current, camera motion included): t0 depth, t1 the
-// engine's object velocities, u0 out. Every point moves with the camera, objects drawn by the motion blur pass also
-// by their own motion; the weapon moves with the camera, so it stays where it is on screen.
+// Motion vectors for DLSS (full size, screen units, previous minus current, camera motion included): t0 depth, t1 object
+// motion, t2 bent vegetation, u0 out. Every point moves with the camera; objects the engine's motion blur pass drew
+// (moving ones, and the first-person weapon and hands) by their own before, which has the camera's move in it (the
+// pass's MotionBlurData is the previous view x the previous world matrix; the first-person view's are relative to the
+// camera, so there it is the sway, bob and recoil). The weapon has no camera motion of its own (0 where not drawn).
+// t1: motionParams.y 2 CryMT's target from the patched pass (xy before minus now, z distance / far, w 1 exact, 0.5 with
+// the engine's shutter factor f still in, 0 not drawn); 1 a copy of the engine's own (rg (now - before) x f x (1 -
+// distance / 200)^8, zeroed under 0.001; b distance / far; a its id, non-zero where drawn). radius: the frame's f.
 [numthreads(8, 8, 1)]
 void motion(uint3 id : SV_DispatchThreadID)
 {
@@ -2212,35 +2218,51 @@ void motion(uint3 id : SV_DispatchThreadID)
         return;
     float2 uv = (id.xy + 0.5) / fullSize;
     float d = depthTex[id.xy];
+    bool weapon = d < kWeaponDepth;
     float2 mv = 0;
-    if (d >= kWeaponDepth)
+    float3 V = 0;
+    if (!weapon)
     {
-        float3 V = ViewPosAt(uv, d);
+        V = ViewPosAt(uv, d);
         float4 prevClip = mul(float4(V.xy, -V.z, 1), reproj);
         mv = float2(prevClip.x, -prevClip.y) / prevClip.w * 0.5 + 0.5 - uv;
-        if (motionParams.y > 0)
+    }
+    // Taken only where the object is this pixel's (its distance matches the scene's; the weapon's is in its own range)
+    // and the move stays under a quarter of the screen a frame.
+    bool object = false;
+    if (motionParams.y > 1.5)
+    {
+        float4 o = srcTex[id.xy];
+        bool exact = o.w > 0.75;
+        float2 obj = exact ? o.xy : o.xy / max(radius, 1e-3);
+        float dist = o.z * motionParams.x;
+        if ((exact || (o.w > 0.25 && radius > 1e-3)) && (weapon || abs(dist - V.z) < 0.03 * V.z + 0.05) && all(abs(obj) < 0.25) && all(obj == obj))
         {
-            // The engine fades its velocity with distance for the blur: (1 - distance / 200)^8; undone where it is kept.
-            // Taken only where it is this pixel's: the distance the engine stored with it (z, of the far plane) matches
-            // the scene's here, the object is within ~107 m (fade > 0.002: a 1 px move still has ~1% precision in the
-            // half float; beyond ~150 m it rounds to 0) and the result stays under a tenth of the screen a frame.
-            // History: until 2026-11-13 this read the target after the engine had reused it for a copy of the scene
-            // (KeepObjectMotion copies it now right after its pass); colours as velocities gave the "vegetation garbage"
-            // of 2026-11-05 (64% of a still jungle view over 2 px), and the 60 m limit (fade > 0.05) then.
-            float4 v = srcTex[id.xy];
-            float dist = v.z * motionParams.x;
-            float fade = pow(1 - saturate(dist / 200), 8);
-            float2 obj = fade > 0.002 ? v.xy / fade : 0;
-            if (fade > 0.002 && abs(dist - V.z) < 0.03 * V.z + 0.05 && all(abs(obj) < 0.1) && all(obj == obj))
-                mv -= obj;
+            mv = obj;
+            object = true;
         }
-        // Wind-bent vegetation (t2, the patched z-prepass: before minus now per 1/60 s, motionParams.z the frame's scale).
-        if (motionParams.w > 0)
+    }
+    else if (motionParams.y > 0.5 && radius > 1e-3)
+    {
+        // History: until 2026-11-13 this read the target after the engine had reused it for a copy of the scene
+        // (KeepObjectMotion copies it now right after its pass), and subtracted it from the camera's move as if it were the
+        // object's own at f = 1 (it has the camera's move in it, times f: 0.72 at 60 fps).
+        float4 v = srcTex[id.xy];
+        float dist = v.z * motionParams.x;
+        float fade = pow(1 - saturate(dist / 200), 8);
+        float2 obj = fade > 0.002 ? -v.xy / (fade * radius) : 0;
+        if (v.a != 0 && any(v.xy != 0) && fade > 0.002 && (weapon || abs(dist - V.z) < 0.03 * V.z + 0.05) && all(abs(obj) < 0.25) && all(obj == obj))
         {
-            float2 bent = historyTex[id.xy].xy * motionParams.z;
-            if (all(abs(bent) < 0.1) && all(bent == bent))
-                mv += bent;
+            mv = obj;
+            object = true;
         }
+    }
+    // Wind-bent vegetation (t2, the patched z-prepass: before minus now per 1/60 s, motionParams.z the frame's scale).
+    if (!weapon && !object && motionParams.w > 0)
+    {
+        float2 bent = historyTex[id.xy].xy * motionParams.z;
+        if (all(abs(bent) < 0.1) && all(bent == bent))
+            mv += bent;
     }
     outTex[id.xy] = float4(mv, 0, 0);
 }
@@ -4390,6 +4412,7 @@ struct Stats
     uint64_t gpuTicks, gpuLists; // GPU time from the start to the end of each main list
     uint64_t depthToSrv, rtClears, dsClears;
     uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, objectMotionCopies, bendMotionPasses, biasFrames, biasDraws, biasGiven, voxPasses, giLateReads, giOtherDepth;
+    uint64_t objectMotionExactFrames, objectMotionExactDraws, objectMotionExactPasses;
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
     uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
     uint64_t voxGeomStale; // replays skipped: the draw's list was done, its ring data possibly reused (VoxDraw::serial)
@@ -7043,6 +7066,67 @@ public:
         m_stats.biasDraws++;
         m_biasRtv->info->outputBound++;
         Bind(m_rtv[1], m_biasRtv);
+        m_omDirty = m_psoDirty = true;
+    }
+
+    // Exact object motion (R16G16B16A16F, the motion blur target's size): the patched motion blur pass's SV_Target1
+    // (Settings.cpp kMotionBlurExact: before minus now in screen fractions, distance / far, 1 exact or 0.5 with the
+    // engine's shutter factor still in; 0 where no moving object was drawn), cleared at the frame's first such draw.
+    // RunMotion reads it in place of the engine's own target.
+    void BindObjectMotion()
+    {
+        const auto* t = static_cast<const TextureCore*>(m_rtv[0]->info);
+        const UINT w = t->width, h = t->height;
+        if (!m_objMvRtv || w != m_objMvW || h != m_objMvH)
+        {
+            if (m_objMvSrv)
+                m_objMvSrv->Release();
+            if (m_objMvRtv)
+                m_objMvRtv->Release();
+            if (m_objMvTex)
+                m_objMvTex->Release();
+            m_objMvSrv = nullptr;
+            m_objMvRtv = nullptr;
+            m_objMvTex = nullptr;
+            D3D10_TEXTURE2D_DESC td{};
+            td.Width = w;
+            td.Height = h;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D10_USAGE_DEFAULT;
+            td.BindFlags = D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
+            ID3D10Texture2D* tex = nullptr;
+            ID3D10RenderTargetView* rtv = nullptr;
+            ID3D10ShaderResourceView* srv = nullptr;
+            if (FAILED(CreateTexture2D(&td, nullptr, &tex)) || FAILED(CreateRenderTargetView(tex, nullptr, &rtv)) ||
+                FAILED(CreateShaderResourceView(tex, nullptr, &srv)))
+            {
+                if (rtv)
+                    rtv->Release();
+                if (tex)
+                    tex->Release();
+                Log("exact object motion %ux%u: failed", w, h);
+                return;
+            }
+            m_objMvTex = tex;
+            m_objMvRtv = static_cast<Rtv12*>(rtv);
+            m_objMvSrv = static_cast<Srv12*>(srv);
+            m_objMvW = w;
+            m_objMvH = h;
+            m_objMvFrame = ~0ull;
+            Log("exact object motion %ux%u", w, h);
+        }
+        if (m_objMvFrame != m_frame)
+        {
+            static const FLOAT kZero[4] = {};
+            ClearRenderTargetView(m_objMvRtv, kZero);
+            m_objMvFrame = m_frame;
+            m_stats.objectMotionExactFrames++;
+        }
+        m_stats.objectMotionExactDraws++;
+        m_objMvRtv->info->outputBound++;
+        Bind(m_rtv[1], m_objMvRtv);
         m_omDirty = m_psoDirty = true;
     }
 
@@ -10870,6 +10954,12 @@ public:
                     FlushBarriers();
                     RecordDump(m_ombCopy.res, named("omb"), 7);
                 }
+                if (m_objMvSrv && m_objMvFrame == m_frame && m_objMvSrv->info)
+                {
+                    Require(m_objMvSrv->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    FlushBarriers();
+                    RecordDump(m_objMvSrv->info->res, named("objmv"), 7);
+                }
                 if (m_foliageSrv && m_foliageFrame == m_frame && m_foliageSrv->info)
                 {
                     Require(m_foliageSrv->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -11550,6 +11640,9 @@ public:
         }
         KeepObjectMotion(); // a pass with nothing drawn after it
         TextureCore* velocity = m_ombCopyFrame == m_frame && g_objectMotion ? &m_ombCopy : nullptr;
+        // CryMT's exact object motion (BindObjectMotion) when the patched pass drew this frame; the engine's target else.
+        Srv12* exact = g_objectMotion && m_objMvSrv && m_objMvFrame == m_frame && m_objMvW == color->width && m_objMvH == color->height &&
+                               m_objMvSrv->info ? m_objMvSrv : nullptr;
         Srv12* bend = g_objectMotion && m_bendSrv && m_bendFrame == m_frame && m_bendW == color->width && m_bendH == color->height ? m_bendSrv : nullptr;
         if (velocity && m_ombDiagFrame == m_frame && m_frame > 1500 && m_ombDiagLogged < 1)
         {
@@ -11567,7 +11660,11 @@ public:
         if (velocity && (velocity == color || velocity->width != color->width || velocity->height != color->height ||
                          velocity->format != DXGI_FORMAT_R16G16B16A16_FLOAT || velocity->samples != 1))
             velocity = nullptr;
+        if (exact)
+            velocity = nullptr;
         Require(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (exact)
+            Require(exact->info, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (velocity)
             Require(velocity, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (bend)
@@ -11581,7 +11678,9 @@ public:
         sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sd.Texture2D.MipLevels = 1;
         g.dev->CreateShaderResourceView(depth->res, &sd, at(0));
-        if (velocity)
+        if (exact)
+            g.dev->CreateShaderResourceView(exact->info->res, nullptr, at(1));
+        else if (velocity)
             g.dev->CreateShaderResourceView(velocity->res, nullptr, at(1));
         else
             g.dev->CreateShaderResourceView(depth->res, &sd, at(1)); // not read
@@ -11606,8 +11705,9 @@ public:
         float c[kGiConstants] = {static_cast<float>(color->width), static_cast<float>(color->height), 0.0f, 0.0f,
                                  1.0f / info.proj[0], 1.0f / info.proj[5], info.proj[10], info.proj[14]};
         memcpy(c + 16, reproj, sizeof(reproj));
+        c[8] = zpass::MotionBlurShutter(); // radius: the engine's motion blur shutter factor f this frame
         c[32] = info.farZ;
-        c[33] = velocity ? 1.0f : 0.0f;
+        c[33] = exact ? 2.0f : velocity ? 1.0f : 0.0f;
         // The bent vegetation's move is per 1/60 s: scaled to the time since the last frame (the game timer's, as PF_time).
         float dt = info.frameTime;
         if (m_mvHavePrevTime && info.time > m_mvPrevTime)
@@ -11627,8 +11727,10 @@ public:
         m_list->Dispatch((color->width + 7) / 8, (color->height + 7) / 8, 1);
         m_barriers.push_back(Transition(m_dlssMvec, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSrvState));
         m_stats.motionPasses++;
-        if (velocity)
+        if (velocity || exact)
             m_stats.objectMotionPasses++;
+        if (exact)
+            m_stats.objectMotionExactPasses++;
         if (bend)
             m_stats.bendMotionPasses++;
         RestoreListState();
@@ -11767,6 +11869,11 @@ private:
     Srv12* m_bendSrv = nullptr;
     UINT m_bendW = 0, m_bendH = 0;
     uint64_t m_bendFrame = ~0ull;
+    ID3D10Texture2D* m_objMvTex = nullptr; // BindObjectMotion
+    Rtv12* m_objMvRtv = nullptr;
+    Srv12* m_objMvSrv = nullptr;
+    UINT m_objMvW = 0, m_objMvH = 0;
+    uint64_t m_objMvFrame = ~0ull;
     float m_mvPrevTime = 0;
     bool m_mvHavePrevTime = false;
     float m_frameLast[32] = {1e9f};             // the frame texture's last data
@@ -12419,6 +12526,15 @@ ID3D12PipelineState* Device::Pso(bool indexed)
         r.blend.RenderTarget[1] = r.blend.RenderTarget[0];
         r.blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
     }
+    else if (numRtv >= 2 && k.rtv[0] == DXGI_FORMAT_R16G16B16A16_FLOAT && k.rtv[1] == DXGI_FORMAT_R16G16B16A16_FLOAT && m_vs->motionBlur)
+    {
+        // Exact object motion (BindObjectMotion) beside the motion blur target: written as it is.
+        r.blend.IndependentBlendEnable = TRUE;
+        r.blend.RenderTarget[1] = r.blend.RenderTarget[0];
+        r.blend.RenderTarget[1].BlendEnable = FALSE;
+        r.blend.RenderTarget[1].LogicOpEnable = FALSE;
+        r.blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
     r.sampleMask = m_sampleMask;
     r.raster = m_raster ? m_raster->d12 : Raster12From(kDefaultRaster); // no padding
     if (cubeCull == 1)
@@ -12560,8 +12676,13 @@ bool Device::ApplyOnce(bool indexed)
     }
     if (m_ps && m_ps->writesTarget1 && m_rtv[0] && !m_rtv[1] && m_rtv[0]->format == DXGI_FORMAT_R32_FLOAT && m_rtv[0]->samples == 1)
         BindFoliageMask();
+    // The patched object motion blur pass (exact object motion in SV_Target1) into its own target: its colour target is
+    // RGBA16F of the scene's size too, so before the bias mask's test.
+    if (m_ps && m_ps->writesTarget1 && m_vs && m_vs->motionBlur && m_rtv[0] && !m_rtv[1] && m_rtv[0]->format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        m_rtv[0]->samples == 1)
+        BindObjectMotion();
     // Water and particles (the patched pixel shaders write DLSS's bias mask in SV_Target1) into the scene's colour.
-    if (m_ps && m_ps->writesTarget1 && !m_ps->writesTarget2 && m_rtv[0] && !m_rtv[1] && m_rtv[0]->format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+    if (m_ps && m_ps->writesTarget1 && !m_ps->writesTarget2 && !(m_vs && m_vs->motionBlur) && m_rtv[0] && !m_rtv[1] && m_rtv[0]->format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
         m_rtv[0]->samples == 1 && m_foliageW && static_cast<const TextureCore*>(m_rtv[0]->info)->width == m_foliageW &&
         static_cast<const TextureCore*>(m_rtv[0]->info)->height == m_foliageH)
         BindBiasMask();
@@ -15119,6 +15240,9 @@ void Dx12WriteStats(FILE* f, double frames)
             static_cast<unsigned long long>(s.objectMotionCopies), static_cast<unsigned long long>(s.bendMotionPasses));
     fprintf(f, "  DLSS bias mask (water, particles): frames %llu, draws %llu, given to DLSS %llu\n", static_cast<unsigned long long>(s.biasFrames),
             static_cast<unsigned long long>(s.biasDraws), static_cast<unsigned long long>(s.biasGiven));
+    fprintf(f, "  exact object motion (the patched motion blur pass): frames %llu, draws %llu, read by the motion pass %llu\n",
+            static_cast<unsigned long long>(s.objectMotionExactFrames), static_cast<unsigned long long>(s.objectMotionExactDraws),
+            static_cast<unsigned long long>(s.objectMotionExactPasses));
     fprintf(f, "  scenes %llu, DLSS applied %llu, motion vectors %llu (with object velocities %llu), GI %llu, voxel updates %llu, GI reads after the scene %llu, with another depth or target %llu\n", static_cast<unsigned long long>(s.scenes),
             static_cast<unsigned long long>(s.dlssFrames), static_cast<unsigned long long>(s.motionPasses), static_cast<unsigned long long>(s.objectMotionPasses),
             static_cast<unsigned long long>(s.giPasses), static_cast<unsigned long long>(s.voxPasses), static_cast<unsigned long long>(s.giLateReads),

@@ -1053,6 +1053,17 @@ bool g_bendBefore;
 uint64_t g_bendBeforeWrites, g_bendBeforeMemory;
 void WriteBendBefore(uintptr_t params, int count, void* dst, int stage, uint32_t cbVectors); // below ResolveTypes
 
+// Exact object motion (CRYMT_OMB_EXACT, 1 the default, 2026-11-13): the engine's motion blur pass places a moving object
+// as it was with MotionBlurData = lerp(now, before, f) (FUN_3803AFC0: f = r_MotionBlurShutterSpeed x 0.8 / frame time,
+// x min(1, 0.03125 / frame time) with r_MotionBlurFrameTimeScale). The patched pass (Settings.cpp kMotionBlurExact) takes
+// f from AvgFogVolumeContrib: here, after the engine's setter, that parameter of a vertex shader in the motion blur
+// lists (batch filter FB_MOTIONBLUR 0x80) gets (f, -777 the mark, 0, 0). The last f also goes to RunMotion (the engine's
+// own target and instanced objects still have it in).
+bool g_mbExact;
+uint64_t g_mbWrites, g_mbMemory, g_mbCalls;
+std::atomic<float> g_mbLastF{0.0f};
+void WriteMotionBlurShutter(uintptr_t params, int count, void* dst, int stage, uint32_t cbVectors); // below ResolveTypes
+
 void* __fastcall SetParamsHook(uintptr_t params, int count, void* dst, int stage, uint32_t slot)
 {
     if (g_tracing && g_zThread == GetCurrentThreadId() && params && count > 0)
@@ -1099,6 +1110,8 @@ void* __fastcall SetParamsHook(uintptr_t params, int count, void* dst, int stage
     void* result = g_setParams(params, count, dst, stage, slot);
     if (g_bendBefore)
         WriteBendBefore(params, count, dst, stage, slot);
+    if (g_mbExact)
+        WriteMotionBlurShutter(params, count, dst, stage, slot);
     return result;
 }
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1273,6 +1286,64 @@ void WriteBendBefore(uintptr_t params, int count, void* dst, int stage, uint32_t
             continue;
         g_cbWrite(reg, *reinterpret_cast<const int16_t*>(p + 0xE), stage, before, 4, static_cast<int>(cbVectors));
         g_bendBeforeWrites++;
+    }
+}
+
+constexpr uintptr_t kRdEnv = 0x382E74D0;            // the renderer's gEnv; + 0x28 ITimer*
+constexpr uintptr_t kMbShutterSpeed = 0x382E9928;   // float r_MotionBlurShutterSpeed (0.015)
+constexpr uintptr_t kMbFrameTimeScale = 0x382E9924; // int r_MotionBlurFrameTimeScale
+
+// FUN_3803AFC0's f: the timer's frame time (vf 0x30 (0)) over its time scale (vf 0x40) when that is under 1.
+float MotionBlurShutterF()
+{
+    const uintptr_t env = *reinterpret_cast<const uintptr_t*>(kRdEnv);
+    void* timer = env ? *reinterpret_cast<void* const*>(env + 0x28) : nullptr;
+    if (!timer)
+        return 0.0f;
+    const uintptr_t* vt = *reinterpret_cast<const uintptr_t* const*>(timer);
+    float dt = reinterpret_cast<float(__fastcall*)(void*, int)>(vt[0x30 / 8])(timer, 0);
+    const float scale = reinterpret_cast<float(__fastcall*)(void*)>(vt[0x40 / 8])(timer);
+    if (scale < 1.0f)
+        dt /= std::max(scale, 1e-4f);
+    float f = dt != 0.0f ? *reinterpret_cast<const float*>(kMbShutterSpeed) * 0.8f / dt : 0.0f;
+    if (*reinterpret_cast<const int*>(kMbFrameTimeScale) != 0 && dt != 0.0f)
+        f *= std::min(1.0f, 0.03125f / dt);
+    return f;
+}
+
+void WriteMotionBlurShutter(uintptr_t params, int count, void* dst, int stage, uint32_t cbVectors)
+{
+    if (stage != 0 || !params || count <= 0)
+        return;
+    const uintptr_t r = *reinterpret_cast<const uintptr_t*>(kRendererGlobal);
+    if (!r || !(*reinterpret_cast<const uint32_t*>(r + kRdBatchFilter) & 0x80)) // the motion blur lists (FB_MOTIONBLUR)
+        return;
+    ResolveTypes();
+    g_mbCalls++;
+    const float f = MotionBlurShutterF();
+    g_mbLastF.store(f, std::memory_order_relaxed);
+    if (g_tFogContrib < 0)
+        return;
+    for (int i = 0; i < count; i++)
+    {
+        const uintptr_t p = params + static_cast<uintptr_t>(i) * kParamSize;
+        const uint32_t flags = *reinterpret_cast<const uint32_t*>(p + 8);
+        if (!(flags & 0x40000) || static_cast<int>(*reinterpret_cast<const uint32_t*>(p + 0x18) & 0xFF) != g_tFogContrib)
+            continue;
+        alignas(16) const float v[4] = {f, -777.0f, 0.0f, 0.0f};
+        if (dst)
+        {
+            if (count != 1)
+                continue;
+            memcpy(dst, v, sizeof(v));
+            g_mbMemory++;
+            continue;
+        }
+        const int reg = *reinterpret_cast<const int16_t*>(p + 0xC);
+        if (reg < 0 && !(flags & 8))
+            continue;
+        g_cbWrite(reg, *reinterpret_cast<const int16_t*>(p + 0xE), stage, v, 4, static_cast<int>(cbVectors));
+        g_mbWrites++;
     }
 }
 
@@ -3507,6 +3578,19 @@ void BendBeforeStats(char* text, size_t size)
              g_bendMoved ? g_bendDeltaSum / static_cast<double>(g_bendMoved) : 0.0, g_bendHistory.size());
 }
 
+float MotionBlurShutter()
+{
+    return g_mbLastF.load(std::memory_order_relaxed);
+}
+
+void MotionBlurStats(char* text, size_t size)
+{
+    snprintf(text, size, "%s; setter calls in the pass %llu, f written %llu (constants %llu, draw packets %llu), last f %.3f",
+             g_mbExact ? "on" : "off (CRYMT_OMB_EXACT=0)", static_cast<unsigned long long>(g_mbCalls),
+             static_cast<unsigned long long>(g_mbWrites + g_mbMemory), static_cast<unsigned long long>(g_mbWrites),
+             static_cast<unsigned long long>(g_mbMemory), g_mbLastF.load(std::memory_order_relaxed));
+}
+
 void OnEngineLoaded()
 {
     InstallProcHooks();
@@ -3585,9 +3669,11 @@ void Install()
     if (g_census || g_traceTarget || g_cycles || g_loopCensus || g_mergeCensus || g_objTexCensus)
         g_zPrepass = reinterpret_cast<ZPrepassFn>(detour(kZPrepassFn, kZPrepassHead, sizeof(kZPrepassHead), reinterpret_cast<const void*>(&ZPrepassHook)));
     g_bendBefore = !(GetEnvironmentVariableW(L"CRYMT_BENDBEFORE", text, 16) && _wtoi(text) == 0);
-    if (g_census || g_traceTarget || g_bendBefore)
+    g_mbExact = !(GetEnvironmentVariableW(L"CRYMT_OMB_EXACT", text, 16) && _wtoi(text) == 0);
+    if (g_census || g_traceTarget || g_bendBefore || g_mbExact)
         g_setParams = reinterpret_cast<SetParamsFn>(detour(kSetParamsFn, kSetParamsHead, sizeof(kSetParamsHead), reinterpret_cast<const void*>(&SetParamsHook)));
     g_bendBefore = g_bendBefore && g_setParams;
+    g_mbExact = g_mbExact && g_setParams;
     if (g_traceTarget || g_cycles)
         g_flush = reinterpret_cast<FlushFn>(detour(kFlushShaderFn, kFlushShaderHead, sizeof(kFlushShaderHead), reinterpret_cast<const void*>(&FlushHook)));
     g_setVerify = GetEnvironmentVariableW(L"CRYMT_SETVERIFY", nullptr, 0) != 0;

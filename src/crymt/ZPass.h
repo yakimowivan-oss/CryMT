@@ -10,4 +10,6 @@ void OnEngineLoaded(); // Cry3DEngine.dll mapped: its hooks
 void WriteStats();
 uint64_t BendBeforeCount(); // the previous vegetation bending written for the z-prepass (motion vectors)
 void BendBeforeStats(char* text, size_t size);
+float MotionBlurShutter(); // the engine's motion blur shutter factor f last written (exact object motion), 0 none yet
+void MotionBlurStats(char* text, size_t size);
 } // namespace zpass
