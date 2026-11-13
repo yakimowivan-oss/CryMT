@@ -72,6 +72,10 @@ $defs = [ordered]@{
     cubedown = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_DOWN = '1'}}
     # GI cones from inside a VisArea take light from outside it too (before 2026-11-13 night).
     noroom = @{Gi = '1'; Env = @{CRYMT_GI_ROOMLIGHT = '0'}}
+    # The engine cube without the terrain's water (DLD_TERRAIN_WATER 0x04 out of 0x89C).
+    cubenowater = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_FLAGS = '0x898'}}
+    # The cube's down face every turn, with its own frame id (as 07:05-21:00 on 2026-11-13).
+    cubedown_own = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_DOWN = '1'; CRYMT_ENVCUBE_OWNFRAME = '1'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}

@@ -5998,11 +5998,20 @@ void EnvCubeUpdate()
     }
     entry[1] = 1;
     *reinterpret_cast<int*>(0x382E984C) = 0; // the renderer's "all faces next time" (FUN_380D4F00 clears it after a render)
-    // The -Z face only once after a start (the water's reflections look up): CRYMT_ENVCUBE_DOWN=1 / the panel draws it always.
+    // The -Z face (the water's reflections look up, it is skipped in the turn) is drawn again once the camera is
+    // CRYMT_ENVCUBE_DOWNMOVE metres (4) from where it was last drawn: the cube follows the camera face by face, so a walk
+    // never counted as a jump and the down face kept the start's ground for the whole game (the user, island 2026-11-13:
+    // a hut's floor in the cube on the beach). CRYMT_ENVCUBE_DOWN=1 / the panel draws it in every turn.
     static const int downBase = EnvCubeSetting("CRYMT_ENVCUBE_DOWN", 0) != 0 ? 1 : 0;
-    const bool downOn = (g_giControl.envCubeDown >= 0 ? g_giControl.envCubeDown.load() : downBase) != 0 || underwater;
+    static const float downMove = static_cast<float>(std::max(EnvCubeSetting("CRYMT_ENVCUBE_DOWNMOVE", 4), 1));
+    static float downPos[3] = {1e9f, 1e9f, 1e9f};
+    const float ddx = cam[0] - downPos[0], ddy = cam[1] - downPos[1], ddz = cam[2] - downPos[2];
+    const bool downMoved = ddx * ddx + ddy * ddy + ddz * ddz > downMove * downMove;
+    const bool downOn = (g_giControl.envCubeDown >= 0 ? g_giControl.envCubeDown.load() : downBase) != 0 || underwater || downMoved;
     if (*reinterpret_cast<int*>(entry + 8) == 5 && facesDrawn >= 6 && !downOn)
         *reinterpret_cast<int*>(entry + 8) = 0;
+    if (*reinterpret_cast<int*>(entry + 8) == 5) // the down face is drawn now
+        memcpy(downPos, cam, sizeof(downPos));
     // The face's render target view: made anew for this face (the engine keeps the first one for all).
     if (auto* ct = *reinterpret_cast<uint8_t**>(texture + 0x98))
         if (auto*& rtv = *reinterpret_cast<ID3D10RenderTargetView**>(ct + kTextureRtv))
