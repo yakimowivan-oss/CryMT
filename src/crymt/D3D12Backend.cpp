@@ -1976,6 +1976,9 @@ int2 OctInterior(int2 t, int n)
     return ip;
 }
 int2 ProbeStateTexel(int slot) { return int2(slot & 127, 1024 + (slot >> 7)); }
+// The probe's offset from its cell's centre (xyz, metres, within 0.45 of the spacing; DDGI's relocation): a probe in a
+// wall or under the ground steps out through the nearest back it sees, one by a surface steps away from it.
+int2 ProbeOffsetTexel(int slot) { return int2(128 + (slot & 127), 1024 + (slot >> 7)); }
 float3 ProbeKey(int3 wc) { return float3(wc & 1023); }
 
 float2 OctEncode(float3 n)
@@ -2075,6 +2078,8 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const float4 state = historyTex.Load(int3(st, 0));
     const bool valid = state.w >= 1 && all(state.xyz == ProbeKey(wc)) && temporal > 0;
     const bool due = !valid || (((uint)slot + (uint)frame) & 3) == 0;
+    const int2 ot = ProbeOffsetTexel(slot);
+    const float3 offset = valid ? historyTex.Load(int3(ot, 0)).xyz : 0;
     float4 ray = 0;
     float3 dir = 0;
     float hit = 0;
@@ -2082,7 +2087,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     if (due)
     {
         dir = ProbeRayDir(gi, frame);
-        ray = RayTrace(ProbePos(wc), dir, voxParams.z, frac(gi * 0.618034 + frame * 0.381966), hit, back);
+        ray = RayTrace(ProbePos(wc) + offset, dir, voxParams.z, frac(gi * 0.618034 + frame * 0.381966), hit, back);
     }
     // A backface hit brings no light, and its distance is cut to a fifth (stored negative): the probe looks closed in
     // that way, so the visibility test keeps it from the surface's front (RTXGI does the same).
@@ -2097,7 +2102,10 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
         outTex[texel] = old;
         probeDepthOut[dt] = float4(oldM, 0, 1);
         if (gi == 0)
+        {
             outTex[st] = state;
+            outTex[ot] = float4(offset, 0);
+        }
         return;
     }
     // The texel's interior one (the border copies the octahedral neighbour across the edge) and its direction: light by
@@ -2129,15 +2137,35 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     {
         // Inside geometry: most rays end within 0.35 m (in a wall), or a fifth or more hit backs (under the ground, in a
         // closed rock): DDGI turns such a probe off at a quarter of backface hits.
-        float closeShare = 0, backShare = 0;
+        float closeShare = 0, backShare = 0, backMin = 1e9, frontMin = 1e9;
+        float3 backDir = 0, frontDir = 0;
         [loop] for (int k = 0; k < 64; k++)
         {
-            closeShare += abs(g_probeDir[k].w) < 0.35 ? 1 : 0;
-            backShare += g_probeDir[k].w < 0 ? 1 : 0;
+            const float d = g_probeDir[k].w;
+            closeShare += abs(d) < 0.35 ? 1 : 0;
+            backShare += d < 0 ? 1 : 0;
+            if (d < 0 && -5 * d < backMin)
+            {
+                backMin = -5 * d;
+                backDir = g_probeDir[k].xyz;
+            }
+            if (d >= 0 && d < frontMin)
+            {
+                frontMin = d;
+                frontDir = g_probeDir[k].xyz;
+            }
         }
         // Kept slowly (0.9): a probe by a wall whose share of 64 rays wavered went on and off.
         const float inside = saturate(max(closeShare, backShare * 4) / 64);
         outTex[st] = float4(ProbeKey(wc), 1 + (valid ? lerp(inside, state.w - 1, 0.9) : inside));
+        // Relocation (DDGI): over a quarter of backface hits, through the nearest back by its distance and a quarter of
+        // the spacing; else away from a front nearer than 0.3 of the spacing. Within 0.45 of the spacing of the centre.
+        float3 moved = offset;
+        if (backShare > 16)
+            moved += backDir * (backMin + 0.25 * kProbeSpacing);
+        else if (frontMin < 0.3 * kProbeSpacing)
+            moved -= frontDir * (0.3 * kProbeSpacing - frontMin);
+        outTex[ot] = float4(clamp(moved, -0.45 * kProbeSpacing, 0.45 * kProbeSpacing), 0);
     }
 }
 
@@ -2170,10 +2198,11 @@ float4 ProbeLight(float3 P, float3 N, out float inside)
         if (state.w < 1 || any(state.xyz != ProbeKey(wc)))
             continue;
         const float3 tri = lerp(1 - f, f, (float3)off);
-        const float facing = (dot(normalize(ProbePos(wc) - P), N) + 1) * 0.5;
+        const float3 probePos = ProbePos(wc) + probeTex.Load(int3(ProbeOffsetTexel(slot), 0)).xyz; // relocated
+        const float facing = (dot(normalize(probePos - P), N) + 1) * 0.5;
         float w = (facing * facing + 0.2) * lerp(1, 0.02, saturate((state.w - 1.4) / 0.4));
         // Visibility: the biased point's distance from the probe against the probe's distances that way.
-        const float3 fromProbe = Pb - ProbePos(wc);
+        const float3 fromProbe = Pb - probePos;
         const float dist = length(fromProbe);
         const float2 dOct = OctEncode(fromProbe / max(dist, 1e-4)) * 0.5 + 0.5;
         const float2 m = probeDepthTex.SampleLevel(linearClamp, (ProbeDepthTile(slot) + 1 + dOct * 6) / kProbeDepthAtlas, 0).xy;
