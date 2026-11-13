@@ -29,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "D3D12Backend.h"
@@ -2746,6 +2747,11 @@ void update(uint3 id : SV_DispatchThreadID)
     float3 centre = (cell + 0.5) * voxelSize;
     float3 V = mul(float4(centre, 1), worldToView).xyz;
     float dist = -V.z;
+    // The engine cube's stamps (RunVoxelGeometry: opacity byte 253, frame 1, so never newer than a z-prepass stamp) fill
+    // what the camera does not see; in its view the z-prepass and the screen decide (the cube may draw another level of
+    // detail: those cells would come back at every turn of the cube and go again).
+    if (stamped && (geometry & 255) == 253 && dist > 0.3 && all(abs(V.xy / (dist * invProj)) <= 1))
+        stamped = false;
     if (dist > 0.3)
     {
         float2 ndc = V.xy / (dist * invProj);
@@ -4534,6 +4540,7 @@ struct Stats
     uint64_t vertices; // indices/vertices drawn (all passes)
     uint64_t zpassDraws, zpassTarget1; // draws into an R32F target with depth, of them with an SV_Target1 shader
     uint64_t voxShadowMaps, voxShadowJobs, voxShadowCovered, voxShadowRecorded, voxShadowDraws, voxShadowNoCamera; // ShadowMap
+    uint64_t voxCubeSeen, voxCubeRecorded, voxCubeNoCamera, voxCubeFoliage, voxCubeRepeat, voxCubeJobs, voxCubeDraws; // cube faces
     float voxShadowCover[8]; // the last frame's shadow maps: half the width they cover around the eye (m)
     uint32_t voxShadowCoverCount;
     uint64_t voxShadowMapDraws[8], voxShadowMapSeen[8]; // per map of a frame: draws, frames
@@ -5783,6 +5790,8 @@ public:
                 RecordVoxDraw(false, true, count, 1, start, base, 0);
             else if (ShadowRecording())
                 RecordVoxDraw(true, true, count, 1, start, base, 0);
+            else if (CubeRecording())
+                RecordVoxDraw(2, true, count, 1, start, base, 0);
         }
         AfterDraw();
     }
@@ -5798,6 +5807,8 @@ public:
                 RecordVoxDraw(false, false, count, 1, start, 0, 0);
             else if (ShadowRecording())
                 RecordVoxDraw(true, false, count, 1, start, 0, 0);
+            else if (CubeRecording())
+                RecordVoxDraw(2, false, count, 1, start, 0, 0);
         }
         AfterDraw();
     }
@@ -5813,6 +5824,8 @@ public:
                 RecordVoxDraw(false, true, count, instances, start, base, startInstance);
             else if (ShadowRecording())
                 RecordVoxDraw(true, true, count, instances, start, base, startInstance);
+            else if (CubeRecording())
+                RecordVoxDraw(2, true, count, instances, start, base, startInstance);
         }
         AfterDraw();
     }
@@ -5828,6 +5841,8 @@ public:
                 RecordVoxDraw(false, false, count, instances, start, 0, startInstance);
             else if (ShadowRecording())
                 RecordVoxDraw(true, false, count, instances, start, 0, startInstance);
+            else if (CubeRecording())
+                RecordVoxDraw(2, false, count, instances, start, 0, startInstance);
         }
         AfterDraw();
     }
@@ -5959,6 +5974,8 @@ public:
                 RecordVoxDraw(false, true, h.count, 1, h.start, h.base, 0);
             else if (ShadowRecording())
                 RecordVoxDraw(true, true, h.count, 1, h.start, h.base, 0);
+            else if (CubeRecording())
+                RecordVoxDraw(2, true, h.count, 1, h.start, h.base, 0);
             break;
         }
         for (UINT i = 0; i < savedCount; i++)
@@ -6783,6 +6800,11 @@ public:
         float skyFill = 0.15f;             // CRYMT_GI_SKYFILL: their light from the sky, a share of the sun's
         bool shadowGeometry = false;       // CRYMT_GI_SHADOWGEOM=1: also the shadow maps' casters (off: their vertex shaders
                                            // put the depth elsewhere, none of their draws landed in the grid - a capture)
+        bool cubeGeometry = false;         // CRYMT_GI_CUBEGEOM=1: the engine cube's face draws (solid only) into the geometry
+                                           // levels, their stamps to fill what the camera does not see. OFF: it does not work
+                                           // (2026-11-13, mine): the general pass places objects by a per-object matrix that
+                                           // already holds the camera, so replacing the frame's view-projection left them in the
+                                           // face's perspective - streaks through the whole grid (voxsnap_views.py)
         float lampLight = 1.0f;            // CRYMT_GI_LAMPS: the lamps' light on the geometry's cells (0 none)
         bool lampTest = false;             // CRYMT_GI_LAMPTEST=1: also on cells the screen coloured (to see it in the voxel view)
         int mipOpacity = 4;                // CRYMT_GI_MIPOPACITY: coarse cells' opacity, 0 the mean, 1/2/3 by rays through, 4 per axis (downsample)
@@ -6892,6 +6914,7 @@ public:
             read(L"CRYMT_GI_SUNALBEDO", v.sunAlbedo);
             read(L"CRYMT_GI_SKYFILL", v.skyFill);
             v.shadowGeometry = GetEnvironmentVariableW(L"CRYMT_GI_SHADOWGEOM", text, 32) && wcscmp(text, L"0") != 0;
+            v.cubeGeometry = GetEnvironmentVariableW(L"CRYMT_GI_CUBEGEOM", text, 32) && wcscmp(text, L"0") != 0;
             read(L"CRYMT_GI_LAMPS", v.lampLight);
             v.lampTest = GetEnvironmentVariableW(L"CRYMT_GI_LAMPTEST", text, 32) && wcscmp(text, L"0") != 0;
             if (GetEnvironmentVariableW(L"CRYMT_GI_MIPOPACITY", text, 32))
@@ -7621,7 +7644,7 @@ public:
             UpdateFrameTexture(info);
         if (info->valid && g_fplusPlaceholder)
             UpdateFPlus(info);
-        g_wantPassMatrices.store(Gi().on && Gi().geometry && Gi().shadowGeometry, std::memory_order_relaxed);
+        g_wantPassMatrices.store(Gi().on && Gi().geometry && (Gi().shadowGeometry || Gi().cubeGeometry), std::memory_order_relaxed);
         GiCamera(info);
         m_giInScene = info->valid != 0;
         // A frame whose GI pass did not run leaves its draws: dropped with the first camera of the next frame. Not at
@@ -9459,6 +9482,24 @@ public:
         return FindMatrices(m_shadowMv, vpZero);
     }
 
+    // The engine cube's face draws: the face camera's view-projection (the renderer's modelview and projection, which the
+    // stream sends before the draws), and the same for positions relative to the face's eye (the cube sits at the eye).
+    std::vector<VoxCameraPatch> FindCubeMatrices() const
+    {
+        float vp[16], viewZero[16], vpZero[16];
+        MatMul(m_passMv, m_passProj, vp);
+        memcpy(viewZero, m_passMv, sizeof(viewZero));
+        viewZero[12] = viewZero[13] = viewZero[14] = 0;
+        MatMul(viewZero, m_passProj, vpZero);
+        return FindMatrices(vp, vpZero);
+    }
+
+    // Between CryMT's "CryMT engine cube" marks (the engine drawing a face of its cube).
+    bool CubeRecording() const
+    {
+        return m_engineCubePass && Gi().on && Gi().geometry && Gi().cubeGeometry && m_giHaveCamera && m_voxOcc[0];
+    }
+
     std::vector<VoxCameraPatch> FindMatrices(const float* vp, const float* vpZero) const
     {
         std::vector<VoxCameraPatch> found;
@@ -9483,9 +9524,22 @@ public:
     int m_zDraws = 0, m_firstWaterZ = -1; // this frame's z-prepass draws seen by RecordVoxDraw, the first ocean one among them
     uint64_t m_voxDrawsFrame = ~0ull;     // the frame (g_presented) whose z-prepass draws m_voxDraws holds
 
-    void RecordVoxDraw(bool shadow, bool indexed, UINT count, UINT instances, UINT start, INT base, UINT startInstance)
+    // kind: 0 the z-prepass, 1 a shadow map (CRYMT_GI_SHADOWGEOM), 2 the engine cube's face (CRYMT_GI_CUBEGEOM).
+    void RecordVoxDraw(int kind, bool indexed, UINT count, UINT instances, UINT start, INT base, UINT startInstance)
     {
-        if (!shadow && m_vs)
+        const bool shadow = kind == 1, cube = kind == 2;
+        if (cube)
+        {
+            m_stats.voxCubeSeen++;
+            if (m_cubeDrawsFrame != g_presented) // a frame's face draws the voxelization did not take (GI voxels off)
+            {
+                m_cubeDrawsFrame = g_presented;
+                m_cubeDraws.clear();
+                m_cubeCopies.clear();
+                m_cubeKeys.clear();
+            }
+        }
+        if (kind == 0 && m_vs)
         {
             m_zDraws++;
             if (m_vs->water && m_firstWaterZ < 0)
@@ -9494,7 +9548,7 @@ public:
         // Draws that leave no depth are no geometry: the sky's z-prepass draw (Sky.cfx ZPass: no pixel shader, depth
         // writes off) is a box around the camera and stood in the voxels as one (the user: a cube like a sky dome in
         // the Num2 view once voxel geometry was on by default).
-        if ((m_depth && m_depth->d12.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO) || (!shadow && !m_ps))
+        if ((m_depth && m_depth->d12.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO) || (!shadow && !m_ps) || (cube && !m_depth))
         {
             m_stats.voxGeomSkipped++;
             return;
@@ -9510,7 +9564,7 @@ public:
             m_stats.voxGeomSkipped++;
             return;
         }
-        auto& cameras = shadow ? m_shadowCamera : m_voxCamera;
+        auto& cameras = shadow ? m_shadowCamera : cube ? m_cubeCamera : m_voxCamera;
         // Alpha-tested materials (the z-prepass pixel shader discards): leaves, grass. With their texture (the material
         // pass) they are voxelized by the shape of the leaves; CRYMT_GI_GEOMETRY=2 keeps them also without one.
         // Alpha-tested: the z-prepass discards by the diffuse map's alpha (CommonZPass.cfi %_RT_ALPHATEST). Its LOD
@@ -9518,16 +9572,30 @@ public:
         // the ground and most solid objects went in half open and cut by their diffuse map's alpha (gloss there), the
         // user's holes across roads and dark spots (the capture: every level-0 stamp had foliage's opacity).
         const bool foliage = m_ps && m_ps->discards && m_ps->diffuseSlot >= 0;
-        if (!shadow)
+        // The cube's foliage stays out: the cells it missed off screen were solid (mine, 2026-11-13: stamps 255).
+        if (cube && foliage)
+        {
+            m_stats.voxCubeFoliage++;
+            return;
+        }
+        if (kind == 0)
             m_stats.voxClass[(m_ps && m_ps->discards ? 2 : 0) + (m_ps && m_ps->diffuseSlot >= 0 ? 1 : 0)]++;
         auto it = cameras.find(m_vs->contentHash);
         if (it == cameras.end())
-            it = cameras.emplace(m_vs->contentHash, shadow ? FindShadowMatrices() : FindCameraMatrices()).first;
-        if (!shadow && !foliage)
+        {
+            std::vector<VoxCameraPatch> found = shadow ? FindShadowMatrices() : cube ? FindCubeMatrices() : FindCameraMatrices();
+            if (cube && found.empty()) // not kept: the face's matrices may not have come yet for this shader's first draw
+            {
+                m_stats.voxCubeNoCamera++;
+                return;
+            }
+            it = cameras.emplace(m_vs->contentHash, std::move(found)).first;
+        }
+        if (kind == 0 && !foliage)
             m_stats.voxPatch[it->second.empty() ? 0 : 1 + (it->second[0].zero ? 2 : 0) + (it->second[0].transposed ? 1 : 0)]++;
         if (it->second.empty())
         {
-            (shadow ? m_stats.voxShadowNoCamera : m_stats.voxGeomNoCamera)++;
+            (shadow ? m_stats.voxShadowNoCamera : cube ? m_stats.voxCubeNoCamera : m_stats.voxGeomNoCamera)++;
             return;
         }
         VoxDraw d{};
@@ -9618,6 +9686,12 @@ public:
             }
         }
         d.key = key;
+        // A face draws an object in several passes (lights, layers): once is enough.
+        if (cube && !m_cubeKeys.insert(key).second)
+        {
+            m_stats.voxCubeRepeat++;
+            return;
+        }
         // The camera buffers' contents now (the replay patches the matrices in): once per buffer and frame.
         for (const VoxCameraPatch& p : it->second)
         {
@@ -9627,7 +9701,7 @@ public:
                 m_stats.voxGeomSkipped++;
                 return;
             }
-            VoxCameraCopy& copy = (shadow ? m_shadowCopies : m_voxCameraCopies)[d.cb[p.slot]];
+            VoxCameraCopy& copy = (shadow ? m_shadowCopies : cube ? m_cubeCopies : m_voxCameraCopies)[d.cb[p.slot]];
             if (copy.bytes.empty())
             {
                 copy.bytes.assign(b->slice.cpu, b->slice.cpu + b->desc.ByteWidth);
@@ -9645,9 +9719,13 @@ public:
             if (!known)
                 copy.patches.push_back(p);
         }
-        (shadow ? m_shadowDraws : m_voxDraws).push_back(d);
+        if (cube && m_cubeDraws.empty())
+            RigidInverse(m_passMv, m_cubeToWorld); // the face's eye and axes (its grid and camera-relative positions)
+        (shadow ? m_shadowDraws : cube ? m_cubeDraws : m_voxDraws).push_back(d);
         if (shadow)
             m_stats.voxShadowRecorded++;
+        else if (cube)
+            m_stats.voxCubeRecorded++;
     }
 
     // ---- GI geometry from the shadow maps (CRYMT_GI_SHADOWGEOM): the light passes draw the casters around the player,
@@ -9968,14 +10046,22 @@ public:
 
     // Inside RunGi, before the grid update: the recorded z-prepass draws into the occupancy grids of levels 0-2 (their cells,
     // toroidal), projected along x, y or z (one axis a frame, the update takes stamps of the last three frames).
-    void RunVoxelGeometry(const float* toWorld, uint32_t stamp)
+    // cubeOnly: the engine cube's face just drawn (its "end" mark: its draws' data is still current), toWorld its camera.
+    void RunVoxelGeometry(const float* toWorld, uint32_t stamp, bool cubeOnly = false)
     {
-        if (!Gi().geometry || (m_voxDraws.empty() && m_shadowDraws.empty()) || !EnsureVoxGeom())
+        if (cubeOnly ? (!Gi().geometry || m_cubeDraws.empty() || !EnsureVoxGeom())
+                     : (!Gi().geometry || (m_voxDraws.empty() && m_shadowDraws.empty()) || !EnsureVoxGeom()))
         {
-            m_voxDraws.clear();
-            m_voxCameraCopies.clear();
-            m_shadowDraws.clear();
-            m_shadowCopies.clear();
+            if (!cubeOnly)
+            {
+                m_voxDraws.clear();
+                m_voxCameraCopies.clear();
+                m_shadowDraws.clear();
+                m_shadowCopies.clear();
+            }
+            m_cubeDraws.clear();
+            m_cubeCopies.clear();
+            m_cubeKeys.clear();
             return;
         }
         // Jobs: the z-prepass draws into each level updated this frame along the frame's axis; the shadow job's draws
@@ -9988,14 +10074,29 @@ public:
             bool shadow;
             int first[3];
             std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, D3D12_GPU_VIRTUAL_ADDRESS> patched;
+            bool cube = false;
         };
         std::vector<Job> jobs;
-        if (!m_voxDraws.empty())
+        if (!cubeOnly && !m_voxDraws.empty())
             for (int l = 0; l < kVoxGeomLevels; l++)
                 if (VoxUpdates(l))
                     jobs.push_back({&m_voxDraws, &m_voxCameraCopies, l, static_cast<int>(m_giFrame % 3), false, {}, {}});
-        if (!m_shadowDraws.empty())
+        if (!cubeOnly && !m_shadowDraws.empty())
             jobs.push_back({&m_shadowDraws, &m_shadowCopies, m_shadowLevel, m_shadowAxis, true, {}, {}});
+        // The cube's face into every geometry level, along an axis that turns between the face's visits (a face comes
+        // every 5 or 6 runs: the turn count plus its sixth).
+        if (cubeOnly)
+        {
+            const int axis = static_cast<int>((m_cubeTurn + m_cubeTurn / 6) % 3);
+            m_cubeTurn++;
+            for (int l = 0; l < kVoxGeomLevels; l++)
+            {
+                Job job{&m_cubeDraws, &m_cubeCopies, l, axis, false, {}, {}};
+                job.cube = true;
+                jobs.push_back(std::move(job));
+                m_stats.voxCubeJobs++;
+            }
+        }
         // Row-vector orthographic projections: grid axis U -> clip x, V -> clip y (down the viewport), W -> depth 0..1.
         // The camera buffers with the matrices replaced, per job, uploaded before any state is set (an upload may start
         // a new list).
@@ -10052,7 +10153,7 @@ public:
         // (level 0 every 4th of its updates, level 1 every 2nd, level 2 each one), by the key's phase so the work spreads
         // evenly; 4 against 3 axes, so each turn comes along the next axis. New ones (first seen, or seen again after a
         // gap) the first three frames: all three axes at once. Moved or animated ones every time, as all were before.
-        const bool cache = Gi().geometryCache && Gi().geometryPersist && m_voxValid;
+        const bool cache = !cubeOnly && Gi().geometryCache && Gi().geometryPersist && m_voxValid;
         std::vector<uint8_t> due(m_voxDraws.size(), 1);
         if (cache)
         {
@@ -10100,18 +10201,23 @@ public:
         for (const Job& job : jobs)
         {
             const int l = job.level;
-            const bool counted = !job.shadow && l == 0; // the z-prepass stats once per draw
+            const bool counted = !job.shadow && !job.cube && l == 0; // the z-prepass stats once per draw
+            // The cube's stamps: frame 1 (never newer than a z-prepass stamp: InterlockedMax keeps the z-prepass's) and
+            // opacity byte 253 (kVoxShader update: counted only outside the camera's view).
             const float constants[8] = {static_cast<float>(job.first[0]), static_cast<float>(job.first[1]), static_cast<float>(job.first[2]),
-                                        static_cast<float>(kVoxN), static_cast<float>(job.axis), static_cast<float>(stamp), 0, 0};
+                                        static_cast<float>(kVoxN), static_cast<float>(job.axis), job.cube ? 1.0f : static_cast<float>(stamp), 0, 0};
             m_list->SetGraphicsRoot32BitConstants(kVoxGeomConstants, 8, constants, 0);
             m_list->SetGraphicsRootDescriptorTable(kVoxGeomUav, {gpu.ptr + 2 * l * g.srvInc});
             // Solid geometry first, then foliage, each under its own name (captures tell them apart).
             for (int part = 0; part < 2; part++)
             {
-            PassName(job.shadow ? (part ? "CryMT GI geometry: shadow foliage" : "CryMT GI geometry: shadow solid")
-                                : (part ? "CryMT GI geometry: foliage" : "CryMT GI geometry: solid"));
-            const uint64_t turn = job.shadow ? 0 : m_giFrame / kVoxPeriod[l]; // this level's update count
-            const uint64_t turns = job.shadow ? 1 : std::max(1, 4 / kVoxPeriod[l]);
+            if (job.cube && part == 1)
+                continue; // no foliage from the cube
+            PassName(job.cube ? "CryMT GI geometry: cube solid"
+                     : job.shadow ? (part ? "CryMT GI geometry: shadow foliage" : "CryMT GI geometry: shadow solid")
+                                  : (part ? "CryMT GI geometry: foliage" : "CryMT GI geometry: solid"));
+            const uint64_t turn = job.shadow || job.cube ? 0 : m_giFrame / kVoxPeriod[l]; // this level's update count
+            const uint64_t turns = job.shadow || job.cube ? 1 : std::max(1, 4 / kVoxPeriod[l]);
             for (size_t di = 0; di < job.draws->size(); di++)
             {
                 const VoxDraw& d = (*job.draws)[di];
@@ -10122,7 +10228,7 @@ public:
                     m_stats.voxGeomStale++;
                     continue;
                 }
-                if (!job.shadow && !due[di] && (turn + (d.key >> 32)) % turns != 0)
+                if (!job.shadow && !job.cube && !due[di] && (turn + (d.key >> 32)) % turns != 0)
                 {
                     m_stats.voxGeomInTurn++;
                     continue;
@@ -10153,7 +10259,8 @@ public:
                         m_stats.voxGeomMaterial++;
                 }
                 // Opacity: foliage CRYMT_GI_FOLIAGE, solid 1 (254 / 255 with the LOD dissolve: a mark in captures).
-                const float job2[2] = {d.foliage ? Gi().foliageOpacity : d.dissolve ? 254.0f / 255.0f : 1.0f, d.foliage ? 1.0f : 0.0f};
+                const float job2[2] = {job.cube ? 253.5f / 255.0f : d.foliage ? Gi().foliageOpacity : d.dissolve ? 254.0f / 255.0f : 1.0f,
+                                       d.foliage ? 1.0f : 0.0f};
                 m_list->SetGraphicsRoot32BitConstants(kVoxGeomConstants, 2, job2, 6);
                 for (UINT k = 0; k < d.pageCount; k++)
                     MarkPageRead(d.pages[k]);
@@ -10176,6 +10283,8 @@ public:
                     m_stats.voxGeomDraws++;
                 else if (job.shadow)
                     m_stats.voxShadowDraws++;
+                else if (job.cube)
+                    m_stats.voxCubeDraws++;
                 if (counted && !d.foliage)
                     m_stats.voxGeomSolid++;
             }
@@ -10186,11 +10295,17 @@ public:
             barrier.UAV.pResource = m_voxOcc[l];
             m_list->ResourceBarrier(1, &barrier);
         }
-        m_voxDraws.clear();
-        m_voxCameraCopies.clear();
-        m_shadowDraws.clear();
-        m_shadowCopies.clear();
-        m_psoApplied = nullptr; // RunGi ends with RestoreListState
+        if (!cubeOnly)
+        {
+            m_voxDraws.clear();
+            m_voxCameraCopies.clear();
+            m_shadowDraws.clear();
+            m_shadowCopies.clear();
+        }
+        m_cubeDraws.clear();
+        m_cubeCopies.clear();
+        m_cubeKeys.clear();
+        m_psoApplied = nullptr; // RunGi ends with RestoreListState (the cube's face: its "end" mark calls it)
     }
 
     // Inside RunGi: this frame's depth and the previous frame's colour into the grid.
@@ -12333,6 +12448,15 @@ private:
     std::vector<VoxDraw> m_shadowDraws;
     std::unordered_map<uint64_t, std::vector<VoxCameraPatch>> m_shadowCamera;
     std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, VoxCameraCopy> m_shadowCopies;
+    // The same for the engine cube's face draws (CubeRecording; the face camera from the renderer's matrices): solid
+    // ones once per key, stamped as the cube's (RunVoxelGeometry) into the cells the camera does not see.
+    std::vector<VoxDraw> m_cubeDraws;
+    std::unordered_map<uint64_t, std::vector<VoxCameraPatch>> m_cubeCamera;
+    std::unordered_map<D3D12_GPU_VIRTUAL_ADDRESS, VoxCameraCopy> m_cubeCopies;
+    std::unordered_set<uint64_t> m_cubeKeys;
+    uint64_t m_cubeDrawsFrame = ~0ull; // the frame (g_presented) whose face draws m_cubeDraws holds
+    uint64_t m_cubeTurn = 0;           // cube jobs run (their axis turns)
+    float m_cubeToWorld[16] = {};      // the face camera's inverse view at its first recorded draw
     float m_passMv[16] = {}, m_passProj[16] = {}; // the renderer's matrices now (stream order, kOpMatrices)
     float m_shadowMv[16] = {};                    // the light matrix of the current shadow map
     bool m_shadowRecording = false;               // the current shadow map's draws are this frame's job
@@ -12729,6 +12853,12 @@ void Device::PassName(const char* text)
             PassName("CryMT cube HDR");
             RunCubeUpdate(m_engineCubeLastFace, m_engineCubeFresh);
             PassNameEnd();
+        }
+        // The face's solid draws into the GI's geometry levels now, while their buffers hold what the face drew.
+        if (end && !m_cubeDraws.empty())
+        {
+            RunVoxelGeometry(m_cubeToWorld, 1, true);
+            RestoreListState();
         }
         return;
     }
@@ -15687,6 +15817,11 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu\n",
             static_cast<unsigned long long>(s.sssRuns), s.sssRuns ? static_cast<double>(s.sssDispatches) / s.sssRuns : 0.0,
             static_cast<unsigned long long>(s.sssNoDepth));
+    if (s.voxCubeSeen)
+        fprintf(f, "  GI geometry from the engine cube's faces: draws seen %.1f per frame, recorded %.1f, without the face camera %.1f, "
+                   "foliage left out %.1f, repeats %.1f; jobs %llu, voxelized %.1f per frame\n",
+                s.voxCubeSeen / frames, s.voxCubeRecorded / frames, s.voxCubeNoCamera / frames, s.voxCubeFoliage / frames,
+                s.voxCubeRepeat / frames, static_cast<unsigned long long>(s.voxCubeJobs), s.voxCubeDraws / frames);
     if (s.voxShadowJobs)
     {
         fprintf(f, "  GI geometry from shadow maps: maps %.2f per frame, jobs %llu (level covered %llu), draws recorded %.1f, voxelized %.1f, without the light matrix %.1f; last frame's maps cover",

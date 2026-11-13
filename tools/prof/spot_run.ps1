@@ -42,6 +42,8 @@ $defs = [ordered]@{
     sss_r4000 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_STARTTIME = '9'; CRYMT_SSS_REACH = '4000'}}
     sss_16 = @{Gi = '1'; Env = @{CRYMT_GI_STARTTIME = '16'}} # the sun facing the overview spot's view
     full_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
+    # GI without the engine cube's face draws in the voxel geometry (before 2026-11-13 evening), GPU per pass.
+    nocubegeom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_CUBEGEOM = '0'}}
     full_early = @{Gi = '1'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}} # main released before shadow prep
     nogi_early = @{Gi = '0'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}}
     full_nojitter = @{Gi = '1'; Env = @{CRYMT_DLSS_JITTER = '0'}} # DLAA without the camera jitter (water update test)
