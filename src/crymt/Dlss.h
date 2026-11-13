@@ -32,6 +32,8 @@ struct Images
     bool cameraMotion; // mvec holds the full motion (CryMT's pass), not only the objects
     ID3D12Resource* exposure; // 1x1 R32F exposure (CryMT's pass), else null: DLSS's auto exposure
     D3D12_RESOURCE_STATES exposureState;
+    ID3D12Resource* bias; // R16F bias towards the current colour (water, particles), else null
+    D3D12_RESOURCE_STATES biasState;
 };
 
 // DLAA on the list; the caller restores its own list state afterwards (descriptor heaps, root signature, pipeline).

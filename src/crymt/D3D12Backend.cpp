@@ -4389,7 +4389,7 @@ struct Stats
     double psoMs;
     uint64_t gpuTicks, gpuLists; // GPU time from the start to the end of each main list
     uint64_t depthToSrv, rtClears, dsClears;
-    uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, objectMotionCopies, bendMotionPasses, voxPasses, giLateReads, giOtherDepth;
+    uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, objectMotionCopies, bendMotionPasses, biasFrames, biasDraws, biasGiven, voxPasses, giLateReads, giOtherDepth;
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
     uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
     uint64_t voxGeomStale; // replays skipped: the draw's list was done, its ring data possibly reused (VoxDraw::serial)
@@ -6986,6 +6986,64 @@ public:
         }
         m_bendRtv->info->outputBound++;
         Bind(m_rtv[2], m_bendRtv);
+    }
+
+    // DLSS's bias towards the current colour (R16F, the scene's size): the patched water and particle pixel shaders'
+    // SV_Target1, blended like the colour (Pso: red only), cleared at the frame's first such draw.
+    void BindBiasMask()
+    {
+        const UINT w = m_foliageW, h = m_foliageH;
+        if (!m_biasRtv || w != m_biasW || h != m_biasH)
+        {
+            if (m_biasSrv)
+                m_biasSrv->Release();
+            if (m_biasRtv)
+                m_biasRtv->Release();
+            if (m_biasTex)
+                m_biasTex->Release();
+            m_biasSrv = nullptr;
+            m_biasRtv = nullptr;
+            m_biasTex = nullptr;
+            D3D10_TEXTURE2D_DESC td{};
+            td.Width = w;
+            td.Height = h;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R16_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D10_USAGE_DEFAULT;
+            td.BindFlags = D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
+            ID3D10Texture2D* tex = nullptr;
+            ID3D10RenderTargetView* rtv = nullptr;
+            ID3D10ShaderResourceView* srv = nullptr;
+            if (FAILED(CreateTexture2D(&td, nullptr, &tex)) || FAILED(CreateRenderTargetView(tex, nullptr, &rtv)) ||
+                FAILED(CreateShaderResourceView(tex, nullptr, &srv)))
+            {
+                if (rtv)
+                    rtv->Release();
+                if (tex)
+                    tex->Release();
+                Log("DLSS bias mask %ux%u: failed", w, h);
+                return;
+            }
+            m_biasTex = tex;
+            m_biasRtv = static_cast<Rtv12*>(rtv);
+            m_biasSrv = static_cast<Srv12*>(srv);
+            m_biasW = w;
+            m_biasH = h;
+            m_biasFrame = ~0ull;
+            Log("DLSS bias mask %ux%u", w, h);
+        }
+        if (m_biasFrame != m_frame)
+        {
+            static const FLOAT kZero[4] = {};
+            ClearRenderTargetView(m_biasRtv, kZero);
+            m_biasFrame = m_frame;
+            m_stats.biasFrames++;
+        }
+        m_stats.biasDraws++;
+        m_biasRtv->info->outputBound++;
+        Bind(m_rtv[1], m_biasRtv);
+        m_omDirty = m_psoDirty = true;
     }
 
     void BindFoliageMask()
@@ -10818,6 +10876,12 @@ public:
                     FlushBarriers();
                     RecordDump(m_foliageSrv->info->res, named("foliage"), 4);
                 }
+                if (m_biasSrv && m_biasFrame == m_frame && m_biasSrv->info)
+                {
+                    Require(m_biasSrv->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    FlushBarriers();
+                    RecordDump(m_biasSrv->info->res, named("bias"), 9);
+                }
                 if (m_bendSrv && m_bendFrame == m_frame && m_bendSrv->info)
                 {
                     Require(m_bendSrv->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -10827,9 +10891,21 @@ public:
             }
         }
         FlushBarriers();
+        // DLSS's bias mask, when water or particles wrote it this frame (BindBiasMask); CRYMT_DLSS_BIAS=0 keeps it from DLSS.
+        static const bool biasOn = [] {
+            wchar_t v[8] = {};
+            return !(GetEnvironmentVariableW(L"CRYMT_DLSS_BIAS", v, 8) && _wtoi(v) == 0);
+        }();
+        Srv12* bias = biasOn && m_biasSrv && m_biasFrame == m_frame && m_biasW == color->width && m_biasH == color->height ? m_biasSrv : nullptr;
+        if (bias)
+        {
+            Require(bias->info, kSrvState);
+            FlushBarriers();
+            m_stats.biasGiven++;
+        }
         const dlss::Images images{sanitized ? m_dlssIn : color->res, sanitized ? kSrvState : color->state, depth->res, depth->state, m_dlssMvec, kSrvState,
                                   m_dlssOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, color->width, color->height, motion,
-                                  exposure ? m_dlssExposure : nullptr, kSrvState};
+                                  exposure ? m_dlssExposure : nullptr, kSrvState, bias ? bias->info->res : nullptr, kSrvState};
         PassName("CryMT DLAA");
         const bool done = dlss::Evaluate(m_list, images, *info);
         PassNameEnd();
@@ -10908,7 +10984,10 @@ public:
         const bool rg = rd.Format == DXGI_FORMAT_R16G16_FLOAT;
         const bool r8 = rd.Format == DXGI_FORMAT_R8_UNORM;
         const bool rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
-        if (rd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && rd.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS && !rg && !r8 && !rgba8)
+        const bool r16f = rd.Format == DXGI_FORMAT_R16_FLOAT;
+        if (r16f)
+            kind = 9; // one half per texel, raw (the DLSS bias mask)
+        if (rd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && rd.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS && !rg && !r8 && !rgba8 && !r16f)
         {
             Log("capture: %s format %d not dumped", name, static_cast<int>(rd.Format));
             return;
@@ -11014,6 +11093,24 @@ public:
                 if (f)
                     fclose(f);
                 Log("capture: %s mean %.4f, over 0.5 %.2f%% (%ux%u)", d.name.c_str(), sum / 255.0 / (double(w) * h), 100.0 * over / (double(w) * h), w, h);
+                d.rb->Unmap(0, nullptr);
+                p = nullptr;
+            }
+            else if (d.kind == 9 && SUCCEEDED(d.rb->Map(0, nullptr, &p)) && p)
+            {
+                // One channel of halves: <name>.f16 (width, height, then the rows).
+                const UINT w = d.fp.Footprint.Width, h = d.fp.Footprint.Height;
+                char path[MAX_PATH];
+                snprintf(path, sizeof(path), "%s%s_%s.f16", CryMTCapture("").c_str(), m_dumpTag.c_str(), d.name.c_str());
+                FILE* f = nullptr;
+                if (fopen_s(&f, path, "wb") == 0 && f)
+                {
+                    fwrite(&w, 4, 1, f);
+                    fwrite(&h, 4, 1, f);
+                    for (UINT y = 0; y < h; y++)
+                        fwrite(static_cast<const uint8_t*>(p) + static_cast<size_t>(y) * d.fp.Footprint.RowPitch, 1, static_cast<size_t>(w) * 2, f);
+                    fclose(f);
+                }
                 d.rb->Unmap(0, nullptr);
                 p = nullptr;
             }
@@ -11660,6 +11757,11 @@ private:
     Srv12* m_foliageSrv = nullptr;
     UINT m_foliageW = 0, m_foliageH = 0;
     uint64_t m_foliageFrame = ~0ull;
+    ID3D10Texture2D* m_biasTex = nullptr; // BindBiasMask
+    Rtv12* m_biasRtv = nullptr;
+    Srv12* m_biasSrv = nullptr;
+    UINT m_biasW = 0, m_biasH = 0;
+    uint64_t m_biasFrame = ~0ull;
     ID3D10Texture2D* m_bendTex = nullptr; // BindBendVelocity
     Rtv12* m_bendRtv = nullptr;
     Srv12* m_bendSrv = nullptr;
@@ -12310,6 +12412,13 @@ ID3D12PipelineState* Device::Pso(bool indexed)
     r.ps = m_ps ? m_ps->contentHash : 0;
     r.layout = m_layout ? m_layout->contentHash : 0;
     SetBlend(r.blend, m_blend ? m_blend->d12 : Blend12From(kDefaultBlend));
+    if (numRtv >= 2 && k.rtv[0] == DXGI_FORMAT_R16G16B16A16_FLOAT && k.rtv[1] == DXGI_FORMAT_R16_FLOAT)
+    {
+        // DLSS's bias mask (BindBiasMask) beside the scene's colour: blended as the colour, red only.
+        r.blend.IndependentBlendEnable = TRUE;
+        r.blend.RenderTarget[1] = r.blend.RenderTarget[0];
+        r.blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+    }
     r.sampleMask = m_sampleMask;
     r.raster = m_raster ? m_raster->d12 : Raster12From(kDefaultRaster); // no padding
     if (cubeCull == 1)
@@ -12451,6 +12560,11 @@ bool Device::ApplyOnce(bool indexed)
     }
     if (m_ps && m_ps->writesTarget1 && m_rtv[0] && !m_rtv[1] && m_rtv[0]->format == DXGI_FORMAT_R32_FLOAT && m_rtv[0]->samples == 1)
         BindFoliageMask();
+    // Water and particles (the patched pixel shaders write DLSS's bias mask in SV_Target1) into the scene's colour.
+    if (m_ps && m_ps->writesTarget1 && !m_ps->writesTarget2 && m_rtv[0] && !m_rtv[1] && m_rtv[0]->format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+        m_rtv[0]->samples == 1 && m_foliageW && static_cast<const TextureCore*>(m_rtv[0]->info)->width == m_foliageW &&
+        static_cast<const TextureCore*>(m_rtv[0]->info)->height == m_foliageH)
+        BindBiasMask();
     if (m_pastScene && m_rtv[0] && m_rtv[0]->info == m_doneColour)
     {
         m_note.lateDraws++;
@@ -15003,6 +15117,8 @@ void Dx12WriteStats(FILE* f, double frames)
     dlss::WriteStats(f);
     fprintf(f, "  object motion: the motion blur target copied after its pass %llu times; bent vegetation's motion in %llu motion passes\n",
             static_cast<unsigned long long>(s.objectMotionCopies), static_cast<unsigned long long>(s.bendMotionPasses));
+    fprintf(f, "  DLSS bias mask (water, particles): frames %llu, draws %llu, given to DLSS %llu\n", static_cast<unsigned long long>(s.biasFrames),
+            static_cast<unsigned long long>(s.biasDraws), static_cast<unsigned long long>(s.biasGiven));
     fprintf(f, "  scenes %llu, DLSS applied %llu, motion vectors %llu (with object velocities %llu), GI %llu, voxel updates %llu, GI reads after the scene %llu, with another depth or target %llu\n", static_cast<unsigned long long>(s.scenes),
             static_cast<unsigned long long>(s.dlssFrames), static_cast<unsigned long long>(s.motionPasses), static_cast<unsigned long long>(s.objectMotionPasses),
             static_cast<unsigned long long>(s.giPasses), static_cast<unsigned long long>(s.voxPasses), static_cast<unsigned long long>(s.giLateReads),

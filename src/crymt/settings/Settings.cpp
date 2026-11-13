@@ -195,6 +195,88 @@ pixout_cryzpass CryMT_ZPassPS(vert2fragZ_cry IN)
 
 )";
 
+// DLSS's bias towards the current colour (2026-11-13): water and particles change by themselves (normal maps, reflections,
+// animated sprites), which no motion vector follows, so DLSS's history smears or ghosts there. Their pixel shaders keep the
+// names the techniques use and wrap the engine's (renamed *Core): the colour as before, and a mask in SV_Target1 that
+// CryMT's back end binds (R16F, blended like the colour, red only) and gives DLSS as kBufferTypeBiasCurrentColorHint
+// (lerp(history, current, mask)): water 0.4, alpha-blended particles 0.8 by their alpha, additive ones by brightness.
+const char* const kWaterMask = R"(// CryMT: the water's pixels in DLSS's bias mask (see the back end).
+#if D3D10
+struct pixout_crymask
+{
+  float4 Color : COLOR0;
+  float4 Mask  : COLOR1;
+};
+
+pixout_crymask WaterPS(v2fWater IN)
+{
+  pixout c = CryMT_WaterCore(IN);
+  pixout_crymask OUT;
+  OUT.Color = c.Color;
+  OUT.Mask = float4(0.4, 0, 0, c.Color.a);
+  return OUT;
+}
+#else
+pixout WaterPS(v2fWater IN)
+{
+  return CryMT_WaterCore(IN);
+}
+#endif
+
+)";
+const char* const kWaterVolsMask = R"(// CryMT: the rivers' and lakes' pixels in DLSS's bias mask (see the back end).
+#if D3D10
+struct pixout_crymask
+{
+  float4 Color : COLOR0;
+  float4 Mask  : COLOR1;
+};
+
+pixout_crymask WaterSurfacePS(v2fReflect IN)
+{
+  pixout c = CryMT_WaterVolCore(IN);
+  pixout_crymask OUT;
+  OUT.Color = c.Color;
+  OUT.Mask = float4(0.4, 0, 0, c.Color.a);
+  return OUT;
+}
+#else
+pixout WaterSurfacePS(v2fReflect IN)
+{
+  return CryMT_WaterVolCore(IN);
+}
+#endif
+
+)";
+const char* const kParticleMask = R"(// CryMT: the particles' pixels in DLSS's bias mask (see the back end).
+#if D3D10
+struct pixout_crymask
+{
+  float4 Color : COLOR0;
+  float4 Mask  : COLOR1;
+};
+
+pixout_crymask CryMT_ParticlePS(v2f IN)
+{
+  pixout c = CryMT_ParticleCore(IN);
+  pixout_crymask OUT;
+  OUT.Color = c.Color;
+#if %_RT_ALPHABLEND
+  OUT.Mask = float4(0.8, 0, 0, c.Color.a);
+#else
+  OUT.Mask = float4(saturate(dot(c.Color.rgb, 0.333)) * 0.8, 0, 0, c.Color.a);
+#endif
+  return OUT;
+}
+#else
+pixout CryMT_ParticlePS(v2f IN)
+{
+  return CryMT_ParticleCore(IN);
+}
+#endif
+
+)";
+
 // Pos_VS_General with the vertex bent as fTimeShift seconds before (ModificatorVT.cfi, before Pos_VS_Terrain).
 const char* const kBendBefore = R"(// CryMT (motion vectors): Pos_VS_General with the vertex bent as fTimeShift seconds before (the shader's own waves) and,
 // with bBendBefore, the instance's main bending as the CPU had it then (vBendBefore).
@@ -1087,7 +1169,7 @@ std::wstring InstallGi()
                             "    P0 = CalcHomogeneousPos(SceneDepth, IN.WPos.xy - CryMT_JitterPixels(IN.ScreenTC.xy)); // CryMT: the DLAA jitter") &&
                     // Blended particles (smoke, dust) take the GI for their ambient.
                     Replace(particles, "pixout ParticlePS(v2f IN)\n",
-                            "// CryMT GI for blended particles (smoke, dust), from the D3D12 back end's volumes around the camera (in place of\n// Textures/CryMT/pvol.dds): per cell x the share of ambient a particle there loses (outdoors a part of it, capped), y\n// the sun's visibility through the voxels (-1: no sun), z the indoor share; and the tint of the light the voxels bring\n// there (hue only: luminance 1, part white). The game lit particles by the sun with the screen's shadow mask behind\n// each pixel (and our first try took the GI there too): both flipped as dust crossed lit and shaded backgrounds (a\n// sunlit floor, a dark wall, a window). The voxels' sun is taken indoors (by the indoor share); outdoors the game's (the\n// voxels' grass and coarse ground cells shaded dust in the open sun). Two volumes of 64 x 64 x 32 cells: fine (0.5 m:\n// walls and ceilings of rooms) and coarse (1.5 m, +-48 m), each as z-slices tiled 8 across 512 x 256 of a 1024 x 513\n// atlas (RGBA32F: fine left, coarse right; rows 0-255 the shares, 257-512 the tints); row 256's texels 0-3 and 4-7 their\n// first cell relative to the camera (metres) and cell size. Read once per pixel (CryMT_PVolAt at the shader's start):\n// two slices blended per volume; the fine one where it reaches, over its outer cells to the coarse one, which fades out\n// over its own (then the game's own). The ambient is darkened and tinted, not brightened. Additive particles (fire,\n// sparks, flashes) are left as they are. The placeholder (no CryMT, or the effect off: key \"-\") has cell sizes of 0: the\n// game's own. The pixel shader is renamed so no cached build of the old one is used.\nstruct CryMT_PVol\n{\n  float share;     // of the ambient that goes\n  float3 tint;     // the ambient's tint\n  float sun;       // the sun's visibility (the voxels')\n  float sunWeight; // how much of it to take (indoors, inside the volumes); 0: the game's own\n};\n\n#if D3D10\nsampler2D CryMT_PVolSampler = sampler_state\n{\n  Texture = Textures/CryMT/pvol.dds;\n  MinFilter = LINEAR;\n  MagFilter = LINEAR;\n  MipFilter = POINT;\n  AddressU = Clamp;\n  AddressV = Clamp;\n};\n\n// One volume (params at row 256's texels p .. p + 3, slices from atlas column x0): its share, sun and indoor share, its\n// tint, its weight (0 outside, rising over the outer 4 cells).\nvoid CryMT_PVolOne(float3 pos, float p, float x0, out float3 v, out float3 tint, out float weight)\n{\n  v = 0;\n  tint = 1;\n  weight = 0;\n  float cell = tex2Dlod(CryMT_PVolSampler, float4((p + 3.5) / 1024, 256.5 / 513, 0, 0)).x;\n  if (cell <= 0)\n    return;\n  float3 first = float3(tex2Dlod(CryMT_PVolSampler, float4((p + 0.5) / 1024, 256.5 / 513, 0, 0)).x,\n                        tex2Dlod(CryMT_PVolSampler, float4((p + 1.5) / 1024, 256.5 / 513, 0, 0)).x,\n                        tex2Dlod(CryMT_PVolSampler, float4((p + 2.5) / 1024, 256.5 / 513, 0, 0)).x);\n  float3 dims = float3(64, 64, 32);\n  float3 g = (pos - first) / cell - 0.5; // cell coordinates, the cells' centres at whole numbers\n  float edge = min(min(min(g.x, dims.x - 1 - g.x), min(g.y, dims.y - 1 - g.y)), min(g.z, dims.z - 1 - g.z));\n  if (edge < 0)\n    return;\n  float z0 = floor(g.z);\n  float z1 = min(z0 + 1, dims.z - 1);\n  float fz = g.z - z0;\n  float2 xy = clamp(g.xy + 0.5, 0.5, dims.xy - 0.5);\n  float2 uv0 = (float2(x0, 0) + float2(fmod(z0, 8), floor(z0 / 8)) * dims.xy + xy) / float2(1024, 513);\n  float2 uv1 = (float2(x0, 0) + float2(fmod(z1, 8), floor(z1 / 8)) * dims.xy + xy) / float2(1024, 513);\n  float2 down = float2(0, 257.0 / 513);\n  v = lerp(tex2Dlod(CryMT_PVolSampler, float4(uv0, 0, 0)).xyz, tex2Dlod(CryMT_PVolSampler, float4(uv1, 0, 0)).xyz, fz);\n  tint = lerp(tex2Dlod(CryMT_PVolSampler, float4(uv0 + down, 0, 0)).xyz, tex2Dlod(CryMT_PVolSampler, float4(uv1 + down, 0, 0)).xyz, fz);\n  weight = saturate(edge / 4);\n}\n\nCryMT_PVol CryMT_PVolAt(float3 posFromCamera)\n{\n  float3 fv, ft, cv, ct;\n  float fw, cw;\n  CryMT_PVolOne(posFromCamera, 0, 0, fv, ft, fw);\n  CryMT_PVolOne(posFromCamera, 4, 512, cv, ct, cw);\n  CryMT_PVol r;\n  r.share = lerp(saturate(cv.x) * cw, saturate(fv.x), fw);\n  r.tint = clamp(lerp(lerp(1, ct, cw), ft, fw), 0, 2);\n  float cs = saturate(cv.z) * cw, fs = saturate(fv.z) * fw;\n  r.sun = fs > 0 ? saturate(fv.y) : saturate(cv.y);\n  r.sunWeight = (fv.y < -0.5 || cv.y < -0.5) ? 0 : max(fs, cs); // no sun this frame: the game's own\n  return r;\n}\n\n// Thin particles (their own opacity under 0.5: light haze, mist) lose less (down to 35% of it for a clear one): darkened\n// they matched the background and vanished; dense smoke and dust take it all.\nhalf3 CryMT_GIParticleAmbient(half3 ambient, CryMT_PVol vol, half opacity)\n{\n  return ambient * (1 - vol.share * lerp(0.35, 1, saturate(opacity * 2))) * vol.tint;\n}\n\nhalf CryMT_GIParticleSun(half engine, CryMT_PVol vol)\n{\n  return lerp(engine, vol.sun, vol.sunWeight);\n}\n#else\nCryMT_PVol CryMT_PVolAt(float3 posFromCamera)\n{\n  CryMT_PVol r;\n  r.share = 0;\n  r.tint = 1;\n  r.sun = 1;\n  r.sunWeight = 0;\n  return r;\n}\n\nhalf3 CryMT_GIParticleAmbient(half3 ambient, CryMT_PVol vol, half opacity)\n{\n  return ambient;\n}\n\nhalf CryMT_GIParticleSun(half engine, CryMT_PVol vol)\n{\n  return engine;\n}\n#endif\n\npixout CryMT_ParticlePS(v2f IN)\n") &&
+                            "// CryMT GI for blended particles (smoke, dust), from the D3D12 back end's volumes around the camera (in place of\n// Textures/CryMT/pvol.dds): per cell x the share of ambient a particle there loses (outdoors a part of it, capped), y\n// the sun's visibility through the voxels (-1: no sun), z the indoor share; and the tint of the light the voxels bring\n// there (hue only: luminance 1, part white). The game lit particles by the sun with the screen's shadow mask behind\n// each pixel (and our first try took the GI there too): both flipped as dust crossed lit and shaded backgrounds (a\n// sunlit floor, a dark wall, a window). The voxels' sun is taken indoors (by the indoor share); outdoors the game's (the\n// voxels' grass and coarse ground cells shaded dust in the open sun). Two volumes of 64 x 64 x 32 cells: fine (0.5 m:\n// walls and ceilings of rooms) and coarse (1.5 m, +-48 m), each as z-slices tiled 8 across 512 x 256 of a 1024 x 513\n// atlas (RGBA32F: fine left, coarse right; rows 0-255 the shares, 257-512 the tints); row 256's texels 0-3 and 4-7 their\n// first cell relative to the camera (metres) and cell size. Read once per pixel (CryMT_PVolAt at the shader's start):\n// two slices blended per volume; the fine one where it reaches, over its outer cells to the coarse one, which fades out\n// over its own (then the game's own). The ambient is darkened and tinted, not brightened. Additive particles (fire,\n// sparks, flashes) are left as they are. The placeholder (no CryMT, or the effect off: key \"-\") has cell sizes of 0: the\n// game's own. The pixel shader is renamed so no cached build of the old one is used.\nstruct CryMT_PVol\n{\n  float share;     // of the ambient that goes\n  float3 tint;     // the ambient's tint\n  float sun;       // the sun's visibility (the voxels')\n  float sunWeight; // how much of it to take (indoors, inside the volumes); 0: the game's own\n};\n\n#if D3D10\nsampler2D CryMT_PVolSampler = sampler_state\n{\n  Texture = Textures/CryMT/pvol.dds;\n  MinFilter = LINEAR;\n  MagFilter = LINEAR;\n  MipFilter = POINT;\n  AddressU = Clamp;\n  AddressV = Clamp;\n};\n\n// One volume (params at row 256's texels p .. p + 3, slices from atlas column x0): its share, sun and indoor share, its\n// tint, its weight (0 outside, rising over the outer 4 cells).\nvoid CryMT_PVolOne(float3 pos, float p, float x0, out float3 v, out float3 tint, out float weight)\n{\n  v = 0;\n  tint = 1;\n  weight = 0;\n  float cell = tex2Dlod(CryMT_PVolSampler, float4((p + 3.5) / 1024, 256.5 / 513, 0, 0)).x;\n  if (cell <= 0)\n    return;\n  float3 first = float3(tex2Dlod(CryMT_PVolSampler, float4((p + 0.5) / 1024, 256.5 / 513, 0, 0)).x,\n                        tex2Dlod(CryMT_PVolSampler, float4((p + 1.5) / 1024, 256.5 / 513, 0, 0)).x,\n                        tex2Dlod(CryMT_PVolSampler, float4((p + 2.5) / 1024, 256.5 / 513, 0, 0)).x);\n  float3 dims = float3(64, 64, 32);\n  float3 g = (pos - first) / cell - 0.5; // cell coordinates, the cells' centres at whole numbers\n  float edge = min(min(min(g.x, dims.x - 1 - g.x), min(g.y, dims.y - 1 - g.y)), min(g.z, dims.z - 1 - g.z));\n  if (edge < 0)\n    return;\n  float z0 = floor(g.z);\n  float z1 = min(z0 + 1, dims.z - 1);\n  float fz = g.z - z0;\n  float2 xy = clamp(g.xy + 0.5, 0.5, dims.xy - 0.5);\n  float2 uv0 = (float2(x0, 0) + float2(fmod(z0, 8), floor(z0 / 8)) * dims.xy + xy) / float2(1024, 513);\n  float2 uv1 = (float2(x0, 0) + float2(fmod(z1, 8), floor(z1 / 8)) * dims.xy + xy) / float2(1024, 513);\n  float2 down = float2(0, 257.0 / 513);\n  v = lerp(tex2Dlod(CryMT_PVolSampler, float4(uv0, 0, 0)).xyz, tex2Dlod(CryMT_PVolSampler, float4(uv1, 0, 0)).xyz, fz);\n  tint = lerp(tex2Dlod(CryMT_PVolSampler, float4(uv0 + down, 0, 0)).xyz, tex2Dlod(CryMT_PVolSampler, float4(uv1 + down, 0, 0)).xyz, fz);\n  weight = saturate(edge / 4);\n}\n\nCryMT_PVol CryMT_PVolAt(float3 posFromCamera)\n{\n  float3 fv, ft, cv, ct;\n  float fw, cw;\n  CryMT_PVolOne(posFromCamera, 0, 0, fv, ft, fw);\n  CryMT_PVolOne(posFromCamera, 4, 512, cv, ct, cw);\n  CryMT_PVol r;\n  r.share = lerp(saturate(cv.x) * cw, saturate(fv.x), fw);\n  r.tint = clamp(lerp(lerp(1, ct, cw), ft, fw), 0, 2);\n  float cs = saturate(cv.z) * cw, fs = saturate(fv.z) * fw;\n  r.sun = fs > 0 ? saturate(fv.y) : saturate(cv.y);\n  r.sunWeight = (fv.y < -0.5 || cv.y < -0.5) ? 0 : max(fs, cs); // no sun this frame: the game's own\n  return r;\n}\n\n// Thin particles (their own opacity under 0.5: light haze, mist) lose less (down to 35% of it for a clear one): darkened\n// they matched the background and vanished; dense smoke and dust take it all.\nhalf3 CryMT_GIParticleAmbient(half3 ambient, CryMT_PVol vol, half opacity)\n{\n  return ambient * (1 - vol.share * lerp(0.35, 1, saturate(opacity * 2))) * vol.tint;\n}\n\nhalf CryMT_GIParticleSun(half engine, CryMT_PVol vol)\n{\n  return lerp(engine, vol.sun, vol.sunWeight);\n}\n#else\nCryMT_PVol CryMT_PVolAt(float3 posFromCamera)\n{\n  CryMT_PVol r;\n  r.share = 0;\n  r.tint = 1;\n  r.sun = 1;\n  r.sunWeight = 0;\n  return r;\n}\n\nhalf3 CryMT_GIParticleAmbient(half3 ambient, CryMT_PVol vol, half opacity)\n{\n  return ambient;\n}\n\nhalf CryMT_GIParticleSun(half engine, CryMT_PVol vol)\n{\n  return engine;\n}\n#endif\n\npixout CryMT_ParticleCore(v2f IN)\n") &&
                     Replace(particles, "  pixout OUT;\n  int nQuality = GetShaderQuality();\n",
                             "  pixout OUT;\n  int nQuality = GetShaderQuality();\n  CryMT_PVol cryVol = CryMT_PVolAt(IN.vView.xyz); // CryMT: the GI volumes at this particle\n") &&
                     Replace(particles, "  #if %_RT_AMBIENT\n    cDiffAcc.xyz += Ambient.xyz;\n    finalColor.xyz += Ambient.xyz;      \n  #endif\n",
@@ -1111,6 +1193,14 @@ std::wstring InstallGi()
                             "compile ps_Auto CryMT_ZPassPS() ZPS;") &&
                     Replace(zpass, "compile vs_3_0 Common_ZPassVS() ZVS;", "compile vs_3_0 CryMT_ZPassVS() ZVS;") &&
                     Replace(zpass, "compile vs_Auto Common_ZPassVS() ZVS;", "compile vs_Auto CryMT_ZPassVS() ZVS;") &&
+                    // DLSS's bias mask from water and particles (kWaterMask, kWaterVolsMask, kParticleMask).
+                    Replace(water, "pixout WaterPS(v2fWater IN)\n", "pixout CryMT_WaterCore(v2fWater IN)\n") &&
+                    Replace(water, "//////////////////////////////// technique ////////////////\n\ntechnique Water\n",
+                            std::string(kWaterMask) + "//////////////////////////////// technique ////////////////\n\ntechnique Water\n") &&
+                    Replace(waterVols, "pixout WaterSurfacePS(v2fReflect IN)\n", "pixout CryMT_WaterVolCore(v2fReflect IN)\n") &&
+                    Replace(waterVols, "//////////////////////////////// technique ////////////////\n\ntechnique General\n",
+                            std::string(kWaterVolsMask) + "//////////////////////////////// technique ////////////////\n\ntechnique General\n") &&
+                    Replace(particles, "/////////////////////////////////\n// technique\n", std::string(kParticleMask) + "/////////////////////////////////\n// technique\n") &&
                     // The bending can be asked for an earlier time (default 0: every other caller as before).
                     Replace(modificator, "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams)",
                             "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams, float fTimeShift = 0)") &&

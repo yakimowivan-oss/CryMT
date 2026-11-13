@@ -376,15 +376,20 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
     const sl::Extent extent{0, 0, images.width, images.height};
     sl::Resource exposure(sl::ResourceType::eTex2d, images.exposure, static_cast<uint32_t>(images.exposureState));
     const sl::Extent one{0, 0, 1, 1};
-    const sl::ResourceTag tags[] = {
+    sl::Resource bias(sl::ResourceType::eTex2d, images.bias, static_cast<uint32_t>(images.biasState));
+    sl::ResourceTag tags[6] = {
         sl::ResourceTag(&color, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilPresent, &extent),
         sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent, &extent),
         sl::ResourceTag(&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent),
         sl::ResourceTag(&mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent),
-        sl::ResourceTag(&exposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilPresent, &one),
     };
+    uint32_t tagCount = 4;
+    if (images.exposure)
+        tags[tagCount++] = sl::ResourceTag(&exposure, sl::kBufferTypeExposure, sl::ResourceLifecycle::eValidUntilPresent, &one);
+    if (images.bias) // water and particles: lerp(history, current, mask)
+        tags[tagCount++] = sl::ResourceTag(&bias, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilPresent, &extent);
     auto* cmd = reinterpret_cast<sl::CommandBuffer*>(list);
-    if (g_slSetTagForFrame(*token, viewport, tags, images.exposure ? 5 : 4, cmd) != sl::Result::eOk)
+    if (g_slSetTagForFrame(*token, viewport, tags, tagCount, cmd) != sl::Result::eOk)
     {
         g_failures++;
         return false;
