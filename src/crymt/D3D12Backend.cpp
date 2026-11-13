@@ -2703,6 +2703,21 @@ float3 SurfaceAt(float2 uv)
 float3 Nearer(float3 a, float3 b) { return abs(a.z) < abs(b.z) ? a : b; }
 float3 Tone(float3 c) { return c / (1 + c); }
 
+// The previous frame's colour at puv (a cell's reprojection) belongs to the first-person view (weapon, hands: depth under
+// kWeaponDepth) where the screen shows it now, the bilinear footprint and a pixel and a half around: it stays in place
+// while the world turns behind it, so cells coming out from behind it took the hands' colour into the GI's bounce (the
+// user, 2026-11-13: "the hands shade other objects in the background").
+bool WeaponAt(float2 puv)
+{
+    float2 px = 1.5 / fullSize;
+    float d = depthTex.SampleLevel(pointClamp, puv, 0).r;
+    d = min(d, depthTex.SampleLevel(pointClamp, puv + float2(-px.x, -px.y), 0).r);
+    d = min(d, depthTex.SampleLevel(pointClamp, puv + float2(px.x, -px.y), 0).r);
+    d = min(d, depthTex.SampleLevel(pointClamp, puv + float2(-px.x, px.y), 0).r);
+    d = min(d, depthTex.SampleLevel(pointClamp, puv + float2(px.x, px.y), 0).r);
+    return d < kWeaponDepth;
+}
+
 [numthreads(4, 4, 4)]
 void update(uint3 id : SV_DispatchThreadID)
 {
@@ -2809,7 +2824,7 @@ void update(uint3 id : SV_DispatchThreadID)
                     float4 pc = mul(float4(centre, 1), worldToPrevClip);
                     float2 puv = float2(pc.x, -pc.y) / pc.w * 0.5 + 0.5;
                     float3 c = colourTex.SampleLevel(linearClamp, puv, 0).rgb;
-                    if (pc.w > 0 && all(puv >= 0) && all(puv <= 1) && Finite3(c))
+                    if (pc.w > 0 && all(puv >= 0) && all(puv <= 1) && Finite3(c) && !WeaponAt(puv))
                     {
                         c = clamp(c, 0, 8);
                         // Colour seen from afar is mostly fog and haze (at night lighter than the surfaces: the
@@ -2833,7 +2848,7 @@ void update(uint3 id : SV_DispatchThreadID)
                     float4 pc = mul(float4(centre, 1), worldToPrevClip);
                     float2 puv = float2(pc.x, -pc.y) / pc.w * 0.5 + 0.5;
                     float3 c = colourTex.SampleLevel(linearClamp, puv, 0).rgb;
-                    if (pc.w > 0 && all(puv >= 0) && all(puv <= 1) && Finite3(c))
+                    if (pc.w > 0 && all(puv >= 0) && all(puv <= 1) && Finite3(c) && !WeaponAt(puv))
                     {
                         float trust = saturate(kColourTrust / dist);
                         v.rgb = v.a > 0.01 ? lerp(v.rgb, clamp(c, 0, 8), 0.25 * trust) : clamp(c, 0, 8) * trust;
@@ -2922,7 +2937,8 @@ void light(uint3 id : SV_DispatchThreadID)
     float3 sky = albedoSun * worldToPrevClip[2].y * (flat ? 0.75 : 0.5 + 0.5 * N.z);
     float cover = 0;
     float3 p = cell + 0.5 + L * 1.5;
-    [loop] for (int i = 0; i < 24 && cover < 0.95 && facing > 0; i++)
+    const int sunSteps = worldToPrevClip[2].w > 0 ? (int)worldToPrevClip[2].w : 24; // CRYMT_GI_SUNMARCH, cells of this level
+    [loop] for (int i = 0; i < sunSteps && cover < 0.95 && facing > 0; i++)
     {
         int3 c = (int3)floor(p);
         if (any(c < g) || any(c >= g + n))
@@ -4608,6 +4624,7 @@ struct Stats
     uint64_t voxShadowMaps, voxShadowJobs, voxShadowCovered, voxShadowRecorded, voxShadowDraws, voxShadowNoCamera; // ShadowMap
     uint64_t voxCubeSeen, voxCubeRecorded, voxCubeNoCamera, voxCubeFoliage, voxCubeRepeat, voxCubeJobs, voxCubeDraws; // cube faces
     uint64_t voxInjectRuns, voxInjectSkipped; // RunCubeInject: faces put into the levels; faces whose depth and colour differ
+    uint64_t voxGeomWeapon; // z-prepass draws of the first-person view (viewport depth under 0.5) left out of the voxels
     float voxShadowCover[8]; // the last frame's shadow maps: half the width they cover around the eye (m)
     uint32_t voxShadowCoverCount;
     uint64_t voxShadowMapDraws[8], voxShadowMapSeen[8]; // per map of a frame: draws, frames
@@ -6865,6 +6882,10 @@ public:
         float nearOcclusion = 0;           // CRYMT_GI_NEAROCC: strength of the near occlusion cones (0 none; Num3 sets 1)
         float sunAlbedo = 0.3f;            // CRYMT_GI_SUNALBEDO: the albedo assumed for sunlit geometry cells (0: none)
         float skyFill = 0.15f;             // CRYMT_GI_SKYFILL: their light from the sky, a share of the sun's
+        int sunMarch = 128;                // CRYMT_GI_SUNMARCH: cells the light pass marches towards the sun in a level, up to
+                                           // 128 (the grid). 24 before 2026-11-13 (6 m at level 0): mine at noon, the light
+                                           // change of cells coming into view (inside, level 1) mean 12.9 -> 4.7 / 255, > 48:
+                                           // 16% -> 2% of cells; +0.05 ms
         bool shadowGeometry = false;       // CRYMT_GI_SHADOWGEOM=1: also the shadow maps' casters (off: their vertex shaders
                                            // put the depth elsewhere, none of their draws landed in the grid - a capture)
         bool cubeGeometry = false;         // CRYMT_GI_CUBEGEOM=1: the engine cube's face draws (solid only) into the geometry
@@ -6985,6 +7006,11 @@ public:
             read(L"CRYMT_GI_NEAROCC", v.nearOcclusion);
             read(L"CRYMT_GI_SUNALBEDO", v.sunAlbedo);
             read(L"CRYMT_GI_SKYFILL", v.skyFill);
+            {
+                float steps = static_cast<float>(v.sunMarch);
+                read(L"CRYMT_GI_SUNMARCH", steps);
+                v.sunMarch = std::min(std::max(static_cast<int>(steps), 1), 128);
+            }
             v.shadowGeometry = GetEnvironmentVariableW(L"CRYMT_GI_SHADOWGEOM", text, 32) && wcscmp(text, L"0") != 0;
             v.cubeGeometry = GetEnvironmentVariableW(L"CRYMT_GI_CUBEGEOM", text, 32) && wcscmp(text, L"0") != 0;
             v.cubeInject = GetEnvironmentVariableW(L"CRYMT_GI_CUBEINJECT", text, 32) && wcscmp(text, L"0") != 0;
@@ -9646,6 +9672,12 @@ public:
             m_stats.voxGeomSkipped++;
             return;
         }
+        // The first-person view (weapon, hands: their own depth range under kWeaponDepth) is not the world's geometry.
+        if (kind == 0 && m_numViewports > 0 && m_viewports[0].MaxDepth < 0.5f)
+        {
+            m_stats.voxGeomWeapon++;
+            return;
+        }
         // The ocean's surface (its waves) is no geometry for the GI: the user saw voxels on the waves.
         if (m_vs->water)
         {
@@ -10607,7 +10639,7 @@ public:
                 memcpy(lc, c, sizeof(lc));
                 const float lit = m_giSun[3] > 0 ? 1.0f : 0.0f;
                 const float sun[12] = {m_giSun[0], m_giSun[1], m_giSun[2], 0, m_giSun[4] * lit, m_giSun[5] * lit, m_giSun[6] * lit, 0,
-                                       Gi().sunAlbedo, Gi().skyFill, Gi().lampTest ? 1.0f : 0.0f, 0};
+                                       Gi().sunAlbedo, Gi().skyFill, Gi().lampTest ? 1.0f : 0.0f, static_cast<float>(Gi().sunMarch)};
                 memcpy(lc + 16, sun, sizeof(sun));
                 m_list->SetComputeRoot32BitConstants(0, kVoxConstants, lc, 0);
                 m_list->SetComputeRootConstantBufferView(2, lamps);
@@ -15995,6 +16027,7 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu\n",
             static_cast<unsigned long long>(s.sssRuns), s.sssRuns ? static_cast<double>(s.sssDispatches) / s.sssRuns : 0.0,
             static_cast<unsigned long long>(s.sssNoDepth));
+    fprintf(f, "  GI geometry: first-person draws (weapon, hands) left out %.1f per frame\n", s.voxGeomWeapon / frames);
     if (s.voxInjectRuns || s.voxInjectSkipped)
         fprintf(f, "  GI cells from the engine cube's faces (inject): faces %llu (%.2f per frame), skipped (depth and colour sizes differ) %llu\n",
                 static_cast<unsigned long long>(s.voxInjectRuns), s.voxInjectRuns / frames, static_cast<unsigned long long>(s.voxInjectSkipped));
