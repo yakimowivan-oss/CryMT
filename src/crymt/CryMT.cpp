@@ -589,6 +589,34 @@ uint64_t g_shadowDrawTicks, g_shadowDraws; // nested flushes of PrepareDepthMap 
 uint64_t g_preSignals;
 uint64_t g_envCubeFaces, g_envCubeFull, g_envCubeTicks, g_envCubeSkips, g_envCubeSwaps, g_envDepthFreed; // EnvCubeUpdate
 uint64_t g_envCubeLightLists[4]; // EnvCubeUpdate: renders that changed the renderer's level 0..3 light list
+// Diagnosis (the editor crash, reproduced by tools\prof\editor_toggle.ps1: fleet, game mode toggled, ~80 s; none with the
+// cube off): what the cube render does to C3DEngine's dynamic light list (+0x760 pointer, +0x768 count, +0x76C capacity,
+// +0x778 added, +0x780) and the lights' camera array (+0x7A8 pointer, +0x7B0 count, +0x7B4 capacity), which main's octree
+// pass indexes by a light's +0x200 (FUN_301020B0 -> camera test at 0x30019FF0, the faulting read).
+struct EngineLightState
+{
+    uint64_t list, cams;
+    int count, capacity, added, total, camCount, camCapacity;
+};
+EngineLightState ReadEngineLights()
+{
+    EngineLightState s = {};
+    const auto* e = *reinterpret_cast<const uint8_t* const*>(k3DEngineGlobal);
+    if (!e)
+        return s;
+    s.list = *reinterpret_cast<const uint64_t*>(e + 0x760);
+    s.count = *reinterpret_cast<const int*>(e + 0x768);
+    s.capacity = *reinterpret_cast<const int*>(e + 0x76C);
+    s.added = *reinterpret_cast<const int*>(e + 0x778);
+    s.total = *reinterpret_cast<const int*>(e + 0x780);
+    s.cams = *reinterpret_cast<const uint64_t*>(e + 0x7A8);
+    s.camCount = *reinterpret_cast<const int*>(e + 0x7B0);
+    s.camCapacity = *reinterpret_cast<const int*>(e + 0x7B4);
+    return s;
+}
+uint64_t g_cubeLightsMoved, g_cubeLightsCounted, g_cubeCamsMoved, g_sceneAfterCubeDiff;
+EngineLightState g_cubeLightsAfter;
+std::atomic<bool> g_cubeLightsAfterSet;
 uint64_t g_lateCallbacks;
 uint64_t g_preFallbacks;
 uint64_t g_warmupFrames = 60;
@@ -1240,6 +1268,9 @@ void WriteStats()
             fprintf(f, "engine env cube: renders that changed the renderer's light list, level 0 %llu, 1 %llu, 2 %llu, 3 %llu\n",
                     static_cast<unsigned long long>(g_envCubeLightLists[0]), static_cast<unsigned long long>(g_envCubeLightLists[1]),
                     static_cast<unsigned long long>(g_envCubeLightLists[2]), static_cast<unsigned long long>(g_envCubeLightLists[3]));
+        fprintf(f, "engine cube and the 3D engine's lights: list moved %llu, counts changed %llu, light cameras moved %llu; main's scene found them changed since %llu\n",
+                static_cast<unsigned long long>(g_cubeLightsMoved), static_cast<unsigned long long>(g_cubeLightsCounted),
+                static_cast<unsigned long long>(g_cubeCamsMoved), static_cast<unsigned long long>(g_sceneAfterCubeDiff));
         fprintf(f, "early barrier: %s; main waited for shadow prep (times of checks, ms/frame):", g_shadowBarrier ? "off" : "on");
         for (int k = 0; k < 4; k++)
             fprintf(f, " %s %llu of %llu, %.3f;", k == 0 ? "RenderWorld" : k == 1 ? "entity update" : k == 2 ? "terrain" : "AI update",
@@ -5913,7 +5944,28 @@ void EnvCubeUpdate()
     // The back end lets the encode pass read its source (Device::ReleaseOutput) and takes the face into its HDR copy at the
     // end, replacing the old one while the cube is new here (fresh).
     D3DLayerPassName(facesDrawn < 6 ? "CryMT engine cube fresh" : "CryMT engine cube");
+    const EngineLightState lightsIn = ReadEngineLights();
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, drawFlags, ~0ull, 0);
+    const EngineLightState lightsOut = ReadEngineLights();
+    {
+        const bool moved = lightsOut.list != lightsIn.list, counted = lightsOut.count != lightsIn.count || lightsOut.total != lightsIn.total,
+                   cams = lightsOut.cams != lightsIn.cams || lightsOut.camCount != lightsIn.camCount;
+        g_cubeLightsMoved += moved;
+        g_cubeLightsCounted += counted;
+        g_cubeCamsMoved += cams;
+        static int logged;
+        if ((moved || counted || cams) && logged < 12)
+        {
+            logged++;
+            FocusLog("frame %llu: engine cube render, 3D engine lights %llx %d/%d (+%d, %d) cams %llx %d/%d -> %llx %d/%d (+%d, %d) cams %llx %d/%d",
+                     static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(lightsIn.list), lightsIn.count, lightsIn.capacity,
+                     lightsIn.added, lightsIn.total, static_cast<unsigned long long>(lightsIn.cams), lightsIn.camCount, lightsIn.camCapacity,
+                     static_cast<unsigned long long>(lightsOut.list), lightsOut.count, lightsOut.capacity, lightsOut.added, lightsOut.total,
+                     static_cast<unsigned long long>(lightsOut.cams), lightsOut.camCount, lightsOut.camCapacity);
+        }
+        g_cubeLightsAfter = lightsOut;
+        g_cubeLightsAfterSet.store(true, std::memory_order_release);
+    }
     D3DLayerPassName("CryMT engine cube end");
     EnvDepthRestore(renderer);
     for (int l = 0; l < 4; l++)
@@ -7059,6 +7111,18 @@ extern "C" void ScenePush(uintptr_t ret)
     {
         WaitIdlePublic(297);
         RunPendingGc();
+    }
+    // Diagnosis (the editor crash): main's scene starts with the 3D engine's lights as the engine cube left them?
+    if (s->depth == 0 && GetCurrentThreadId() == g_mainThread && g_cubeLightsAfterSet.exchange(false, std::memory_order_acq_rel))
+    {
+        const EngineLightState now = ReadEngineLights();
+        if (memcmp(&now, &g_cubeLightsAfter, sizeof(now)) != 0 && ++g_sceneAfterCubeDiff <= 12)
+            FocusLog("frame %llu: main's scene, 3D engine lights %llx %d/%d (+%d, %d) cams %llx %d/%d (the cube left %llx %d/%d (+%d, %d) cams %llx %d/%d)",
+                     static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(now.list), now.count, now.capacity, now.added,
+                     now.total, static_cast<unsigned long long>(now.cams), now.camCount, now.camCapacity,
+                     static_cast<unsigned long long>(g_cubeLightsAfter.list), g_cubeLightsAfter.count, g_cubeLightsAfter.capacity,
+                     g_cubeLightsAfter.added, g_cubeLightsAfter.total, static_cast<unsigned long long>(g_cubeLightsAfter.cams),
+                     g_cubeLightsAfter.camCount, g_cubeLightsAfter.camCapacity);
     }
     s->ret[s->depth++] = ret;
 }
