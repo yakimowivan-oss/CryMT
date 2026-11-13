@@ -2403,12 +2403,18 @@ void trace(uint3 id : SV_DispatchThreadID)
             const int area = VisAreaAt(Pw);
             if (area >= 0 && visAreas[0].y > 0.5)
                 SetRoom(area);
-            // GI v2: the probes inside their grid, the cones beyond it and across its last two probes.
+            // GI v2: the probes inside their grid, the cones beyond it and across its last two probes. |visAreas[0].w|:
+            // the probes' strength, + 100 when the cones keep the occlusion everywhere and the probes give the light only
+            // (the user, 2026-11-14: walking, surfaces the GI had darkened came out lighter where the probes took over:
+            // a probe hangs up to a metre off the surface and misses the occlusion close to it).
             float probeIn = 0;
+            const float probeW = abs(visAreas[0].w);
+            const bool probeLightOnly = probeW >= 100;
+            const float probeStrength = probeLightOnly ? probeW - 100 : probeW;
             const float4 probe = visAreas[0].w != 0 ? ProbeLight(Pw, Nw, probeIn) : 0;
             float3 farLight = 0;
             float farOcc = 0;
-            if (probeIn < 1)
+            if (probeIn < 1 || probeLightOnly)
             {
                 float4 cone = ConeTrace(O, Nw, 0.577, start, voxParams.z, false, true, Pw, Nw, noise);
                 farLight = cone.rgb;
@@ -2424,8 +2430,9 @@ void trace(uint3 id : SV_DispatchThreadID)
                 farLight *= voxParams.w / 3;
                 farOcc /= 3;
             }
-            farLight = lerp(farLight, probe.rgb * abs(visAreas[0].w), probeIn); // the probes' own strength (CRYMT_GI_PROBESTRENGTH)
-            farOcc = lerp(farOcc, probe.a, probeIn);
+            farLight = lerp(farLight, probe.rgb * probeStrength, probeIn); // the probes' own strength (CRYMT_GI_PROBESTRENGTH)
+            if (!probeLightOnly)
+                farOcc = lerp(farOcc, probe.a, probeIn);
             // Indoors: a VisArea; else the cover above (houses without one): the roof texture half a metre off the
             // surface and, when the two strengths differ, a ray up leaned off the surface and turned per texel.
             float roof = area >= 0 ? 1 : 0;
@@ -7531,7 +7538,8 @@ public:
                                            // inside; the voxels page; default since 2026-11-14, the user), 2 six directions
                                            // (+-X, +-Y, +-Z, ~220 MB more, made when first asked for)
         int probes = 0;                    // CRYMT_GI_PROBES=1: GI v2, irradiance probes traced through the voxels in place
-                                           // of the cones near the camera (kGiShader "probes", ProbeLight)
+                                           // of the cones near the camera (kGiShader "probes", ProbeLight); 2: the probes'
+                                           // light with the cones' occlusion
         bool probeVisibility = true;       // CRYMT_GI_PROBEVIS=0: no visibility test (measures the light it keeps out)
         float probeStrength = 1.0f;        // CRYMT_GI_PROBESTRENGTH: their bounce light's factor (the cones' is voxelStrength
                                            // 1.5: coarse mips lose light; the probes' thin rays see the cells' full light,
@@ -7657,7 +7665,7 @@ public:
             if (GetEnvironmentVariableW(L"CRYMT_GI_DIRLIGHT", text, 32))
                 v.dirLight = std::min(std::max(_wtoi(text), 0), 2);
             if (GetEnvironmentVariableW(L"CRYMT_GI_PROBES", text, 32))
-                v.probes = std::min(std::max(_wtoi(text), 0), 1);
+                v.probes = std::min(std::max(_wtoi(text), 0), 2);
             read(L"CRYMT_GI_PROBESTRENGTH", v.probeStrength);
             v.probeVisibility = !(GetEnvironmentVariableW(L"CRYMT_GI_PROBEVIS", text, 32) && wcscmp(text, L"0") == 0);
             v.replaceSsao = !(GetEnvironmentVariableW(L"CRYMT_GI_SSAO", text, 32) && wcscmp(text, L"0") != 0);
@@ -7774,7 +7782,7 @@ public:
         g.sssWeaponThickness = g_giControl.sssWeapon >= 0 && g_giControl.sssWeapon < 5 ? kSssWeaponThick[g_giControl.sssWeapon] : b.sssWeaponThickness;
         g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
         g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 2) : b.dirLight;
-        g.probes = g_giControl.probes >= 0 ? std::min(g_giControl.probes.load(), 1) : b.probes;
+        g.probes = g_giControl.probes >= 0 ? std::min(g_giControl.probes.load(), 2) : b.probes;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -9626,8 +9634,10 @@ public:
             f[0] = static_cast<float>(m_giVisAreaCount);
             f[1] = Gi().roomLight ? 1.0f : 0.0f; // [0].y: the cones from inside a room take no light from outside its box
             f[2] = static_cast<float>(ConeDirMode()); // [0].z: the cells' light, 0 one colour, 1 L1, 2 six directions
-            // [0].w: GI v2 on, its bounce light's factor; negative without the visibility test (CRYMT_GI_PROBEVIS=0)
-            f[3] = probesOn ? std::max(Gi().probeStrength, 1e-4f) * (Gi().probeVisibility ? 1.0f : -1.0f) : 0.0f;
+            // [0].w: GI v2 on, its bounce light's factor, + 100 when it gives the light only (method 2: the cones keep the
+            // occlusion); negative without the visibility test (CRYMT_GI_PROBEVIS=0)
+            f[3] = probesOn ? (std::max(Gi().probeStrength, 1e-4f) + (Gi().probes == 2 ? 100.0f : 0.0f)) * (Gi().probeVisibility ? 1.0f : -1.0f)
+                            : 0.0f;
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
         }
@@ -11687,7 +11697,7 @@ public:
         static const char* const cubeSize[] = {"64", "128", "256", "512"};
         static const char* const giNear[] = {"30 М (ДО 75)|30 M (TO 75)", "40 М (ДО 100)|40 M (TO 100)", "50 М (ДО 125)|50 M (TO 125)",
                                              "62 М (ДО 155)|62 M (TO 155)"};
-        static const char* const giMethod[] = {"КОНУСЫ|CONES", "ПРОБЫ (GI v2)|PROBES (GI v2)"};
+        static const char* const giMethod[] = {"КОНУСЫ|CONES", "ПРОБЫ (GI v2)|PROBES (GI v2)", "СВЕТ ПРОБ, ТЕНЬ КОНУСОВ|PROBE LIGHT, CONE SHADE"};
         static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
@@ -11729,8 +11739,8 @@ public:
              [] { const int v = g_giControl.giNear; return v >= 0 ? v : GiNearIndex(GiBase().terrainAoNear); },
              [] { return GiNearIndex(GiBase().terrainAoNear); }, [](int v) { g_giControl.giNear = v; }, true, nullptr},
             // GI v2 (CRYMT_GI_PROBES): probes traced through the voxels near the camera in place of the cones.
-            {0, "Метод GI|GI method", 0, 1, 1, true, giMethod, 0, nullptr,
-             [] { const int v = g_giControl.probes; return v < 0 ? GiBase().probes : std::min(v, 1); },
+            {0, "Метод GI|GI method", 0, 2, 1, true, giMethod, 0, nullptr,
+             [] { const int v = g_giControl.probes; return v < 0 ? GiBase().probes : std::min(v, 2); },
              [] { return GiBase().probes; }, [](int v) { g_giControl.probes = v; }, true, nullptr},
             {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
