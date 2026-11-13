@@ -43,6 +43,9 @@ $defs = [ordered]@{
     full_early = @{Gi = '1'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}} # main released before shadow prep
     nogi_early = @{Gi = '0'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}}
     full_nojitter = @{Gi = '1'; Env = @{CRYMT_DLSS_JITTER = '0'}} # DLAA without the camera jitter (water update test)
+    # Motion vector check (crymt_capture N in -Commands dumps N frames: colour, vectors, motion blur target, foliage
+    # mask; tools\prof\mv_check.py): no jitter, so a still frame pair differs only by motion and light.
+    mvseq = @{Gi = '1'; Env = @{CRYMT_MVSEQ = '1'; CRYMT_DLSS_JITTER = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}

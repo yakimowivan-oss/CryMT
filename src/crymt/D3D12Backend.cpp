@@ -622,7 +622,8 @@ struct CpuDescriptors
 };
 CpuDescriptors g_srvCpu, g_rtvCpu, g_dsvCpu, g_samplerCpu;
 D3D12_CPU_DESCRIPTOR_HANDLE g_nullSrv, g_defaultSampler;
-extern std::atomic<bool> g_sceneDumpWanted;
+extern std::atomic<int> g_sceneDumpFrames;
+bool MvSequence();
 std::atomic<bool> g_objectMotion{true}; // the engine's object velocities in DLSS's motion vectors (PgDn with the test keys) // the capture key's DLSS input/output dump (defined with the capture)
 
 // Shader-visible CBV/SRV/UAV descriptors, handed out in submission order (main lists only).
@@ -2221,15 +2222,16 @@ void motion(uint3 id : SV_DispatchThreadID)
         {
             // The engine fades its velocity with distance for the blur: (1 - distance / 200)^8; undone where it is kept.
             // Taken only where it is this pixel's: the distance the engine stored with it (z, of the far plane) matches
-            // the scene's here, the object is within ~60 m (fade > 0.05: beyond, 1 / fade multiplied the error), and the
-            // result stays under a tenth of the screen a frame. In vegetation the target held something else (on a
-            // still jungle view 64% of the pixels got over 2 px, 18% over 1000 px): DLSS fetched its history from far
-            // away, bright dots in shade and textures settling after a turn, gone without the object velocities.
+            // the scene's here, the object is within ~107 m (fade > 0.002: a 1 px move still has ~1% precision in the
+            // half float; beyond ~150 m it rounds to 0) and the result stays under a tenth of the screen a frame.
+            // History: until 2026-11-13 this read the target after the engine had reused it for a copy of the scene
+            // (KeepObjectMotion copies it now right after its pass); colours as velocities gave the "vegetation garbage"
+            // of 2026-11-05 (64% of a still jungle view over 2 px), and the 60 m limit (fade > 0.05) then.
             float4 v = srcTex[id.xy];
             float dist = v.z * motionParams.x;
             float fade = pow(1 - saturate(dist / 200), 8);
-            float2 obj = fade > 0.05 ? v.xy / fade : 0;
-            if (fade > 0.05 && abs(dist - V.z) < 0.03 * V.z + 0.05 && all(abs(obj) < 0.1) && all(obj == obj))
+            float2 obj = fade > 0.002 ? v.xy / fade : 0;
+            if (fade > 0.002 && abs(dist - V.z) < 0.03 * V.z + 0.05 && all(abs(obj) < 0.1) && all(obj == obj))
                 mv -= obj;
         }
     }
@@ -4377,7 +4379,7 @@ struct Stats
     double psoMs;
     uint64_t gpuTicks, gpuLists; // GPU time from the start to the end of each main list
     uint64_t depthToSrv, rtClears, dsClears;
-    uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, voxPasses, giLateReads, giOtherDepth;
+    uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, objectMotionCopies, voxPasses, giLateReads, giOtherDepth;
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
     uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
     uint64_t voxGeomStale; // replays skipped: the draw's list was done, its ring data possibly reused (VoxDraw::serial)
@@ -5631,6 +5633,7 @@ public:
     void STDMETHODCALLTYPE DrawIndexed(UINT count, UINT start, INT base) override
     {
         NoteWaterDraw();
+        KeepObjectMotion();
         if (Apply(true))
         {
             m_list->DrawIndexedInstanced(count, 1, start, base, 0); m_stats.vertices += count;
@@ -5645,6 +5648,7 @@ public:
     void STDMETHODCALLTYPE Draw(UINT count, UINT start) override
     {
         NoteWaterDraw();
+        KeepObjectMotion();
         if (Apply(false))
         {
             m_list->DrawInstanced(count, 1, start, 0); m_stats.vertices += count;
@@ -5659,6 +5663,7 @@ public:
     void STDMETHODCALLTYPE DrawIndexedInstanced(UINT count, UINT instances, UINT start, INT base, UINT startInstance) override
     {
         NoteWaterDraw();
+        KeepObjectMotion();
         if (Apply(true))
         {
             m_list->DrawIndexedInstanced(count, instances, start, base, startInstance); m_stats.vertices += count * instances;
@@ -5673,6 +5678,7 @@ public:
     void STDMETHODCALLTYPE DrawInstanced(UINT count, UINT instances, UINT start, UINT startInstance) override
     {
         NoteWaterDraw();
+        KeepObjectMotion();
         if (Apply(false))
         {
             m_list->DrawInstanced(count, instances, start, startInstance); m_stats.vertices += count * instances;
@@ -5828,12 +5834,77 @@ public:
         AfterDraw();
     }
 
+    // The engine's object motion blur target is reused soon after its pass: at the overview spot (19 motion blur draws a
+    // frame into their own RGBA16F target) the target held a copy of the scene colour by the time the scene was handed
+    // to DLSS, so RunMotion read colours as velocities (in 44% of the frames; its distance check threw most away, which
+    // also lost the real velocities - the "vegetation garbage" of 2026-11-05). The first draw, clear or copy after the
+    // pass (or the hand-over) copies the target into m_ombCopy, which RunMotion and the CRYMT_MVSEQ dumps read.
+    void KeepObjectMotion()
+    {
+        if (!m_ombPending || (m_vs && m_vs->motionBlur))
+            return;
+        m_ombPending = false;
+        TextureCore* src = m_ombTarget;
+        if (!src || !src->res || src->format != DXGI_FORMAT_R16G16B16A16_FLOAT || src->samples != 1 || src->dim != D3D10_RESOURCE_DIMENSION_TEXTURE2D)
+            return;
+        if (!m_ombCopy.res || m_ombCopy.width != src->width || m_ombCopy.height != src->height)
+        {
+            DeferRelease(m_ombCopy.res);
+            m_ombCopy.res = nullptr;
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = src->width;
+            d.Height = src->height;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d.SampleDesc.Count = 1;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_ombCopy.res))))
+            {
+                m_ombCopy.res = nullptr;
+                m_ombCopy.width = m_ombCopy.height = 0;
+                return;
+            }
+            m_ombCopy.dim = D3D10_RESOURCE_DIMENSION_TEXTURE2D;
+            m_ombCopy.width = src->width;
+            m_ombCopy.height = src->height;
+            m_ombCopy.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            m_ombCopy.samples = 1;
+            m_ombCopy.state = D3D12_RESOURCE_STATE_COPY_DEST;
+            Log("object motion: the motion blur target kept in a copy, %ux%u", src->width, src->height);
+        }
+        const D3D12_RESOURCE_STATES before = src->state;
+        Require(src, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Require(&m_ombCopy, D3D12_RESOURCE_STATE_COPY_DEST);
+        FlushBarriers();
+        m_list->CopyResource(m_ombCopy.res, src->res);
+        Require(src, before);
+        FlushBarriers();
+        m_ombCopyFrame = m_frame;
+        m_stats.objectMotionCopies++;
+    }
+
     void AfterDraw()
     {
         if (m_vs && m_vs->motionBlur && m_rtv[0])
         {
             m_ombTarget = static_cast<TextureCore*>(m_rtv[0]->info);
             m_ombFrame = m_frame;
+            m_ombPending = true;
+            // Diagnosis (2026-11-13: at the overview spot the "motion blur target" held the scene colour): the draws with
+            // MotionBlurData in the vertex shader this frame, by target and shaders.
+            if (m_ombDiagFrame != m_frame)
+            {
+                m_ombDiagFrame = m_frame;
+                m_ombDiagCount = 0;
+            }
+            if (m_ombDiagCount < 8)
+                m_ombDiag[m_ombDiagCount++] = {m_ombTarget, m_vs->contentHash, m_ps ? m_ps->contentHash : 0};
+            else
+                m_ombDiagCount++;
         }
         m_stats.draws++;
         if (m_engineCubeRes && m_rtv[0] && m_rtv[0]->resource == m_engineCubeRes)
@@ -5871,6 +5942,7 @@ public:
     // ---- clears, copies, updates
     void STDMETHODCALLTYPE ClearRenderTargetView(ID3D10RenderTargetView* view, const FLOAT color[4]) override
     {
+        KeepObjectMotion();
         auto* v = static_cast<Rtv12*>(view);
         if (!v)
             return;
@@ -5895,6 +5967,7 @@ public:
 
     void STDMETHODCALLTYPE CopyResource(ID3D10Resource* dst, ID3D10Resource* src) override
     {
+        KeepObjectMotion();
         if (!dst || !src)
             return;
         Buffer12* db = AsBuffer(dst);
@@ -5925,6 +5998,7 @@ public:
     void STDMETHODCALLTYPE CopySubresourceRegion(ID3D10Resource* dst, UINT dstSub, UINT x, UINT y, UINT z, ID3D10Resource* src, UINT srcSub,
                                                  const D3D10_BOX* box) override
     {
+        KeepObjectMotion();
         if (!dst || !src)
             return;
         Buffer12* db = AsBuffer(dst);
@@ -5951,6 +6025,7 @@ public:
 
     void STDMETHODCALLTYPE ResolveSubresource(ID3D10Resource* dst, UINT dstSub, ID3D10Resource* src, UINT srcSub, DXGI_FORMAT format) override
     {
+        KeepObjectMotion();
         TextureCore* dt = AsTexture(dst);
         TextureCore* st = AsTexture(src);
         if (!dt || !st)
@@ -10639,16 +10714,44 @@ public:
         const bool motion = RunMotion(*info, color, depth);
         const bool exposure = RunExposure(color, info->reset);
         const bool sanitized = RunSanitize(color);
-        const bool dumpScene = g_sceneDumpWanted.exchange(false);
+        int dumpsLeft = g_sceneDumpFrames.load();
+        while (dumpsLeft > 0 && !g_sceneDumpFrames.compare_exchange_weak(dumpsLeft, dumpsLeft - 1))
+        {
+        }
+        const bool dumpScene = dumpsLeft > 0;
         if (dumpScene)
         {
+            // One frame: next_dlss_in / next_mvec. A sequence (CRYMT_MVSEQ): mvNN_in, mvNN_mvec, mvNN_omb (the engine's motion
+            // blur target, raw), mvNN_foliage, NN counting the frames of this capture.
+            const bool seq = MvSequence();
+            const int index = seq ? m_sceneDumpIndex++ : 0;
+            char name[32];
+            const auto named = [&](const char* what) {
+                snprintf(name, sizeof(name), "mv%02d_%s", index, what);
+                return name;
+            };
             Require(color, D3D12_RESOURCE_STATE_COPY_SOURCE);
             FlushBarriers();
-            RecordDump(color->res, "next_dlss_in", 0);
+            RecordDump(color->res, seq ? named("in") : "next_dlss_in", 0);
             D3D12_RESOURCE_BARRIER b = Transition(m_dlssMvec, kSrvState, D3D12_RESOURCE_STATE_COPY_SOURCE);
             m_list->ResourceBarrier(1, &b);
-            RecordDump(m_dlssMvec, "next_mvec", 3);
+            RecordDump(m_dlssMvec, seq ? named("mvec") : "next_mvec", 3);
             m_barriers.push_back(Transition(m_dlssMvec, D3D12_RESOURCE_STATE_COPY_SOURCE, kSrvState));
+            if (seq)
+            {
+                if (m_ombCopyFrame == m_frame && m_ombCopy.res)
+                {
+                    Require(&m_ombCopy, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    FlushBarriers();
+                    RecordDump(m_ombCopy.res, named("omb"), 7);
+                }
+                if (m_foliageSrv && m_foliageFrame == m_frame && m_foliageSrv->info)
+                {
+                    Require(m_foliageSrv->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    FlushBarriers();
+                    RecordDump(m_foliageSrv->info->res, named("foliage"), 4);
+                }
+            }
         }
         FlushBarriers();
         const dlss::Images images{sanitized ? m_dlssIn : color->res, sanitized ? kSrvState : color->state, depth->res, depth->state, m_dlssMvec, kSrvState,
@@ -10895,7 +10998,11 @@ public:
                     fclose(f);
                 };
                 const auto byte = [](float v) { return static_cast<uint8_t>(std::min(std::max(v, 0.0f), 1.0f) * 255.0f); };
-                if (d.kind == 0)
+                if (d.kind == 7)
+                {
+                    // raw only (the motion blur target of a motion vector sequence)
+                }
+                else if (d.kind == 0)
                     ppm("", [&](UINT x, UINT y, uint8_t* o) {
                         for (int c = 0; c < 3; c++)
                         {
@@ -11271,7 +11378,21 @@ public:
             PollFence();
             m_srvRing.Reclaim();
         }
-        TextureCore* velocity = m_ombFrame == m_frame && g_objectMotion ? m_ombTarget : nullptr;
+        KeepObjectMotion(); // a pass with nothing drawn after it
+        TextureCore* velocity = m_ombCopyFrame == m_frame && g_objectMotion ? &m_ombCopy : nullptr;
+        if (velocity && m_ombDiagFrame == m_frame && m_frame > 1500 && m_ombDiagLogged < 1)
+        {
+            m_ombDiagLogged++;
+            Log("motion blur draws, frame %llu: %u (scene colour %p res %p %ux%u)", static_cast<unsigned long long>(m_frame), m_ombDiagCount,
+                static_cast<void*>(color), static_cast<void*>(color->res), color->width, color->height);
+            for (uint32_t i = 0; i < std::min(m_ombDiagCount, 8u); i++)
+            {
+                const OmbDiag& o = m_ombDiag[i];
+                Log("  target %p res %p %ux%u format %d%s, vs %016llx ps %016llx", static_cast<void*>(o.target), static_cast<void*>(o.target->res),
+                    o.target->width, o.target->height, static_cast<int>(o.target->format), o.target->res == color->res ? " (the scene colour)" : "",
+                    static_cast<unsigned long long>(o.vs), static_cast<unsigned long long>(o.ps));
+            }
+        }
         if (velocity && (velocity == color || velocity->width != color->width || velocity->height != color->height ||
                          velocity->format != DXGI_FORMAT_R16G16B16A16_FLOAT || velocity->samples != 1))
             velocity = nullptr;
@@ -11561,6 +11682,17 @@ private:
     // The object motion blur pass's target this frame (r_MotionBlur 3, Very High): RGBA16F, full size, drawn before
     // the scene is done: (now - before) * a distance fade in screen units, distance / far, object id.
     TextureCore* m_ombTarget = nullptr;
+    TextureCore m_ombCopy{};          // KeepObjectMotion: the motion blur target right after its pass
+    uint64_t m_ombCopyFrame = ~0ull;
+    bool m_ombPending = false;
+    struct OmbDiag
+    {
+        TextureCore* target;
+        uint64_t vs, ps;
+    };
+    OmbDiag m_ombDiag[8] = {};
+    uint32_t m_ombDiagCount = 0, m_ombDiagLogged = 0;
+    uint64_t m_ombDiagFrame = ~0ull;
     uint64_t m_ombFrame = ~0ull;
     float m_mvPrevView[16] = {}, m_mvPrevProj[16] = {}, m_mvPrevToWorld[16] = {}; // the last motion pass's camera
     bool m_mvHavePrev = false;
@@ -11645,6 +11777,7 @@ private:
     size_t m_activeQueries = 0;              // occlusion queries begun and not ended
     ID3D12Resource* m_dlssOut = nullptr;
     ID3D12Resource* m_dlssMvec = nullptr;
+    int m_sceneDumpIndex = 0; // the frame number of a motion vector sequence dump (CRYMT_MVSEQ)
     UINT m_dlssWidth = 0, m_dlssHeight = 0;
     DXGI_FORMAT m_dlssFormat = DXGI_FORMAT_UNKNOWN;
     ID3D12QueryHeap* m_listStampHeap = nullptr;
@@ -13800,7 +13933,17 @@ Capture g_capture;
 // they go to logs\play\key_MMDD_HHMMSS_w1_c<n>.ppm. Ignored while a capture runs.
 std::atomic<int> g_captureKeyFrames{0};
 std::atomic<int> g_captureKeyFlags{0}; // what was on, for the name: 1 GI, 2 the DLAA jitter, 4 object velocities
-std::atomic<bool> g_sceneDumpWanted{false}; // the next scene hand-over dumps DLSS's input and output (capture key)
+// Scene hand-overs left to dump DLSS's input and output (the capture key: 1; with CRYMT_MVSEQ=1 every captured frame, for
+// the motion vector check tools\prof\mv_check.py: colour, vectors, the engine's object velocities, the foliage mask).
+std::atomic<int> g_sceneDumpFrames{0};
+bool MvSequence()
+{
+    static const bool on = [] {
+        wchar_t v[8] = {};
+        return GetEnvironmentVariableW(L"CRYMT_MVSEQ", v, 8) && _wtoi(v) != 0;
+    }();
+    return on;
+}
 
 // Milliseconds since the process started (capture windows line up with CryMT's comparison schedule).
 DWORD ProcessMilliseconds()
@@ -13991,7 +14134,8 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
         m_dumpTag = g_capture.tag;
         m_giDumpWanted = true;
         m_engineCubeDumpWanted = true;
-        g_sceneDumpWanted = true;
+        m_sceneDumpIndex = 0;
+        g_sceneDumpFrames = MvSequence() ? std::max(keyFrames - 1, 1) : 1; // the scenes before the capture's last present
     }
     if (g_capture.window < g_capture.starts.size() &&
         (g_capture.byFrame ? ::CryMTWorldFrame() : ProcessMilliseconds()) >= g_capture.starts[g_capture.window])
@@ -14761,6 +14905,7 @@ void Dx12WriteStats(FILE* f, double frames)
                 g_pipes.queue.size(), static_cast<unsigned long long>(g_pipes.deferred), static_cast<unsigned long long>(g_pipes.deferredDraws));
     }
     dlss::WriteStats(f);
+    fprintf(f, "  object motion: the motion blur target copied after its pass %llu times\n", static_cast<unsigned long long>(s.objectMotionCopies));
     fprintf(f, "  scenes %llu, DLSS applied %llu, motion vectors %llu (with object velocities %llu), GI %llu, voxel updates %llu, GI reads after the scene %llu, with another depth or target %llu\n", static_cast<unsigned long long>(s.scenes),
             static_cast<unsigned long long>(s.dlssFrames), static_cast<unsigned long long>(s.motionPasses), static_cast<unsigned long long>(s.objectMotionPasses),
             static_cast<unsigned long long>(s.giPasses), static_cast<unsigned long long>(s.voxPasses), static_cast<unsigned long long>(s.giLateReads),
