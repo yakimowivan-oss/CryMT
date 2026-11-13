@@ -1320,6 +1320,40 @@ void WriteMotionBlurShutter(uintptr_t params, int count, void* dst, int stage, u
         return;
     ResolveTypes();
     g_mbCalls++;
+    // CRYMT_OMBLOG=1 (diagnosis, 2026-11-13: falling barrels' exact vectors 7-40% too long): per object drawn by the
+    // pass, once a frame, the renderer's frame id and the render object's now (+0x14) and previous (+0x54) places, to
+    // logs\mt\crymt_omb.txt (the first 3000 lines).
+    static const bool ombLog = GetEnvironmentVariableW(L"CRYMT_OMBLOG", nullptr, 0) != 0;
+    if (ombLog)
+    {
+        static FILE* log = nullptr;
+        static int lines = 0;
+        static uintptr_t lastObj = 0;
+        static int lastFrame = -1;
+        const uintptr_t obj = *reinterpret_cast<const uintptr_t*>(r + kRdCurObject);
+        const int frame = *reinterpret_cast<const int*>(r + kFrameIdAllOffset);
+        if (!log && lines == 0)
+            fopen_s(&log, CryMTLog("crymt_omb.txt").c_str(), "w");
+        const float* o = obj ? reinterpret_cast<const float*>(obj) : nullptr;
+        const float mx = o ? o[0x20 / 4] - o[0x60 / 4] : 0.0f, my = o ? o[0x30 / 4] - o[0x70 / 4] : 0.0f, mz = o ? o[0x40 / 4] - o[0x80 / 4] : 0.0f;
+        const float* cam = reinterpret_cast<const float*>(r + kRdRelativeOrigin);
+        const float cx = o ? o[0x20 / 4] - cam[0] : 0.0f, cy = o ? o[0x30 / 4] - cam[1] : 0.0f, cz = o ? o[0x40 / 4] - cam[2] : 0.0f;
+        const bool moved = mx * mx + my * my + mz * mz > 1e-4f && cx * cx + cy * cy + cz * cz < 400.0f; // within 20 m
+        if (log && obj && moved && lines < 3000 && (obj != lastObj || frame != lastFrame))
+        {
+            // 3x4 rows from +0x14 (now) and +0x54 (previous): translation at +0x20, +0x30, +0x40 / +0x60, +0x70, +0x80
+            fprintf(log, "%d obj %p flags %08x now %.4f %.4f %.4f prev %.4f %.4f %.4f f %.4f\n", frame, reinterpret_cast<void*>(obj),
+                    *reinterpret_cast<const uint32_t*>(r + 0xAEC), o[0x20 / 4], o[0x30 / 4], o[0x40 / 4], o[0x60 / 4], o[0x70 / 4], o[0x80 / 4],
+                    MotionBlurShutterF());
+            lines++;
+            if (lines == 3000)
+                fclose(log), log = nullptr;
+            else if (lines % 50 == 0)
+                fflush(log);
+        }
+        lastObj = obj;
+        lastFrame = frame;
+    }
     const float f = MotionBlurShutterF();
     g_mbLastF.store(f, std::memory_order_relaxed);
     if (g_tFogContrib < 0)

@@ -66,7 +66,16 @@ def main():
     if len(frames) < 2:
         print('fewer than 2 frames for', tag)
         return
-    print(f'{tag}: {len(frames)} frames, threshold {thr}')
+    # The jitter per frame (<tag>_mvinfo.txt, captures with the jitter on): the input picture is moved by +jitter, so the
+    # previous frame is taken at x + mv - (jitter now - jitter before).
+    jit = {}
+    info_path = os.path.join(folder, f'{tag}_mvinfo.txt')
+    if os.path.exists(info_path):
+        for line in open(info_path):
+            t = line.split()
+            if len(t) > 3 and t[1] == 'jitter':
+                jit[int(t[0])] = (float(t[2]), float(t[3]))
+    print(f'{tag}: {len(frames)} frames, threshold {thr}{", jitter compensated" if jit else ""}')
     print('pair  class      pixels%   changed%  missed%  fixed%   mean err  mean |mv| px')
     totals = {}
     last = None
@@ -76,7 +85,8 @@ def main():
         mv = read_f16(os.path.join(folder, f'{tag}_mv{n:02d}_mvec.f16'), 2)
         h, w = cur.shape[:2]
         ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-        warped = bilinear(prev, xs + mv[..., 0] * w, ys + mv[..., 1] * h)
+        dj = np.array(jit.get(n, (0, 0))) - np.array(jit.get(n - 1, (0, 0)))
+        warped = bilinear(prev, xs + mv[..., 0] * w - dj[0], ys + mv[..., 1] * h - dj[1])
         err = np.abs(cur - warped).mean(axis=2)
         err0 = np.abs(cur - prev).mean(axis=2)
         fol_path = os.path.join(folder, f'{tag}_mv{n:02d}_foliage.pgm')

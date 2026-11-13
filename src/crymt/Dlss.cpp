@@ -48,6 +48,7 @@ IDXGIFactory4* g_factoryProxy;
 uint32_t g_optionsWidth, g_optionsHeight;
 uint64_t g_evaluations, g_failures, g_resets;
 sl::float4x4 g_prevViewToWorld, g_prevProj;
+float g_prevView[16]; // the previous frame's view (the cut test by the turn)
 bool g_havePrev;
 
 void Logf(const char* format, ...)
@@ -329,7 +330,12 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
         viewToWorld[3] = sl::float4(scene.camPos[0], scene.camPos[1], scene.camPos[2], 1.0f);
     // A camera cut (teleport, level start, cutscene) has no usable history.
     const float dx = viewToWorld[3].x - g_prevViewToWorld[3].x, dy = viewToWorld[3].y - g_prevViewToWorld[3].y, dz = viewToWorld[3].z - g_prevViewToWorld[3].z;
-    const bool reset = scene.reset || !g_havePrev || dx * dx + dy * dy + dz * dz > 100.0f;
+    // A cut also when the camera turned more than 45 degrees in one frame (a cutscene's cut that only turns).
+    double turn = 0.0;
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++)
+            turn += static_cast<double>(scene.view[r * 4 + k]) * g_prevView[r * 4 + k];
+    const bool reset = scene.reset || !g_havePrev || dx * dx + dy * dy + dz * dz > 100.0f || (turn - 1.0) / 2.0 < 0.7071;
     sl::Constants c{};
     c.cameraViewToClip = proj;
     c.clipToCameraView = Invert(proj);
@@ -369,6 +375,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
     }
     g_prevViewToWorld = viewToWorld;
     g_prevProj = proj;
+    memcpy(g_prevView, scene.view, sizeof(g_prevView));
     g_havePrev = true;
     if (reset)
         g_resets++;

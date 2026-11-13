@@ -5599,7 +5599,23 @@ void MotionBlurGates()
             }
         }
         g_mbGateOn = true;
-        FocusLog("object motion at any preset: the motion blur pass's tests read CryMT's value (r_MotionBlur, at least 3)");
+        // Entities (CRenderProxy, CryEntitySystem +0x74BEA): SRendParams +0x119 (the object's motion blur amount) is 0x80
+        // only when r_MotionBlur > 1, so at High the first-person weapon and other entities were never drawn by the pass
+        // (characters get theirs through CryAnimation). "cmp eax, 1" -> "cmp eax, -1": always.
+        const auto ent = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"CryEntitySystem.dll"));
+        auto* cmp = ent ? reinterpret_cast<uint8_t*>(ent + 0x74C10) : nullptr;
+        bool entPatched = false;
+        DWORD old = 0;
+        if (cmp && cmp[0] == 0x83 && cmp[1] == 0xF8 && cmp[2] == 0x01 && cmp[3] == 0x0F && cmp[4] == 0x4F &&
+            VirtualProtect(cmp + 2, 1, PAGE_EXECUTE_READWRITE, &old))
+        {
+            cmp[2] = 0xFF;
+            VirtualProtect(cmp + 2, 1, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), cmp, 5);
+            entPatched = true;
+        }
+        FocusLog("object motion at any preset: the motion blur pass's tests read CryMT's value (r_MotionBlur, at least 3); "
+                 "entities flagged at any value: %s", entPatched ? "yes" : "no (unexpected bytes)");
     }
     if (!g_mbGateOn)
         return;

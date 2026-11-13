@@ -3268,6 +3268,16 @@ void ReprojDouble(const float* view, const float* camPos, const float* prevView,
         }
 }
 
+// The cosine of the camera's turn between two views (their rotations' Frobenius product: trace(R^T R') = 1 + 2 cos).
+double ViewTurnCos(const float* view, const float* prevView)
+{
+    double t = 0.0;
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            t += static_cast<double>(view[r * 4 + c]) * prevView[r * 4 + c];
+    return (t - 1.0) / 2.0;
+}
+
 // The camera's move between two frames (metres), for the cut test.
 double CameraJump(const float* view, const float* camPos, const float* prevView, const float* prevCamPos)
 {
@@ -11792,7 +11802,10 @@ public:
         // This view to the world, then the previous view and projection; a cut (or the first frame) has no motion.
         float toWorld[16], reproj[16];
         RigidInverse(info.view, toWorld);
-        if (info.reset || !m_mvHavePrev || CameraJump(info.view, info.camPos, m_mvPrevView, m_mvPrevCamPos) > 10.0)
+        // A cut: more than 10 m or a turn of more than 45 degrees in one frame (2026-11-13: a cutscene cut that only turns the
+        // camera gave vectors of thousands of pixels).
+        if (info.reset || !m_mvHavePrev || CameraJump(info.view, info.camPos, m_mvPrevView, m_mvPrevCamPos) > 10.0 ||
+            ViewTurnCos(info.view, m_mvPrevView) < 0.7071)
         {
             memcpy(m_mvPrevView, info.view, sizeof(m_mvPrevView));
             memcpy(m_mvPrevProj, info.proj, sizeof(m_mvPrevProj));
