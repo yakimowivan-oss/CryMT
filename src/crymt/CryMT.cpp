@@ -615,6 +615,21 @@ EngineLightState ReadEngineLights()
     return s;
 }
 uint64_t g_cubeLightsMoved, g_cubeLightsCounted, g_cubeCamsMoved, g_sceneAfterCubeDiff;
+// ROOT CAUSE of the 0x1B crashes (game 06:26 and 06:46, editor 03:02 / 04:15): the cube render's RenderWorld calls the
+// real EF_ADDDlight on the render thread, which writes the light's id in the cube's level-2 list (+0 of the CDLight)
+// into lights main's octree nodes still list. Main's next pass resets ids only for the lights it processes, so an
+// object's shadow-frustum mask got bit "light 1" (log 06:46: main's level-1 list and the 3D engine's list held only the
+// sun, the cube's level-2 list 2 lights) and GetShadowFrustumsList read +0x90 of EF_Query 0x1B's null. The gate now
+// records each light's id before the cube's EF_ADDDlight, and EnvCubeUpdate puts them back once the face is drawn.
+struct CubeLightId
+{
+    int* light;
+    int id;
+};
+CubeLightId g_cubeLightIds[64];
+int g_cubeLightIdCount;
+bool g_cubeRendering; // render thread, inside the cube's render call
+uint64_t g_cubeIdsRestored, g_cubeIdsOutside, g_cubeIdsOverflow;
 EngineLightState g_cubeLightsAfter;
 std::atomic<bool> g_cubeLightsAfterSet;
 uint64_t g_lateCallbacks;
@@ -1268,6 +1283,9 @@ void WriteStats()
             fprintf(f, "engine env cube: renders that changed the renderer's light list, level 0 %llu, 1 %llu, 2 %llu, 3 %llu\n",
                     static_cast<unsigned long long>(g_envCubeLightLists[0]), static_cast<unsigned long long>(g_envCubeLightLists[1]),
                     static_cast<unsigned long long>(g_envCubeLightLists[2]), static_cast<unsigned long long>(g_envCubeLightLists[3]));
+        fprintf(f, "engine cube: light ids put back after its EF_ADDDlight %llu (lights outside the 3D engine's list %llu, overflow %llu)\n",
+                static_cast<unsigned long long>(g_cubeIdsRestored), static_cast<unsigned long long>(g_cubeIdsOutside),
+                static_cast<unsigned long long>(g_cubeIdsOverflow));
         fprintf(f, "engine cube and the 3D engine's lights: list moved %llu, counts changed %llu, light cameras moved %llu; main's scene found them changed since %llu\n",
                 static_cast<unsigned long long>(g_cubeLightsMoved), static_cast<unsigned long long>(g_cubeLightsCounted),
                 static_cast<unsigned long long>(g_cubeCamsMoved), static_cast<unsigned long long>(g_sceneAfterCubeDiff));
@@ -4729,6 +4747,16 @@ extern "C" uintptr_t GateC(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
         f->rax = light;
         return kHandled;
     }
+    if (idx == kAddDLight && g_cubeRendering && f->rdx && GetCurrentThreadId() == g_rtTid)
+    {
+        if (g_cubeLightIdCount < static_cast<int>(sizeof(g_cubeLightIds) / sizeof(g_cubeLightIds[0])))
+        {
+            auto* light = reinterpret_cast<int*>(f->rdx);
+            g_cubeLightIds[g_cubeLightIdCount++] = {light, *light};
+        }
+        else
+            g_cubeIdsOverflow++;
+    }
     if (GetCurrentThreadId() != g_mainThread || g_depth != 0)
         return orig;
     const uintptr_t ret = rbp[1];
@@ -5983,7 +6011,35 @@ void EnvCubeUpdate()
     // end, replacing the old one while the cube is new here (fresh).
     D3DLayerPassName(facesDrawn < 6 ? "CryMT engine cube fresh" : "CryMT engine cube");
     const EngineLightState lightsIn = ReadEngineLights();
+    g_cubeLightIdCount = 0;
+    g_cubeRendering = true;
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, drawFlags, ~0ull, 0);
+    g_cubeRendering = false;
+    // The face is drawn: the lights' ids as main's pass left them (in reverse, a light added twice ends as it was).
+    for (int i = g_cubeLightIdCount - 1; i >= 0; i--)
+    {
+        const CubeLightId& r = g_cubeLightIds[i];
+        if (*r.light != r.id)
+            g_cubeIdsRestored++;
+        const auto addr = reinterpret_cast<uintptr_t>(r.light);
+        const bool inList = lightsIn.list && addr >= lightsIn.list && addr < lightsIn.list + static_cast<uint64_t>(lightsIn.count) * 0x258;
+        if (!inList)
+        {
+            g_cubeIdsOutside++;
+            static int logged;
+            if (logged < 4)
+            {
+                logged++;
+                const auto* l = reinterpret_cast<const uint8_t*>(r.light);
+                const float* p = reinterpret_cast<const float*>(l + 4);
+                FocusLog("frame %llu: engine cube added a light outside the 3D engine's list (%p, list %llx of %d): id %d -> %d, flags %x, at %.1f %.1f %.1f, "
+                         "radius %.2f, owner %p", static_cast<unsigned long long>(g_frame), static_cast<const void*>(l),
+                         static_cast<unsigned long long>(lightsIn.list), lightsIn.count, r.id, *r.light, *reinterpret_cast<const uint32_t*>(l + 0x1D4),
+                         p[0], p[1], p[2], *reinterpret_cast<const float*>(l + 0x50), *reinterpret_cast<void* const*>(l + 0x90));
+            }
+        }
+        *r.light = r.id;
+    }
     const EngineLightState lightsOut = ReadEngineLights();
     {
         const bool moved = lightsOut.list != lightsIn.list, counted = lightsOut.count != lightsIn.count || lightsOut.total != lightsIn.total,
