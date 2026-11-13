@@ -628,18 +628,21 @@ struct CubeLightId
 };
 CubeLightId g_cubeLightIds[64];
 int g_cubeLightIdCount;
-// The cube's own frame id (CRYMT_ENVCUBE_OWNFRAME, 1 the default; 2026-11-13 after the camera-index crash of 06:56 in
+// The cube's own frame id (CRYMT_ENVCUBE_OWNFRAME=1; 2026-11-13 after the camera-index crash of 06:56 in
 // the game). The cube did not move the renderer's id that counts recursive renders (GetFrameID(true), +0x28F68), so its
 // RenderWorld ran under the id main's frame had just used: the octree nodes' light lists (FUN_3019C5D0 / FUN_3019D180
 // rebuild them when node +0xE0 differs from the id at 0x3022B930) were main's, and the cube appended its registrations
 // to them, and FUN_301020B0 added main's lights to the cube's level-2 list on the fly (0x30102592). Now the id moves by
 // one before each face, so the cube builds its own lists; main's copy (g_shadowFrameIdAll) catches up after the flush's
 // engine callbacks (HookEndEf3D), so main's next frame is above it.
+// OFF by default since 2026-11-13 ~21:00: with it main's frame lost every lamp inside VisAreas (mine, CamPos 2387 2356:
+// 3 lamps 3-11 m away in the frame's list with 0, none with 1; spot_run -Map mine, CRYMT_LIGHTLOG / CRYMT_VISDUMP).
+// Mechanism not found; the camera-index crash it was meant for never reproduced with either value.
 int EnvCubeOwnFrame()
 {
     static const int on = [] {
         char v[8] = {};
-        return GetEnvironmentVariableA("CRYMT_ENVCUBE_OWNFRAME", v, sizeof(v)) ? atoi(v) : 1;
+        return GetEnvironmentVariableA("CRYMT_ENVCUBE_OWNFRAME", v, sizeof(v)) ? atoi(v) : 0;
     }();
     return on;
 }

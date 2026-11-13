@@ -3,7 +3,8 @@ param([string[]]$Variants = 'full,nogi,geomcache,nogeom,nozown', [string]$Pre = 
       [string]$GotoPos = '1103 1390 137', [string]$Pos = '{x=1103,y=1390,z=137}', [string]$Angles = '{x=-0.0873,y=0,z=-1.117}',
       [string]$Tag = 'spot', [string]$Capture = '', [string]$Commands = '', [switch]$Sample, [int]$SampleSec = 15,
       [string]$Mode = 'dlaa', # -Mode mt: the "MT only" preset (the stock D3D10 renderer), dx12, dlaa
-      [string]$Exec = 'girecord') # -Exec giplay_rooms: the user's girooms demo (VisArea rooms, lamps; quits at its end)
+      [string]$Exec = 'girecord', # -Exec giplay_rooms: the user's girooms demo (VisArea rooms, lamps; quits at its end)
+      [string]$Map = 'village') # -Map mine: the level loaded
 # Frame times at one place on village (default: the user's spot of 2026-11-12, CamPos 1103 1390 139, Angl -5 0 -64 at
 # 7:00, flying: the ground there is under water at ~98), about 50 s a run. CryMT's test commands (crymt_wait/
 # crymt_waitlevel pace them): once the level runs, the player's physics off (holds it in the air; SimulateOnAction
@@ -52,6 +53,10 @@ $defs = [ordered]@{
     mvseqj_flip = @{Gi = '1'; Env = @{CRYMT_MVSEQ = '1'; CRYMT_DLSS_JITTER = '--'}}
     # The engine cube under main's frame id as before 2026-11-13 07:10 (crash A/B).
     cube_oldframe = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_OWNFRAME = '0'}}
+    # The cube's own frame id (default 1 from 07:05 to ~21:00 on 2026-11-13: it lost the lamps in VisAreas).
+    cube_ownframe = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_OWNFRAME = '1'}}
+    # No engine cube at all: water planar, materials the game's maps (a CRYMT_ENVMAP line in CryMT.ini overrides this).
+    nocube = @{Gi = '1'; Env = @{CRYMT_WATERCUBE = '0'; CRYMT_ENVMAP = 'game'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}
@@ -74,7 +79,8 @@ foreach ($v in ($Variants | ForEach-Object { $_ -split ',' })) {
     foreach ($e in $d.Env.GetEnumerator()) { $vars[$e.Key] = $e.Value }
     foreach ($e in $vars.GetEnumerator()) { Set-Item "Env:$($e.Key)" $e.Value }
     $focusLines = if (Test-Path $focus) { (Get-Content $focus).Count } else { 0 }
-    $gameArgs = "-dx10 -DEVMODE -crymt=$Mode -crymt-gi=$($d.Gi) +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map village +exec $Exec"
+    $gameArgs = "-dx10 -DEVMODE -crymt=$Mode -crymt-gi=$($d.Gi) +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map $Map +exec $Exec"
+    foreach ($f in 'crymt_vis.txt', 'crymt_lightlog.txt') { Remove-Item "$g\CryMT\logs\mt\$f" -ErrorAction SilentlyContinue } # no stale copies
     $p = Start-Process "$g\Bin64\Crysis.exe" -ArgumentList $gameArgs -WorkingDirectory "$g\Bin64" -PassThru
     if ($Sample) {
         $t0 = Get-Date
@@ -86,7 +92,7 @@ foreach ($v in ($Variants | ForEach-Object { $_ -split ',' })) {
     }
     if (-not $p.WaitForExit((180 + $Settle + $Measure) * 1000)) { Stop-Process -Id $p.Id -Force; "$v force-stopped" }
     Start-Sleep -Seconds 2
-    foreach ($f in 'crymt_frames.txt', 'crymt_detail.txt', 'd3d10_census.txt', 'crymt_focus.txt', 'crymt_stats.txt') {
+    foreach ($f in 'crymt_frames.txt', 'crymt_detail.txt', 'd3d10_census.txt', 'crymt_focus.txt', 'crymt_stats.txt', 'crymt_vis.txt', 'crymt_lightlog.txt') {
         Copy-Item "$g\CryMT\logs\mt\$f" "$out\${Tag}_${v}_$f" -Force -ErrorAction SilentlyContinue
     }
     if ($Sample) { Copy-Item "$g\CryMT\logs\mt\crymt_frames.txt" "$out\${Tag}_$v.frames.txt" -Force -ErrorAction SilentlyContinue }
