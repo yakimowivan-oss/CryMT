@@ -1406,6 +1406,10 @@ Texture3D<float4> dirTex2 : register(t9);
 Texture3D<float4> dirTex3 : register(t10);
 Buffer<float4> visAreas : register(t11); // [0].x count; per area 10: x, y box, (z min, z max, points, 0), 16 points (x, y pairs)
 Texture3D<float> roofTex : register(t12); // cover above per cell of level 0 at half its resolution (RoofAt)
+Texture3D<float4> l1Tex : register(t13);  // the levels' light direction g (CRYMT_GI_DIRLIGHT 1, visAreas[0].z): out towards w
+Texture3D<float4> l1Tex1 : register(t14); // the colour times 1 + g.w
+Texture3D<float4> l1Tex2 : register(t15);
+Texture3D<float4> l1Tex3 : register(t16);
 
 // The VisArea near the camera that holds P (the rooms the level marks as indoors; with a margin of 0.3 m, so walls on
 // their border count), else -1.
@@ -1524,6 +1528,18 @@ float3 SampleDir(int level, float3 X, float mip)
     return dirTex3.SampleLevel(linearWrap, uvw, mip - 1).xyz;
 }
 
+float3 SampleL1(int level, float3 X, float mip)
+{
+    float3 uvw = X / (voxParams.x * (1 << level) * voxGrid.w);
+    if (level == 0)
+        return l1Tex.SampleLevel(linearWrap, uvw, mip).xyz;
+    if (level == 1)
+        return l1Tex1.SampleLevel(linearWrap, uvw, mip).xyz;
+    if (level == 2)
+        return l1Tex2.SampleLevel(linearWrap, uvw, mip).xyz;
+    return l1Tex3.SampleLevel(linearWrap, uvw, mip).xyz;
+}
+
 float4 SampleGrid(int level, float3 X, float mip)
 {
     float3 uvw = X / (voxParams.x * (1 << level) * voxGrid.w);
@@ -1583,6 +1599,14 @@ float4 ConeTrace(float3 O, float3 dir, float halfTan, float start, float reach, 
             if (((uint)options & 64) != 0)
                 w.a = dot(dir * dir * axes, SampleDir(level + 1, X, mip1));
             v = lerp(w, v, edge);
+        }
+        // CRYMT_GI_DIRLIGHT 1: the light the cells send back along the cone (out towards -dir): colour x (1 - g.dir).
+        if (visAreas[0].z > 0.5)
+        {
+            float3 gl = SampleL1(level, X, mip);
+            if (edge < 1)
+                gl = lerp(SampleL1(level + 1, X, clamp(lod - level - 1, 1, 4)), gl, edge);
+            v.rgb *= max(1 - dot(gl, dir), 0);
         }
         float above = plane ? saturate((dot(X - Ps, Ns) - diameter * 0.5) / (diameter * 0.5)) : 1;
         light += (1 - blocked) * v.rgb * above * RoomWeight(X, diameter * 0.5);
@@ -2678,7 +2702,7 @@ constexpr UINT kVoxConstants = 60;
 constexpr int kVoxN = 128;
 constexpr UINT kVoxMips = 5; // 128 .. 8
 constexpr int kVoxLevels = 4;  // cells of voxelSize (0.25 m), 2, 4 and 8 times that: 32, 64, 128 and 256 m around the camera
-constexpr UINT kVoxTable = 9;  // descriptors per table: t0..t2, u0..u5
+constexpr UINT kVoxTable = 11; // descriptors per table: t0..t2, u0..u7 (u6/u7 the light direction, CRYMT_GI_DIRLIGHT)
 const char* const kVoxShader = R"(
 cbuffer VoxConstants : register(b0)
 {
@@ -2719,6 +2743,13 @@ SamplerState linearClamp : register(s1);
 RWTexture3D<unorm float4> dirSrc : register(u3); // downsample: the per-axis opacity, the mip below (grid mip 2 and up)
 RWTexture3D<unorm float4> dirDst : register(u4); // and the one written
 RWTexture3D<unorm float> roofOut : register(u5);  // roof: cover above per cell of level 0 at half its resolution
+// The cells' light direction (CRYMT_GI_DIRLIGHT 1, voxFlags bit 0): g, |g| <= 1; the light going out towards w is the
+// colour times 1 + g.w (a thin wall lit outside: the colour the mean of both sides, g pointing out). Downsample: u6 the
+// mip below, u7 the mip written.
+RWTexture3D<snorm float4> l1Grid : register(u6);
+RWTexture3D<snorm float4> l1Dst : register(u7);
+cbuffer VoxFlags : register(b2) { uint voxFlags; };
+float Luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 static const float kWeaponDepth = 0.1;
 static const float kColourTrust = 48; // metres: screen colour taken at full weight up to here (update)
@@ -2752,6 +2783,25 @@ bool WeaponAt(float2 puv)
     return d < kWeaponDepth;
 }
 
+// CRYMT_GI_DIRLIGHT 1: the screen's colour c is the light the cell sends out towards the camera's side of its surface
+// (nView, view space): that side moves to it, the other side keeps its light (a cell seen for the first time: dark,
+// unknown); the colour becomes the two sides' mean and g their difference along the normal over their sum (the rest of g
+// fades). A wall seen from inside keeps the sun its outer side got.
+void ScreenL1(uint3 id, inout float4 v, float3 nView, float3 c, float trust)
+{
+    float3 n = normalize(float3(dot(nView, toWorldX.xyz), dot(nView, toWorldY.xyz), dot(nView, toWorldZ.xyz)));
+    float3 g = l1Grid[id].xyz;
+    float gn = dot(g, n);
+    bool fresh = v.a <= 0.01;
+    float3 front = fresh ? c * trust : lerp(v.rgb * (1 + gn), c, 0.25 * trust);
+    float3 back = fresh ? 0 : v.rgb * max(1 - gn, 0);
+    v.rgb = 0.5 * (front + back);
+    float lf = Luma(front), lb = Luma(back);
+    float3 gNew = n * ((lf - lb) / max(lf + lb, 1e-4)) + (g - n * gn) * 0.75;
+    float len = length(gNew);
+    l1Grid[id] = float4(len > 1 ? gNew / len : gNew, 0);
+}
+
 [numthreads(4, 4, 4)]
 void update(uint3 id : SV_DispatchThreadID)
 {
@@ -2763,7 +2813,11 @@ void update(uint3 id : SV_DispatchThreadID)
     float4 v = voxels[id];
     bool entered = any(cell < pg) || any(cell >= pg + n);
     if (entered)
+    {
         v = 0; // entered the grid now: nothing known
+        if (voxFlags & 1)
+            l1Grid[id] = 0;
+    }
     bool track = prevGridMin.w > 0; // the geometry's levels keep which cells the screen coloured
     if (track && entered)
     {
@@ -2818,6 +2872,7 @@ void update(uint3 id : SV_DispatchThreadID)
                 // cells that came and went as the camera moved (the user). Near the surface it is measured along the
                 // surface's normal (from the depth of the neighbouring pixels); far in front along the ray as before.
                 float side = dist - surface; // < 0 in front of the surface, > 0 behind it
+                float3 surfN = 0;            // the surface's normal there (view space, towards the camera), if found
                 if (d < 0.99999 && side > -(tolerance + 24 * voxelSize) && side < tolerance + 3 * voxelSize)
                 {
                     float2 px = 1 / fullSize;
@@ -2831,6 +2886,7 @@ void update(uint3 id : SV_DispatchThreadID)
                         if (dot(N, P0) > 0)
                             N = -N; // towards the camera
                         side = -dot(V - P0, N);
+                        surfN = N;
                     }
                 }
                 if (side < -tolerance)
@@ -2865,7 +2921,10 @@ void update(uint3 id : SV_DispatchThreadID)
                         // coarse levels lit a band at their edge until the camera came near): trusted fully up to
                         // kColourTrust metres, less beyond; a first sight from afar is dimmed likewise.
                         float trust = saturate(kColourTrust / dist);
-                        v.rgb = v.a > 0.01 ? lerp(v.rgb, c, 0.25 * trust) : c * trust;
+                        if ((voxFlags & 1) && dot(surfN, surfN) > 0)
+                            ScreenL1(id, v, surfN, c, trust);
+                        else
+                            v.rgb = v.a > 0.01 ? lerp(v.rgb, c, 0.25 * trust) : c * trust;
                         // A leaf on screen (the foliage mask) is no wall: half open at most, as the stamps have it.
                         if (!foliage && !geomOnly)
                             v.a = lerp(v.a, foliageTex.SampleLevel(pointClamp, uv, 0) >= 0.5 ? 0.5 : 1, 0.5);
@@ -2990,7 +3049,21 @@ void light(uint3 id : SV_DispatchThreadID)
         roof += (1 - roof) * voxels[Wrap(c)].a;
         p.z += 1;
     }
-    v.rgb = lerp(v.rgb, albedoSun * facing * (1 - cover) + sky * (1 - roof) + surface * LampLight(cell, N, flat, g, n), 0.25);
+    const float3 sunPart = albedoSun * facing * (1 - cover);
+    const float3 rest = sky * (1 - roof) + surface * LampLight(cell, N, flat, g, n);
+    if (voxFlags & 1)
+    {
+        // CRYMT_GI_DIRLIGHT 1: the sun on the side towards it only (a thin wall: its outer face), the sky and the lamps on
+        // both: the cell sends rest + sun out towards the sun's side and rest away from it.
+        const float3 target = rest + 0.5 * sunPart;
+        const float lt = Luma(target);
+        const float3 side = flat ? L : N * (dot(N, L) >= 0 ? 1 : -1);
+        const float3 dirT = lt > 1e-5 ? side * (0.5 * Luma(sunPart) / lt) : 0;
+        v.rgb = lerp(v.rgb, target, 0.25);
+        l1Grid[id] = float4(lerp(l1Grid[id].xyz, dirT, 0.25), 0);
+    }
+    else
+        v.rgb = lerp(v.rgb, sunPart + rest, 0.25);
     voxels[id] = v;
 }
 
@@ -3156,6 +3229,20 @@ void downsample(uint3 id : SV_DispatchThreadID)
             sum.a = mipOpacity > 1 ? most : (ax + ay + az) / 12;
     }
     voxelsDst[id] = sum;
+    if (voxFlags & 1) // the light direction: the children's, weighted by their light (CRYMT_GI_DIRLIGHT 1)
+    {
+        float3 gs = 0;
+        float ws = 0;
+        [unroll] for (int j3 = 0; j3 < 8; j3++)
+        {
+            uint3 cid = id * 2 + uint3(j3 & 1, (j3 >> 1) & 1, j3 >> 2);
+            float4 cv = voxels[cid];
+            float w = Luma(cv.rgb) * (mode == 1 ? cv.a : 1);
+            gs += l1Grid[cid].xyz * w;
+            ws += w;
+        }
+        l1Dst[id] = float4(ws > 1e-6 ? gs / ws : 0, 0);
+    }
 }
 
 // The info panel (GI test keys), its rectangle in pixels in worldToPrevClip's first row (width 0: none): the frame
@@ -6951,6 +7038,9 @@ public:
         bool thinFix = true;               // CRYMT_GI_THIN=0: thin features keep their own (chance) GI
         bool roomLight = true;             // CRYMT_GI_ROOMLIGHT=0: cones from inside a VisArea take light from outside it too
                                            // (2026-11-13: sunlit roofs and outer walls leaked in through the coarse mips)
+        int dirLight = 0;                  // CRYMT_GI_DIRLIGHT: the cells' light, 0 one colour for all directions, 1 a colour
+                                           // and the direction it goes out stronger (L1: a thin wall lit outside stays dark
+                                           // inside; the voxels page). 2: six directions (not yet)
         float gtaoRadius = 0.5f;           // CRYMT_GI_GTAORADIUS, metres
         bool contactShadows = true;        // CRYMT_CONTACTSHADOWS=0: no screen-space contact shadows in the sun's shadow mask
         float contactLength = 0.35f;       // CRYMT_CONTACTLENGTH: the march's length at 10 m (metres; scales with distance)
@@ -7069,6 +7159,8 @@ public:
             v.roofCells = GetEnvironmentVariableW(L"CRYMT_GI_ROOFCELLS", text, 32) && wcscmp(text, L"0") != 0;
             v.thinFix = !(GetEnvironmentVariableW(L"CRYMT_GI_THIN", text, 32) && wcscmp(text, L"0") == 0);
             v.roomLight = !(GetEnvironmentVariableW(L"CRYMT_GI_ROOMLIGHT", text, 32) && wcscmp(text, L"0") == 0);
+            if (GetEnvironmentVariableW(L"CRYMT_GI_DIRLIGHT", text, 32))
+                v.dirLight = std::min(std::max(_wtoi(text), 0), 1);
             v.replaceSsao = !(GetEnvironmentVariableW(L"CRYMT_GI_SSAO", text, 32) && wcscmp(text, L"0") != 0);
             read(L"CRYMT_GI_GTAO", v.gtao);
             read(L"CRYMT_GI_GTAORADIUS", v.gtaoRadius);
@@ -7182,6 +7274,7 @@ public:
         g.sssReach = g_giControl.sssReach > 0 ? static_cast<float>(g_giControl.sssReach) : b.sssReach;
         g.sssWeaponThickness = g_giControl.sssWeapon >= 0 && g_giControl.sssWeapon < 5 ? kSssWeaponThick[g_giControl.sssWeapon] : b.sssWeaponThickness;
         g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
+        g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 1) : b.dirLight;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -8110,7 +8203,7 @@ public:
                 return false;
             }
         D3D12_DESCRIPTOR_RANGE ranges[3] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 3},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2 * kVoxLevels + 2, 3, 0, 0}};
+                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3 * kVoxLevels + 2, 3, 0, 0}};
         D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = kGiConstants;
@@ -8950,6 +9043,7 @@ public:
             {
                 m_barriers.push_back(Transition(m_vox[l], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
                 m_barriers.push_back(Transition(m_voxDir[l], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+                m_barriers.push_back(Transition(m_voxL1[l], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
             }
         if (cones)
             m_barriers.push_back(Transition(m_voxRoof, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
@@ -8963,6 +9057,7 @@ public:
             memset(f, 0, kVisFloat4s * 16);
             f[0] = static_cast<float>(m_giVisAreaCount);
             f[1] = Gi().roomLight ? 1.0f : 0.0f; // [0].y: the cones from inside a room take no light from outside its box
+            f[2] = static_cast<float>(Gi().dirLight); // [0].z: the cells' light direction (CRYMT_GI_DIRLIGHT)
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
         }
@@ -8970,7 +9065,7 @@ public:
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
         // Three tables of 6: trace (depth, colour, -, raw out, -, -), filter (depth, raw, previous GI, new GI out,
         // distance out, previous distance) and upsample (depth, new GI, -, full-size out, distances, -).
-        const UINT aoTables = 24 + 2 * kVoxLevels + 2; // then three tables of 6 for the GTAO passes
+        const UINT aoTables = 24 + 3 * kVoxLevels + 2; // then three tables of 6 for the GTAO passes
         while (!m_srvRing.TryAlloc(aoTables + 30, cpu, gpu))
         {
             Submit();
@@ -9034,6 +9129,15 @@ public:
         rv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         rv.Texture3D.MipLevels = 1;
         g.dev->CreateShaderResourceView(cones ? m_voxRoof : nullptr, &rv, at(24 + 2 * kVoxLevels + 1));
+        for (int l = 0; l < kVoxLevels; l++) // t13..t16: the levels' light direction (CRYMT_GI_DIRLIGHT 1)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC ld{};
+            ld.Format = DXGI_FORMAT_R8G8B8A8_SNORM;
+            ld.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            ld.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            ld.Texture3D.MipLevels = cones ? kVoxMips : 1;
+            g.dev->CreateShaderResourceView(cones ? m_voxL1[l] : nullptr, &ld, at(24 + 2 * kVoxLevels + 2 + l));
+        }
         // GTAO: (depth, foliage mask, -, -, raw out, -), (depth, raw, previous history, current history out, -, -),
         // (depth, current history, -, full-size GI, -, -).
         const int aoCur = m_aoCur ^ 1, aoPrev = m_aoCur;
@@ -9350,6 +9454,7 @@ public:
             {
                 m_barriers.push_back(Transition(m_vox[l], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
                 m_barriers.push_back(Transition(m_voxDir[l], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+                m_barriers.push_back(Transition(m_voxL1[l], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
             }
         if (cones)
             m_barriers.push_back(Transition(m_voxRoof, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
@@ -9400,14 +9505,17 @@ public:
                 Log("voxel shader %s: %s", entries[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
                 return false;
             }
-        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 6, 0, 0, 3}};
-        D3D12_ROOT_PARAMETER params[3]{};
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 8, 0, 0, 3}};
+        D3D12_ROOT_PARAMETER params[4]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = kVoxConstants;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {2, ranges};
         params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; // b1: the lamps (light)
         params[2].Descriptor.ShaderRegister = 1;
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; // b2: voxFlags (VoxFlags())
+        params[3].Constants.ShaderRegister = 2;
+        params[3].Constants.Num32BitValues = 1;
         D3D12_STATIC_SAMPLER_DESC samplers[2]{};
         for (int i = 0; i < 2; i++)
         {
@@ -9417,7 +9525,7 @@ public:
             samplers[i].ShaderRegister = i;
         }
         D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 3;
+        rd.NumParameters = 4;
         rd.pParameters = params;
         rd.NumStaticSamplers = 2;
         rd.pStaticSamplers = samplers;
@@ -9453,6 +9561,12 @@ public:
         for (int l = 0; l < kVoxLevels && SUCCEEDED(hr); l++)
             hr = g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource),
                                                 reinterpret_cast<void**>(&m_vox[l]));
+        // The cells' direction of light (CRYMT_GI_DIRLIGHT 1, VoxFlags): RGBA8 SNORM, xyz g with |g| <= 1, the light going
+        // out towards w is the colour times 1 + g.w; the same mips as the grid. ~37 MB for four levels.
+        d.Format = DXGI_FORMAT_R8G8B8A8_SNORM;
+        for (int l = 0; l < kVoxLevels && SUCCEEDED(hr); l++)
+            hr = g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource),
+                                                reinterpret_cast<void**>(&m_voxL1[l]));
         d.Width = d.Height = kVoxN / 2;
         d.DepthOrArraySize = kVoxN / 2;
         d.MipLevels = kVoxMips - 1;
@@ -9495,6 +9609,20 @@ public:
         ud.Texture3D.WSize = static_cast<UINT>(-1);
         g.dev->CreateUnorderedAccessView(mip < 0 ? nullptr : m_vox[level], nullptr, &ud, at);
     }
+
+    // A UAV of one mip of a level's light direction (m_voxL1), or a null 3D view.
+    void L1Uav(D3D12_CPU_DESCRIPTOR_HANDLE at, int mip, int level = 0)
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R8G8B8A8_SNORM;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        ud.Texture3D.MipSlice = mip < 0 ? 0 : static_cast<UINT>(mip);
+        ud.Texture3D.WSize = static_cast<UINT>(-1);
+        g.dev->CreateUnorderedAccessView(mip < 0 || level < 0 ? nullptr : m_voxL1[level], nullptr, &ud, at);
+    }
+
+    // The voxel passes' b2 (voxFlags): bit 0 the cells' light direction is kept and used (CRYMT_GI_DIRLIGHT 1).
+    uint32_t VoxFlags() const { return Gi().dirLight == 1 ? 1u : 0u; }
 
     // A UAV of one mip of a level's per-axis opacity (grid mip mip + 1), or a null 3D view.
     void DirUav(D3D12_CPU_DESCRIPTOR_HANDLE at, int mip, int level = 0)
@@ -10263,10 +10391,13 @@ public:
             SeenUav(at(b + 6), l);
             AlbedoUav(at(b + 7), l);
             VoxUav(at(b + 8), -1);
+            L1Uav(at(b + 9), 0, l);
+            L1Uav(at(b + 10), -1);
         }
         // The face's depth to distance: clip.w = s z (s = +-1 the projection's handedness), d = A s + B / distance.
         const float A = m_cubeFaceProj[10], B = m_cubeFaceProj[14], s = m_cubeFaceProj[11] >= 0 ? 1.0f : -1.0f;
         m_list->SetComputeRootSignature(m_voxRoot);
+        m_list->SetComputeRoot32BitConstant(3, VoxFlags(), 0);
         m_list->SetPipelineState(m_voxPsoInject);
         for (int l = 0; l < kVoxGeomLevels; l++)
         {
@@ -10606,6 +10737,7 @@ public:
         nu.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         FlushBarriers();
         m_list->SetComputeRootSignature(m_voxRoot);
+        m_list->SetComputeRoot32BitConstant(3, VoxFlags(), 0);
         UINT table = 0;
         for (int l = 0; l < kVoxLevels; l++)
         {
@@ -10661,6 +10793,8 @@ public:
                 }
                 else
                     VoxUav(at(b + 8), -1);
+                L1Uav(at(b + 9), t == 0 ? 0 : static_cast<int>(t) - 1, l); // u6: the level's light direction (downsample: the mip below)
+                L1Uav(at(b + 10), t == 0 ? -1 : static_cast<int>(t), l);   // u7: the downsample's mip
             }
             float c[kVoxConstants] = {};
             VoxConstants(c, toWorld, m_giFullW, m_giFullH, 0.0f, l);
@@ -10858,6 +10992,7 @@ public:
         static const char* const view[] = {"ВЫКЛ|OFF", "КАРКАС|WIRE", "СПЛОШНОЙ|SOLID"};
         static const char* const geometry[] = {"ВЫКЛ|OFF", "ВКЛ|ON", "ВКЛ + ЛИСТВА|ON + FOLIAGE"};
         static const char* const opacity[] = {"ЭКРАН И ГЕОМЕТРИЯ|SCREEN+GEOMETRY", "ГЕОМЕТРИЯ|GEOMETRY"};
+        static const char* const cellLight[] = {"ОДИН ЦВЕТ|ONE COLOUR", "ЦВЕТ + НАПРАВЛЕНИЕ|COLOUR + DIRECTION"};
         static const char* const cache[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "КАЖДЫЙ 4-Й|EVERY 4TH"};
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE", "КУБ ДВИЖКА|ENGINE CUBE"};
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
@@ -10944,6 +11079,11 @@ public:
             {2, "Непрозрачность из|Opacity from", 0, 1, 1, true, opacity, 0, nullptr,
              [] { const int v = g_giControl.voxOpacity; return v < 0 ? (GiBase().opacityGeometry ? 1 : 0) : v; },
              [] { return GiBase().opacityGeometry ? 1 : 0; }, [](int v) { g_giControl.voxOpacity = v; }, true, nullptr},
+            // The cells' light (CRYMT_GI_DIRLIGHT): one colour for all directions, or a colour and the direction it goes
+            // out stronger (a wall lit outside stays dark inside).
+            {2, "Свет ячейки|Cell light", 0, 1, 1, true, cellLight, 0, nullptr,
+             [] { const int v = g_giControl.dirLight; return v < 0 ? GiBase().dirLight : std::min(v, 1); },
+             [] { return GiBase().dirLight; }, [](int v) { g_giControl.dirLight = v; }, true, nullptr},
             {2, "Неизменные объекты|Unchanged objects", 0, 1, 1, true, cache, 0, nullptr,
              [] { const int v = g_giControl.geomCache; return v < 0 ? (GiBase().geometryCache ? 1 : 0) : v; },
              [] { return GiBase().geometryCache ? 1 : 0; }, [](int v) { g_giControl.geomCache = v; }, true, nullptr},
@@ -11356,6 +11496,8 @@ public:
         VoxUav(at(6), 0, 1);
         VoxUav(at(7), 0, 2);
         VoxUav(at(8), 0, 3);
+        L1Uav(at(9), -1);
+        L1Uav(at(10), -1);
         float toWorld[16];
         RigidInverse(m_giView, toWorld);
         float c[kVoxConstants] = {};
@@ -11371,6 +11513,7 @@ public:
             c[19] = static_cast<float>(m_panelH);
         }
         m_list->SetComputeRootSignature(m_voxRoot);
+        m_list->SetComputeRoot32BitConstant(3, 0, 0);
         m_list->SetComputeRoot32BitConstants(0, kVoxConstants, c, 0);
         m_list->SetPipelineState(m_voxPsoView);
         m_list->SetComputeRootDescriptorTable(1, gpu);
@@ -12698,6 +12841,7 @@ private:
     ID3D12Resource* m_giCam = nullptr;              // its 1x1 texture
     ID3D12Resource* m_vox[kVoxLevels] = {};       // voxel grid levels (kVoxShader), unordered access but in the GI passes
     ID3D12Resource* m_voxDir[kVoxLevels] = {};    // their opacity per axis, RGBA8 at grid mips 1..4 (CRYMT_GI_MIPOPACITY=4)
+    ID3D12Resource* m_voxL1[kVoxLevels] = {};     // their light's direction, RGBA8 SNORM with the grid's mips (CRYMT_GI_DIRLIGHT 1)
     ID3D12Resource* m_voxView = nullptr;          // its debug view, the back buffer's size and format
     UINT m_voxViewW = 0, m_voxViewH = 0;
     DXGI_FORMAT m_voxViewFormat = DXGI_FORMAT_UNKNOWN;

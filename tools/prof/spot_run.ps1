@@ -76,6 +76,10 @@ $defs = [ordered]@{
     cubenowater = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_FLAGS = '0x898'}}
     # The cube's down face every turn, with its own frame id (as 07:05-21:00 on 2026-11-13).
     cubedown_own = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_DOWN = '1'; CRYMT_ENVCUBE_OWNFRAME = '1'}}
+    # Directional voxel light (CRYMT_GI_DIRLIGHT 1, L1) A/B, GPU per pass: with the room fix, without it, and the old cones.
+    dirl1_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '1'}}
+    dirl1_noroom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '1'; CRYMT_GI_ROOMLIGHT = '0'}}
+    noroom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_ROOMLIGHT = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}
