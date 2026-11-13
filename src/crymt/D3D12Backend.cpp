@@ -2234,6 +2234,13 @@ void motion(uint3 id : SV_DispatchThreadID)
             if (fade > 0.002 && abs(dist - V.z) < 0.03 * V.z + 0.05 && all(abs(obj) < 0.1) && all(obj == obj))
                 mv -= obj;
         }
+        // Wind-bent vegetation (t2, the patched z-prepass: before minus now per 1/60 s, motionParams.z the frame's scale).
+        if (motionParams.w > 0)
+        {
+            float2 bent = historyTex[id.xy].xy * motionParams.z;
+            if (all(abs(bent) < 0.1) && all(bent == bent))
+                mv += bent;
+        }
     }
     outTex[id.xy] = float4(mv, 0, 0);
 }
@@ -3977,6 +3984,7 @@ public:
     bool water = false; // a vertex shader with the constant WaterLevel (WaterOcean.cfx, its z-prepass too): not voxel geometry
     bool discards = false;
     bool writesTarget1 = false; // a pixel shader writing SV_Target1 (the patched z-prepass: the foliage mask)
+    bool writesTarget2 = false; // ... SV_Target2 (the patched z-prepass: wind-bent vegetation's screen move)
 
     // SM4 token stream (the SHDR chunk): opcode in bits 0-10, length in 24-30 (custom data: the next token).
     static bool HasDiscard(const std::vector<uint8_t>& dxbc)
@@ -4097,6 +4105,8 @@ public:
                 outputs.push_back({o.SemanticName, o.SemanticIndex, o.Register, o.Mask, o.ComponentType, o.SystemValueType});
                 if (_stricmp(o.SemanticName, "SV_Target") == 0 && o.SemanticIndex == 1) // reflected with system value 0
                     writesTarget1 = true;
+                if (_stricmp(o.SemanticName, "SV_Target") == 0 && o.SemanticIndex == 2)
+                    writesTarget2 = true;
             }
         }
         r->Release();
@@ -4379,7 +4389,7 @@ struct Stats
     double psoMs;
     uint64_t gpuTicks, gpuLists; // GPU time from the start to the end of each main list
     uint64_t depthToSrv, rtClears, dsClears;
-    uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, objectMotionCopies, voxPasses, giLateReads, giOtherDepth;
+    uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, objectMotionCopies, bendMotionPasses, voxPasses, giLateReads, giOtherDepth;
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
     uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
     uint64_t voxGeomStale; // replays skipped: the draw's list was done, its ring data possibly reused (VoxDraw::serial)
@@ -6923,6 +6933,61 @@ public:
     // smaller than the previous frame's largest z-prepass (the reflections') are left out. That was "the largest ever"
     // until 2026-11-13: after the game's resolution went down (5120 -> 2560 wide) the scene's own z-prepass counted as a
     // reflection, so no mask, no depth for the screen-space shadows and the water's SSR for the rest of the session.
+    // Wind-bent vegetation's screen move (R16G16F, the scene's size): the patched z-prepass's SV_Target2 (before minus now,
+    // screen fractions per 1/60 s; 0 on everything not bent), cleared at the frame's first z-prepass draw. RunMotion
+    // adds it scaled to the frame's time.
+    void BindBendVelocity(UINT w, UINT h)
+    {
+        if (!m_bendRtv || w != m_bendW || h != m_bendH)
+        {
+            if (m_bendSrv)
+                m_bendSrv->Release();
+            if (m_bendRtv)
+                m_bendRtv->Release();
+            if (m_bendTex)
+                m_bendTex->Release();
+            m_bendSrv = nullptr;
+            m_bendRtv = nullptr;
+            m_bendTex = nullptr;
+            D3D10_TEXTURE2D_DESC td{};
+            td.Width = w;
+            td.Height = h;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R16G16_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D10_USAGE_DEFAULT;
+            td.BindFlags = D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
+            ID3D10Texture2D* tex = nullptr;
+            ID3D10RenderTargetView* rtv = nullptr;
+            ID3D10ShaderResourceView* srv = nullptr;
+            if (FAILED(CreateTexture2D(&td, nullptr, &tex)) || FAILED(CreateRenderTargetView(tex, nullptr, &rtv)) ||
+                FAILED(CreateShaderResourceView(tex, nullptr, &srv)))
+            {
+                if (rtv)
+                    rtv->Release();
+                if (tex)
+                    tex->Release();
+                Log("bent vegetation's motion %ux%u: failed", w, h);
+                return;
+            }
+            m_bendTex = tex;
+            m_bendRtv = static_cast<Rtv12*>(rtv);
+            m_bendSrv = static_cast<Srv12*>(srv);
+            m_bendW = w;
+            m_bendH = h;
+            m_bendFrame = ~0ull;
+            Log("bent vegetation's motion %ux%u", w, h);
+        }
+        if (m_bendFrame != m_frame)
+        {
+            static const FLOAT kZero[4] = {};
+            ClearRenderTargetView(m_bendRtv, kZero);
+            m_bendFrame = m_frame;
+        }
+        m_bendRtv->info->outputBound++;
+        Bind(m_rtv[2], m_bendRtv);
+    }
+
     void BindFoliageMask()
     {
         const auto* t = static_cast<const TextureCore*>(m_rtv[0]->info);
@@ -6990,6 +7055,8 @@ public:
         }
         m_foliageRtv->info->outputBound++;
         Bind(m_rtv[1], m_foliageRtv);
+        if (m_ps->writesTarget2 && !m_rtv[2])
+            BindBendVelocity(w, h);
         m_omDirty = m_psoDirty = true;
         m_zTarget = static_cast<TextureCore*>(m_rtv[0]->info); // the depth for RunSss
         m_zTargetFrame = m_frame;
@@ -10751,6 +10818,12 @@ public:
                     FlushBarriers();
                     RecordDump(m_foliageSrv->info->res, named("foliage"), 4);
                 }
+                if (m_bendSrv && m_bendFrame == m_frame && m_bendSrv->info)
+                {
+                    Require(m_bendSrv->info, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    FlushBarriers();
+                    RecordDump(m_bendSrv->info->res, named("bend"), 3);
+                }
             }
         }
         FlushBarriers();
@@ -11380,6 +11453,7 @@ public:
         }
         KeepObjectMotion(); // a pass with nothing drawn after it
         TextureCore* velocity = m_ombCopyFrame == m_frame && g_objectMotion ? &m_ombCopy : nullptr;
+        Srv12* bend = g_objectMotion && m_bendSrv && m_bendFrame == m_frame && m_bendW == color->width && m_bendH == color->height ? m_bendSrv : nullptr;
         if (velocity && m_ombDiagFrame == m_frame && m_frame > 1500 && m_ombDiagLogged < 1)
         {
             m_ombDiagLogged++;
@@ -11399,6 +11473,8 @@ public:
         Require(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (velocity)
             Require(velocity, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (bend)
+            Require(bend->info, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         m_barriers.push_back(Transition(m_dlssMvec, kSrvState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
         FlushBarriers();
         const auto at = [&](int i) { return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + i * g.srvInc}; };
@@ -11412,7 +11488,10 @@ public:
             g.dev->CreateShaderResourceView(velocity->res, nullptr, at(1));
         else
             g.dev->CreateShaderResourceView(depth->res, &sd, at(1)); // not read
-        g.dev->CreateShaderResourceView(depth->res, &sd, at(2));     // not read
+        if (bend)
+            g.dev->CreateShaderResourceView(bend->info->res, nullptr, at(2));
+        else
+            g.dev->CreateShaderResourceView(depth->res, &sd, at(2)); // not read
         g.dev->CreateUnorderedAccessView(m_dlssMvec, nullptr, nullptr, at(3));
         g.dev->CreateUnorderedAccessView(m_dlssMvec, nullptr, nullptr, at(4)); // not written
         g.dev->CreateUnorderedAccessView(m_dlssMvec, nullptr, nullptr, at(5)); // not written
@@ -11432,6 +11511,14 @@ public:
         memcpy(c + 16, reproj, sizeof(reproj));
         c[32] = info.farZ;
         c[33] = velocity ? 1.0f : 0.0f;
+        // The bent vegetation's move is per 1/60 s: scaled to the time since the last frame (the game timer's, as PF_time).
+        float dt = info.frameTime;
+        if (m_mvHavePrevTime && info.time > m_mvPrevTime)
+            dt = info.time - m_mvPrevTime;
+        m_mvPrevTime = info.time;
+        m_mvHavePrevTime = info.time > 0;
+        c[34] = std::min(std::max(dt, 0.0f), 0.1f) * 60.0f;
+        c[35] = bend ? 1.0f : 0.0f;
         memcpy(m_mvPrevView, info.view, sizeof(m_mvPrevView));
         memcpy(m_mvPrevProj, info.proj, sizeof(m_mvPrevProj));
         memcpy(m_mvPrevToWorld, toWorld, sizeof(m_mvPrevToWorld));
@@ -11445,6 +11532,8 @@ public:
         m_stats.motionPasses++;
         if (velocity)
             m_stats.objectMotionPasses++;
+        if (bend)
+            m_stats.bendMotionPasses++;
         RestoreListState();
         return true;
     }
@@ -11571,6 +11660,13 @@ private:
     Srv12* m_foliageSrv = nullptr;
     UINT m_foliageW = 0, m_foliageH = 0;
     uint64_t m_foliageFrame = ~0ull;
+    ID3D10Texture2D* m_bendTex = nullptr; // BindBendVelocity
+    Rtv12* m_bendRtv = nullptr;
+    Srv12* m_bendSrv = nullptr;
+    UINT m_bendW = 0, m_bendH = 0;
+    uint64_t m_bendFrame = ~0ull;
+    float m_mvPrevTime = 0;
+    bool m_mvHavePrevTime = false;
     float m_frameLast[32] = {1e9f};             // the frame texture's last data
     ID3D12Resource* m_giColor = nullptr;   // previous frame's HDR scene colour
     ID3D12Resource* m_giHist[2] = {};      // half-resolution GI, ping-pong
@@ -14905,7 +15001,8 @@ void Dx12WriteStats(FILE* f, double frames)
                 g_pipes.queue.size(), static_cast<unsigned long long>(g_pipes.deferred), static_cast<unsigned long long>(g_pipes.deferredDraws));
     }
     dlss::WriteStats(f);
-    fprintf(f, "  object motion: the motion blur target copied after its pass %llu times\n", static_cast<unsigned long long>(s.objectMotionCopies));
+    fprintf(f, "  object motion: the motion blur target copied after its pass %llu times; bent vegetation's motion in %llu motion passes\n",
+            static_cast<unsigned long long>(s.objectMotionCopies), static_cast<unsigned long long>(s.bendMotionPasses));
     fprintf(f, "  scenes %llu, DLSS applied %llu, motion vectors %llu (with object velocities %llu), GI %llu, voxel updates %llu, GI reads after the scene %llu, with another depth or target %llu\n", static_cast<unsigned long long>(s.scenes),
             static_cast<unsigned long long>(s.dlssFrames), static_cast<unsigned long long>(s.motionPasses), static_cast<unsigned long long>(s.objectMotionPasses),
             static_cast<unsigned long long>(s.giPasses), static_cast<unsigned long long>(s.voxPasses), static_cast<unsigned long long>(s.giLateReads),

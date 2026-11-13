@@ -110,6 +110,103 @@ const char* const kEnvAll = R"(#if D3D10
 // the water (the shader's own scene map, a parameter) at the hit, the cube where it misses. Ported to SM4 for inverted
 // depth and mirror rays. Rivers and lakes (WaterVols.cfx WaterSurfacePS) take the same reflection in place of their
 // planar one, their static cube or none (the user, 2026-11-13).
+// Motion vectors for wind-bent vegetation (2026-11-13): the z-prepass's vertex shader also places each vertex as it was
+// bent 1/60 s before (ModificatorVT's bending is a function of the time and the instance's wind, which itself changes
+// slowly), both with this frame's camera; the pixel shader writes the screen move (before minus now, screen fractions per
+// 1/60 s) into a third target CryMT's back end binds next to the foliage mask; RunMotion scales it to the frame's time.
+// Own names (CryMT_ZPassVS / CryMT_ZPassPS, struct vert2fragZ_cry): the shared shader cache keeps Common_ZPassVS/PS
+// by name (Methagen.cfx uses those) and vert2fragZ stays as it was.
+const char* const kZPassVelocity = R"(// CryMT motion vectors for wind-bent vegetation (see the back end's RunMotion).
+struct vert2fragZ_cry
+{
+  float4 HPosition : POSITION;
+#if !%PARALLAX_OCCLUSION_MAPPING && !%_RT_FSAA
+  float  ZInfo     : TEXCOORD0_centroid;
+#else
+  float4 ZInfo     : TEXCOORD0_centroid;
+#endif
+#if (%_RT_ALPHATEST || %_RT_DISSOLVE || %PARALLAX_OCCLUSION_MAPPING) && !%TEMP_TERRAIN
+  float4 baseTC     : TEXCOORD1;
+#endif
+#if %PARALLAX_OCCLUSION_MAPPING
+  float3 viewTS   : TEXCOORD2;
+#endif
+#if D3D10
+ #if !%TEMP_TERRAIN
+  // The same where nothing is bent: the pixel shader is built without the vertex modifier flags (MDV), so it cannot
+  // tell; with them inside its #if the move was never written (2026-11-13, the first try).
+  float4 CryNow    : TEXCOORD6;
+  float4 CryBefore : TEXCOORD7;
+ #endif
+#endif
+};
+
+vert2fragZ_cry CryMT_ZPassVS(app2vertZGeneral IN)
+{
+  vert2fragZ base = Common_ZPassVS(IN);
+  vert2fragZ_cry OUT = (vert2fragZ_cry)0;
+  OUT.HPosition = base.HPosition;
+  OUT.ZInfo = base.ZInfo;
+#if (%_RT_ALPHATEST || %_RT_DISSOLVE || %PARALLAX_OCCLUSION_MAPPING) && !%TEMP_TERRAIN
+  OUT.baseTC = base.baseTC;
+#endif
+#if %PARALLAX_OCCLUSION_MAPPING
+  OUT.viewTS = base.viewTS;
+#endif
+#if D3D10
+ #if !%TEMP_TERRAIN
+  OUT.CryNow = base.HPosition;
+  OUT.CryBefore = base.HPosition;
+  #if %_VT_TYPE || %_VT_TYPE_MODIF
+  streamPos cryPos = (streamPos)0;
+  streamPos_FromZ(IN, cryPos);
+  OUT.CryBefore = CryMT_PosBentBefore(g_VS_ViewProjZeroMatr, cryPos, 1.0 / 60);
+  #endif
+ #endif
+#endif
+  return OUT;
+}
+
+pixout_cryzpass CryMT_ZPassPS(vert2fragZ_cry IN)
+{
+  vert2fragZ base = (vert2fragZ)0;
+  base.HPosition = IN.HPosition;
+  base.ZInfo = IN.ZInfo;
+#if (%_RT_ALPHATEST || %_RT_DISSOLVE || %PARALLAX_OCCLUSION_MAPPING) && !%TEMP_TERRAIN
+  base.baseTC = IN.baseTC;
+#endif
+#if %PARALLAX_OCCLUSION_MAPPING
+  base.viewTS = IN.viewTS;
+#endif
+  pixout_cryzpass OUT = CryMT_ZPassCore(base);
+#if D3D10
+ #if !%TEMP_TERRAIN
+  OUT.Velocity = float4((IN.CryBefore.xy / IN.CryBefore.w - IN.CryNow.xy / IN.CryNow.w) * float2(0.5, -0.5), 0, 0);
+ #endif
+#endif
+  return OUT;
+}
+
+)";
+
+// Pos_VS_General with the vertex bent as fTimeShift seconds before (ModificatorVT.cfi, before Pos_VS_Terrain).
+const char* const kBendBefore = R"(// CryMT (motion vectors): Pos_VS_General with the vertex bent as fTimeShift seconds before.
+float4 CryMT_PosBentBefore(float4x4 VPMatrix, inout streamPos IN, float fTimeShift)
+{
+#if %_RT_OBJ_IDENTITY
+  VPMatrix = g_VS_ViewProjMatr;
+#endif
+#if %_RT_SKELETON_SSD
+  #if MESH_SHORT_POS
+    IN.Position.xyz *= MeshScale.xyz;
+  #endif
+#endif
+  Matrix_Inst_General(IN);
+  return _pos_Modificators(VPMatrix, IN.InstMatrix, IN, true, false, fTimeShift);
+}
+
+)";
+
 const char* const kWaterEnvDecl = R"(#if D3D10
 samplerCUBE CryMT_WaterEnvSampler = sampler_state
 {
@@ -768,6 +865,7 @@ const wchar_t* kMetal = L"Shaders\\HWScripts\\CryFX\\Metal.cfx";
 const wchar_t* kVegetation = L"Shaders\\HWScripts\\CryFX\\Vegetation.cfx";
 const wchar_t* kWater = L"Shaders\\HWScripts\\CryFX\\Water.cfx";
 const wchar_t* kWaterVols = L"Shaders\\HWScripts\\CryFX\\WaterVols.cfx";
+const wchar_t* kModificator = L"Shaders\\HWScripts\\CryFX\\ModificatorVT.cfi";
 const wchar_t* kPlaceholder = L"Textures\\CryMT\\gi.dds";
 // The patch goes into the game as a pak: without -DEVMODE CryPak reads files only from paks (loose files are ignored)
 // and a later pak by name overrides the earlier ones (as the official ZPatch1.pak does), so zzCryMT.pak's sources
@@ -907,13 +1005,13 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
                 particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal)),
                 vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater)),
-                waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols));
+                waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols)), modificator = Lf(ReadAll(tmp + L"\\" + kModificator));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
@@ -995,15 +1093,36 @@ std::wstring InstallGi()
                             "    PixelShader = compile ps_Auto CryMT_ParticlePS() GeneralPS; \n") &&
                     // The z-prepass marks alpha-tested surfaces (the foliage mask).
                     Replace(zpass, "pixout Common_ZPassPS(vert2fragZ IN)\n{\n\tpixout OUT = (pixout)0;\n",
-                            "// CryMT: the z-prepass also marks alpha-tested surfaces (leaves, grass, nets) in a second target that CryMT's back\n// end binds (without it the output goes nowhere): contact shadows and GTAO leave them out as occluders.\n#if D3D10\nstruct pixout_cryzpass\n{\n  float4 Color : COLOR0;\n  float4 Foliage : COLOR1;\n};\n#else\nstruct pixout_cryzpass\n{\n  float4 Color : COLOR0;\n};\n#endif\n\npixout_cryzpass CryMT_ZPassPS(vert2fragZ IN)\n{\n\tpixout_cryzpass OUT = (pixout_cryzpass)0;\n") &&
+                            "// CryMT: the z-prepass also marks alpha-tested surfaces (leaves, grass, nets) in a second target that CryMT's back\n// end binds (without it the output goes nowhere): contact shadows and GTAO leave them out as occluders.\n#if D3D10\nstruct pixout_cryzpass\n{\n  float4 Color : COLOR0;\n  float4 Foliage : COLOR1;\n  float4 Velocity : COLOR2; // CryMT: wind-bent vegetation's screen move (CryMT_ZPassPS below)\n};\n#else\nstruct pixout_cryzpass\n{\n  float4 Color : COLOR0;\n};\n#endif\n\npixout_cryzpass CryMT_ZPassCore(vert2fragZ IN)\n{\n\tpixout_cryzpass OUT = (pixout_cryzpass)0;\n") &&
                     Replace(zpass, "\t\t#if %_RT_ALPHATEST\n\t\t\tfloat baseColor = tex2D(diffuseMapSampler, IN.baseTC.xy).w;\n",
                             "\t\t#if %_RT_ALPHATEST\n\t\t\tfloat baseColor = tex2D(diffuseMapSampler, IN.baseTC.xy).w;\n#if D3D10\n  #if %GRASS\n\t\t\tOUT.Foliage = 0.6; // CryMT: grass (keeps the engine's SSAO, see fragLib)\n  #else\n\t\t\tOUT.Foliage = 1; // CryMT\n  #endif\n#endif\n") &&
                     Replace(zpass, "//////////////////////////////// technique ////////////////\n\ntechnique ZPass",
-                            "// The engine's own z-prepass pixel shader (Methagen.cfx names it): CryMT_ZPassPS without the foliage mask. The ZPass\n// technique below uses CryMT_ZPassPS: the precompiled shared cache (ShaderCache.pak) holds Common_ZPassPS by name\n// and kept the unpatched one.\npixout Common_ZPassPS(vert2fragZ IN)\n{\n  pixout OUT;\n  OUT.Color = CryMT_ZPassPS(IN).Color;\n  return OUT;\n}\n\n//////////////////////////////// technique ////////////////\n\ntechnique ZPass") &&
+                            "// The engine's own z-prepass pixel shader (Methagen.cfx names it): CryMT_ZPassPS without the foliage mask. The ZPass\n// technique below uses CryMT_ZPassPS: the precompiled shared cache (ShaderCache.pak) holds Common_ZPassPS by name\n// and kept the unpatched one.\npixout Common_ZPassPS(vert2fragZ IN)\n{\n  pixout OUT;\n  OUT.Color = CryMT_ZPassCore(IN).Color;\n  return OUT;\n}\n\n" + std::string(kZPassVelocity) + "//////////////////////////////// technique ////////////////\n\ntechnique ZPass") &&
                     Replace(zpass, "compile ps_3_0 Common_ZPassPS() ZPS;",
                             "compile ps_3_0 CryMT_ZPassPS() ZPS;") &&
                     Replace(zpass, "compile ps_Auto Common_ZPassPS() ZPS;",
                             "compile ps_Auto CryMT_ZPassPS() ZPS;") &&
+                    Replace(zpass, "compile vs_3_0 Common_ZPassVS() ZVS;", "compile vs_3_0 CryMT_ZPassVS() ZVS;") &&
+                    Replace(zpass, "compile vs_Auto Common_ZPassVS() ZVS;", "compile vs_Auto CryMT_ZPassVS() ZVS;") &&
+                    // The bending can be asked for an earlier time (default 0: every other caller as before).
+                    Replace(modificator, "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams)",
+                            "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams, float fTimeShift = 0)") &&
+                    Replace(modificator, "  float fTime = g_VS_AnimGenParams.z;  \n",
+                            "  float fTime = g_VS_AnimGenParams.z - fTimeShift; // CryMT: as fTimeShift seconds before (motion vectors)\n") &&
+                    Replace(modificator, "float _VTBending(inout float4 vPos, float4 BendInfo, inout float3 vNormal, inout float4 Color, float3 worldPos, float4 vBendDetailParams, float bendDetailBranchAmplitudeVal)",
+                            "float _VTBending(inout float4 vPos, float4 BendInfo, inout float3 vNormal, inout float4 Color, float3 worldPos, float4 vBendDetailParams, float bendDetailBranchAmplitudeVal, float fTimeShift = 0)") &&
+                    Replace(modificator, "  colorVariation = _DetailBending(worldPos, vPos, vNormal.xyz, vVertexInfo, vBendParams, vBendDetailParams);",
+                            "  colorVariation = _DetailBending(worldPos, vPos, vNormal.xyz, vVertexInfo, vBendParams, vBendDetailParams, fTimeShift);") &&
+                    Replace(modificator, "void _VTModify(inout float4 inPos, float3 vNorm, float4x4 InstMatrix, streamPos IN, bool bRelativeToCam, int nType)",
+                            "void _VTModify(inout float4 inPos, float3 vNorm, float4x4 InstMatrix, streamPos IN, bool bRelativeToCam, int nType, float fTimeShift = 0)") &&
+                    Replace(modificator, "    _VTBending(inPos, vBendingInfo, vNorm.xyz, vColor, worldPos, vBendDetailParams, bendDetailBranchAmplitudeVal);",
+                            "    _VTBending(inPos, vBendingInfo, vNorm.xyz, vColor, worldPos, vBendDetailParams, bendDetailBranchAmplitudeVal, fTimeShift);") &&
+                    Replace(modificator, "float4 _pos_Modificators(float4x4 VPMatrix, float4x4 InstMatrix, inout streamPos IN, bool bRelativeToCam=true, bool bPrevFrame=false)",
+                            "float4 _pos_Modificators(float4x4 VPMatrix, float4x4 InstMatrix, inout streamPos IN, bool bRelativeToCam=true, bool bPrevFrame=false, float fTimeShift=0)") &&
+                    Replace(modificator, "   _VTModify(InPos, vNorm, InstMatrix, IN, bRelativeToCam, nType);",
+                            "   _VTModify(InPos, vNorm, InstMatrix, IN, bRelativeToCam, nType, fTimeShift);") &&
+                    Replace(modificator, "float4 Pos_VS_Terrain(float fOffsetZ, float4x4 VPMatrix, inout streamPos IN, bool bSG=false)",
+                            std::string(kBendBefore) + "float4 Pos_VS_Terrain(float fOffsetZ, float4x4 VPMatrix, inout streamPos IN, bool bSG=false)") &&
                     // Contact shadows in the sun's mask (not the terrain's variance pass).
                     Replace(shadowMask, "  fInShadow = (1-fInShadow) * saturate(fFadeF); //TODO: remove saturate\n",
                             "  fInShadow = (1-fInShadow) * saturate(fFadeF); //TODO: remove saturate\n  #if !%_RT_VARIANCE_SM\n    fInShadow = max(fInShadow, CryMT_ContactShadow(IN.WS_ViewVect, SceneDepth, IN.ScreenTC.xy, IN.WPos.xy)); // CryMT: contact shadows\n  #endif\n");
@@ -1070,6 +1189,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/Vegetation.cfx", Crlf(vegetation)},
                               {"Shaders/HWScripts/CryFX/Water.cfx", Crlf(water)},
                               {"Shaders/HWScripts/CryFX/WaterVols.cfx", Crlf(waterVols)},
+                              {"Shaders/HWScripts/CryFX/ModificatorVT.cfi", Crlf(modificator)},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/hiz.dds", hiz},
                               {"Textures/CryMT/env.dds", env},

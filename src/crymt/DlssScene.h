@@ -35,4 +35,8 @@ struct DlssSceneInfo
     uint32_t fplusWidth, fplusHeight;
     uint32_t pad5;
     float fplusCam[4];
+    // The frame's game time and length (CryMT's timer snapshot, seconds: the shaders' PF_time): the wind-bent
+    // vegetation's motion vectors, written per 1/60 s, are scaled to the time between frames.
+    float time, frameTime;
+    uint32_t pad6[2];
 };

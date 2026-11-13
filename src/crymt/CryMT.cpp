@@ -2449,6 +2449,9 @@ extern "C" void __cdecl GpuInnerHook(int site)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+extern float g_tCurr[2], g_tFrame[2]; // the timer's snapshot of the frame being drawn (below: TimerGetCurrTime)
+extern bool g_timerSnap;
+// ---------------------------------------------------------------------------------------------------------------------
 // DLSS (CRYMT_DLSS=1 with the D3D12 back end): sub-pixel camera jitter in SetCamera, and the scene handed to the back
 // end before HDR post-processing, so tone mapping, bloom, motion blur and the HUD work on the anti-aliased image.
 // ---------------------------------------------------------------------------------------------------------------------
@@ -2949,6 +2952,8 @@ void DlssBeforeList(uintptr_t renderer)
         g_dlssScene.valid = 0; // reference segment: jitter without DLSS
     g_dlssScene.frame = g_dlssFrame;
     g_dlssScene.reset = g_dlssReset;
+    g_dlssScene.time = g_timerSnap ? g_tCurr[0] : 0.0f;
+    g_dlssScene.frameTime = g_timerSnap ? g_tFrame[0] : 0.0f;
     g_dlssReset = false;
     // The sun for the GI's voxel light: the level-1 light farthest away (its origin is the sun ~1000 km out; CRYMT_SUNDUMP
     // on island: one light, origin (-823130, 509032, 252289), colour at +0x1C 8.25 6.90 5.16 1).
@@ -4482,6 +4487,37 @@ void LogNullLightQuery(const CallFrame* f, const uintptr_t* rbp, const char* pat
              reinterpret_cast<void*>(rbp[1]), static_cast<unsigned long long>(g_envCubeFaces));
 }
 
+// The same null answered by main's own list in the fill window (the game crash of 2026-11-13 06:26 at village: no log on
+// that path): the index, main's level and its counts, and the 3D engine's lights (their renderer ids at +0, flags +0x1D4,
+// list index +0x200), to see which light carries an id past the list and which level gave it.
+void LogNullFillLight(uint32_t n, const uintptr_t* rbp)
+{
+    static int logged;
+    if (logged >= 3)
+        return;
+    logged++;
+    FocusLog("frame %llu: EF_Query 0x1B light %u past main's list (fill window) at main's level %d; main's counts by level 1-4: %d %d %d %d; "
+             "caller %p; engine cube renders so far %llu",
+             static_cast<unsigned long long>(g_frame), n, g_shadowLevel, g_fillLightCount[1], g_fillLightCount[2], g_fillLightCount[3],
+             g_fillLightCount[4], reinterpret_cast<void*>(rbp[1]), static_cast<unsigned long long>(g_envCubeFaces));
+    const auto* e = *reinterpret_cast<const uint8_t* const*>(k3DEngineGlobal);
+    if (!e)
+        return;
+    const auto* lights = *reinterpret_cast<const uint8_t* const*>(e + 0x760);
+    const int count = *reinterpret_cast<const int*>(e + 0x768), total = *reinterpret_cast<const int*>(e + 0x780);
+    for (int i = 0; lights && i < count && i < 16; i++)
+    {
+        const uint8_t* l = lights + static_cast<size_t>(i) * 0x258;
+        const float* p = reinterpret_cast<const float*>(l + 4);
+        FocusLog("  3D engine light %d of %d (processed %d) %p: id %d, flags %x, index %d, at %.1f %.1f %.1f, radius %.2f", i, count, total,
+                 static_cast<const void*>(l), *reinterpret_cast<const int*>(l), *reinterpret_cast<const uint32_t*>(l + 0x1D4),
+                 *reinterpret_cast<const int*>(l + 0x200), p[0], p[1], p[2], *reinterpret_cast<const float*>(l + 0x50));
+    }
+    for (int level = 1; level <= 3; level++)
+        for (int k = 0; k < g_fillLightCount[level] && k < 8; k++)
+            FocusLog("  main's level %d light %d: %p", level, k, g_fillLights[level][k]);
+}
+
 uintptr_t HandleSpecial(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
 {
     if (idx >= static_cast<uint32_t>(kAuxBase))
@@ -4768,6 +4804,8 @@ extern "C" uintptr_t GateC(uint32_t idx, CallFrame* f, const uintptr_t* rbp)
                 const uint32_t n = static_cast<uint32_t>(f->r8);
                 f->rax = n < static_cast<uint32_t>(g_fillLightCount[g_shadowLevel]) ? reinterpret_cast<uint64_t>(g_fillLights[g_shadowLevel][n]) : 0;
                 g_levelLightQueries++;
+                if (!f->rax)
+                    LogNullFillLight(n, rbp);
                 return kHandled;
             }
             break;
