@@ -4,7 +4,8 @@ param([string[]]$Variants = 'full,nogi,geomcache,nogeom,nozown', [string]$Pre = 
       [string]$Tag = 'spot', [string]$Capture = '', [string]$Commands = '', [switch]$Sample, [int]$SampleSec = 15,
       [string]$Mode = 'dlaa', # -Mode mt: the "MT only" preset (the stock D3D10 renderer), dx12, dlaa
       [string]$Exec = 'girecord', # -Exec giplay_rooms: the user's girooms demo (VisArea rooms, lamps; quits at its end)
-      [string]$Map = 'village') # -Map mine: the level loaded
+      [string]$Map = 'village', # -Map mine: the level loaded
+      [string]$StartTime = '7') # hour of the day (mine: 12, its sun is ~13 degrees at 7)
 # Frame times at one place on village (default: the user's spot of 2026-11-12, CamPos 1103 1390 139, Angl -5 0 -64 at
 # 7:00, flying: the ground there is under water at ~98), about 50 s a run. CryMT's test commands (crymt_wait/
 # crymt_waitlevel pace them): once the level runs, the player's physics off (holds it in the air; SimulateOnAction
@@ -44,6 +45,8 @@ $defs = [ordered]@{
     full_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     # GI without the engine cube's face draws in the voxel geometry (before 2026-11-13 evening), GPU per pass.
     nocubegeom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_CUBEGEOM = '0'}}
+    # GI without the cube faces' surfaces injected into the voxels (CRYMT_GI_CUBEINJECT, before 2026-11-13 night).
+    noinject_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_CUBEINJECT = '0'}}
     full_early = @{Gi = '1'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}} # main released before shadow prep
     nogi_early = @{Gi = '0'; Env = @{CRYMT_EARLYBARRIER = '1'; CRYMT_THREADLEVEL = '1'}}
     full_nojitter = @{Gi = '1'; Env = @{CRYMT_DLSS_JITTER = '0'}} # DLAA without the camera jitter (water update test)
@@ -70,7 +73,7 @@ $pre = if ($Pre) { "$Pre;" } else { '' }
 foreach ($v in ($Variants | ForEach-Object { $_ -split ',' })) {
     $d = $defs[$v]
     if (-not $d) { "unknown variant $v"; continue }
-    $vars = @{CRYMT_FRAMELOG = '1'; CRYMT_GI_STARTTIME = '7'; CRYMT_TESTCMDSEC = '0'
+    $vars = @{CRYMT_FRAMELOG = '1'; CRYMT_GI_STARTTIME = $StartTime; CRYMT_TESTCMDSEC = '0'
               CRYMT_TESTCMD = "crymt_waitlevel;${pre}crymt_wait 2;#g_localActor:EnablePhysics(false);crymt_wait 1;" +
                               "goto $GotoPos;crymt_wait 1;#g_gameRules.game:MovePlayer(g_localActor.id,$Pos,$Angles);crymt_wait 1;" +
                               "#g_localActor:SetAngles($Angles);crymt_wait $Settle;crymt_statsreset;crymt_wait $Measure;" +

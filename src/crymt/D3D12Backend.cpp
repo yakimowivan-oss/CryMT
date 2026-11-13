@@ -2944,6 +2944,72 @@ void light(uint3 id : SV_DispatchThreadID)
     voxels[id] = v;
 }
 
+// The engine cube's face just drawn (CRYMT_GI_CUBEINJECT, RunCubeInject): every cell of this level that the face saw as
+// a surface, outside the camera's view, gets the cube's stamp (frame 1, opacity byte 253: the update counts it only
+// outside the view; never newer than a geometry stamp) and the face's lit colour, and is marked coloured (seen bit 0:
+// the light pass leaves it). worldToPrevClip: the face's view-projection (clip.w = the distance along its axis);
+// toWorldX: its depth (distance = y / (d + x)) and size; t0 its depth, t1 its HDR colour; prevGridMin: the level's cells.
+[numthreads(4, 4, 4)]
+void inject(uint3 id : SV_DispatchThreadID)
+{
+    int n = (int)gridMin.w;
+    if (any(id >= (uint)n))
+        return;
+    int3 g = (int3)prevGridMin.xyz;
+    int3 cell = g + Wrap(int3(id) - g);
+    float3 centre = (cell + 0.5) * voxelSize;
+    float4 clip = mul(float4(centre, 1), worldToPrevClip);
+    if (clip.w < 1.5) // the face's near plane (1.5 m with entities)
+        return;
+    float2 ndc = clip.xy / clip.w;
+    if (any(abs(ndc) > 1))
+        return;
+    // In the camera's view the z-prepass and the screen decide.
+    float3 V = mul(float4(centre, 1), worldToView).xyz;
+    if (-V.z > 0.3 && all(abs(V.xy / (-V.z * invProj)) <= 1))
+        return;
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    float tolerance = voxelSize * 0.87;
+    // The face sees well past the cell (every texel of the 3x3 around it beyond it): a cube stamp there is stale (an
+    // entity that moved, a door) and goes; the geometry's stamps stay (the update and the screen decide on those).
+    float nearest = 1e9;
+    [unroll] for (int j = -1; j <= 1; j++)
+        [unroll] for (int i = -1; i <= 1; i++)
+        {
+            float dn = depthTex.SampleLevel(pointClamp, uv + float2(i, j) / toWorldX.zw, 0).r;
+            nearest = min(nearest, dn >= 0.99999 ? 1e9 : toWorldX.y / (dn + toWorldX.x));
+        }
+    if (clip.w < nearest - 2 * tolerance)
+    {
+        if (occupancy[id] == 256u + 253u)
+        {
+            occupancy[id] = 0;
+            float4 gone = voxels[id];
+            gone.a = 0;
+            voxels[id] = gone;
+        }
+        return;
+    }
+    float d = depthTex.SampleLevel(pointClamp, uv, 0).r;
+    if (d >= 0.99999) // the sky
+        return;
+    float surface = toWorldX.y / (d + toWorldX.x);
+    if (abs(clip.w - surface) > tolerance)
+        return;
+    float3 c = colourTex.SampleLevel(pointClamp, uv, 0).rgb;
+    if (!Finite3(c))
+        return;
+    uint old;
+    InterlockedMax(occupancy[id], 256u + 253u, old);
+    float4 v = voxels[id];
+    float trust = saturate(kColourTrust / clip.w); // far: mostly fog and haze (as the screen's colour)
+    c = clamp(c, 0, 8);
+    v.rgb = v.a > 0.01 ? lerp(v.rgb, c, 0.5 * trust) : c * trust;
+    v.a = max(v.a, 253.0 / 255.0);
+    voxels[id] = v;
+    seen[id] = seen[id] | 1u;
+}
+
 // Cover above per cell of level 0 at half its resolution (roofOut, the GI's RoofAt): five rays up (straight and four
 // leaning 25 degrees) from the centre of the 2x2x2 block through level 0's cells within 32 cells (8 m), each covered
 // by the opacity it meets (1 - the product of 1 - a); the mean. An eighth of the texture a frame (mode: the slab of z).
@@ -4541,6 +4607,7 @@ struct Stats
     uint64_t zpassDraws, zpassTarget1; // draws into an R32F target with depth, of them with an SV_Target1 shader
     uint64_t voxShadowMaps, voxShadowJobs, voxShadowCovered, voxShadowRecorded, voxShadowDraws, voxShadowNoCamera; // ShadowMap
     uint64_t voxCubeSeen, voxCubeRecorded, voxCubeNoCamera, voxCubeFoliage, voxCubeRepeat, voxCubeJobs, voxCubeDraws; // cube faces
+    uint64_t voxInjectRuns, voxInjectSkipped; // RunCubeInject: faces put into the levels; faces whose depth and colour differ
     float voxShadowCover[8]; // the last frame's shadow maps: half the width they cover around the eye (m)
     uint32_t voxShadowCoverCount;
     uint64_t voxShadowMapDraws[8], voxShadowMapSeen[8]; // per map of a frame: draws, frames
@@ -6805,6 +6872,11 @@ public:
                                            // (2026-11-13, mine): the general pass places objects by a per-object matrix that
                                            // already holds the camera, so replacing the frame's view-projection left them in the
                                            // face's perspective - streaks through the whole grid (voxsnap_views.py)
+        bool cubeInject = false;           // CRYMT_GI_CUBEINJECT=1: cells from the engine cube's faces (kVoxShader "inject": the
+                                           // surfaces each face's depth shows, with its lit colour, outside the view). Off: on
+                                           // mine (2026-11-13, noon) it added only 3-5k level-0 cells, the cells found on
+                                           // turning were 93-98% surfaces the cube cannot see (backs, hidden parts), and
+                                           // inside the light change on turning grew (> 48/255: 14% of cells vs 1.4%)
         float lampLight = 1.0f;            // CRYMT_GI_LAMPS: the lamps' light on the geometry's cells (0 none)
         bool lampTest = false;             // CRYMT_GI_LAMPTEST=1: also on cells the screen coloured (to see it in the voxel view)
         int mipOpacity = 4;                // CRYMT_GI_MIPOPACITY: coarse cells' opacity, 0 the mean, 1/2/3 by rays through, 4 per axis (downsample)
@@ -6915,6 +6987,7 @@ public:
             read(L"CRYMT_GI_SKYFILL", v.skyFill);
             v.shadowGeometry = GetEnvironmentVariableW(L"CRYMT_GI_SHADOWGEOM", text, 32) && wcscmp(text, L"0") != 0;
             v.cubeGeometry = GetEnvironmentVariableW(L"CRYMT_GI_CUBEGEOM", text, 32) && wcscmp(text, L"0") != 0;
+            v.cubeInject = GetEnvironmentVariableW(L"CRYMT_GI_CUBEINJECT", text, 32) && wcscmp(text, L"0") != 0;
             read(L"CRYMT_GI_LAMPS", v.lampLight);
             v.lampTest = GetEnvironmentVariableW(L"CRYMT_GI_LAMPTEST", text, 32) && wcscmp(text, L"0") != 0;
             if (GetEnvironmentVariableW(L"CRYMT_GI_MIPOPACITY", text, 32))
@@ -7644,7 +7717,8 @@ public:
             UpdateFrameTexture(info);
         if (info->valid && g_fplusPlaceholder)
             UpdateFPlus(info);
-        g_wantPassMatrices.store(Gi().on && Gi().geometry && (Gi().shadowGeometry || Gi().cubeGeometry), std::memory_order_relaxed);
+        g_wantPassMatrices.store(Gi().on && Gi().geometry && (Gi().shadowGeometry || Gi().cubeGeometry || Gi().cubeInject),
+                                 std::memory_order_relaxed);
         GiCamera(info);
         m_giInScene = info->valid != 0;
         // A frame whose GI pass did not run leaves its draws: dropped with the first camera of the next frame. Not at
@@ -9236,10 +9310,10 @@ public:
         auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
         if (!compile || !g_serializeRoot)
             return false;
-        ID3DBlob* code[5] = {};
+        ID3DBlob* code[6] = {};
         ID3DBlob* errors = nullptr;
-        const char* entries[5] = {"update", "view", "downsample", "light", "roof"};
-        for (int i = 0; i < 5; i++)
+        const char* entries[6] = {"update", "view", "downsample", "light", "roof", "inject"};
+        for (int i = 0; i < 6; i++)
             if (FAILED(compile(kVoxShader, strlen(kVoxShader), "CryMT_Vox", nullptr, nullptr, entries[i], "cs_5_0", 1 << 15, 0, &code[i], &errors)))
             {
                 Log("voxel shader %s: %s", entries[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
@@ -9277,8 +9351,8 @@ public:
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = m_voxRoot;
         HRESULT hr = S_OK;
-        ID3D12PipelineState** psos[5] = {&m_voxPsoUpdate, &m_voxPsoView, &m_voxPsoDown, &m_voxPsoLight, &m_voxPsoRoof};
-        for (int i = 0; i < 5; i++)
+        ID3D12PipelineState** psos[6] = {&m_voxPsoUpdate, &m_voxPsoView, &m_voxPsoDown, &m_voxPsoLight, &m_voxPsoRoof, &m_voxPsoInject};
+        for (int i = 0; i < 6; i++)
         {
             pd.CS = {code[i]->GetBufferPointer(), code[i]->GetBufferSize()};
             if (SUCCEEDED(hr))
@@ -9497,7 +9571,7 @@ public:
     // Between CryMT's "CryMT engine cube" marks (the engine drawing a face of its cube).
     bool CubeRecording() const
     {
-        return m_engineCubePass && Gi().on && Gi().geometry && Gi().cubeGeometry && m_giHaveCamera && m_voxOcc[0];
+        return m_engineCubePass && Gi().on && Gi().geometry && (Gi().cubeGeometry || Gi().cubeInject) && m_giHaveCamera && m_voxOcc[0];
     }
 
     std::vector<VoxCameraPatch> FindMatrices(const float* vp, const float* vpZero) const
@@ -9530,6 +9604,20 @@ public:
         const bool shadow = kind == 1, cube = kind == 2;
         if (cube)
         {
+            // The face's own targets and camera, at its first scene draw (depth written into an HDR target): what the
+            // inject pass reads at the face's end.
+            if (!m_cubeFaceNoted && m_dsv && m_dsv->info && m_rtv[0] && m_rtv[0]->info && m_ps &&
+                m_rtv[0]->format == DXGI_FORMAT_R16G16B16A16_FLOAT && !(m_depth && m_depth->d12.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO))
+            {
+                m_cubeFaceNoted = true;
+                m_cubeFaceDepth = m_dsv->info;
+                m_cubeFaceDepthFormat = m_dsv->format;
+                m_cubeFaceColour = m_rtv[0]->info;
+                MatMul(m_passMv, m_passProj, m_cubeFaceVp);
+                memcpy(m_cubeFaceProj, m_passProj, sizeof(m_cubeFaceProj));
+            }
+            if (!Gi().cubeGeometry)
+                return;
             m_stats.voxCubeSeen++;
             if (m_cubeDrawsFrame != g_presented) // a frame's face draws the voxelization did not take (GI voxels off)
             {
@@ -10046,6 +10134,79 @@ public:
 
     // Inside RunGi, before the grid update: the recorded z-prepass draws into the occupancy grids of levels 0-2 (their cells,
     // toroidal), projected along x, y or z (one axis a frame, the update takes stamps of the last three frames).
+    // The engine cube's face just drawn into the geometry levels (kVoxShader "inject", CRYMT_GI_CUBEINJECT): at its "end"
+    // mark, while its depth and HDR colour targets still hold it. Cells outside the camera's view where the face shows a
+    // surface get the cube's stamp and the face's colour.
+    void RunCubeInject()
+    {
+        ResourceInfo* depth = m_cubeFaceDepth;
+        ResourceInfo* colour = m_cubeFaceColour;
+        m_cubeFaceNoted = false;
+        if (!Gi().on || !Gi().cubeInject || !m_voxValid || !m_voxPsoInject || !m_voxOcc[0] || !depth || !colour || !depth->res ||
+            !colour->res || m_cubeFaceDepthFormat == DXGI_FORMAT_UNKNOWN)
+            return;
+        const D3D12_RESOURCE_DESC dd = depth->res->GetDesc(), cd = colour->res->GetDesc();
+        if (dd.Width != cd.Width || dd.Height != cd.Height || dd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        {
+            m_stats.voxInjectSkipped++;
+            return;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+        VoxTable(cpu, gpu, kVoxGeomLevels);
+        Require(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Require(colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        FlushBarriers();
+        const auto at = [&](int i) { return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + i * g.srvInc}; };
+        for (int l = 0; l < kVoxGeomLevels; l++)
+        {
+            const int b = l * static_cast<int>(kVoxTable);
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DepthSrvFormat(m_cubeFaceDepthFormat);
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2D.MipLevels = 1;
+            g.dev->CreateShaderResourceView(depth->res, &sd, at(b));
+            sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g.dev->CreateShaderResourceView(colour->res, &sd, at(b + 1));
+            NullSrv(at(b + 2));
+            VoxUav(at(b + 3), 0, l);
+            OccupancyUav(at(b + 4), l);
+            VoxUav(at(b + 5), -1);
+            SeenUav(at(b + 6), l);
+            AlbedoUav(at(b + 7), l);
+            VoxUav(at(b + 8), -1);
+        }
+        // The face's depth to distance: clip.w = s z (s = +-1 the projection's handedness), d = A s + B / distance.
+        const float A = m_cubeFaceProj[10], B = m_cubeFaceProj[14], s = m_cubeFaceProj[11] >= 0 ? 1.0f : -1.0f;
+        m_list->SetComputeRootSignature(m_voxRoot);
+        m_list->SetPipelineState(m_voxPsoInject);
+        for (int l = 0; l < kVoxGeomLevels; l++)
+        {
+            float c[kVoxConstants] = {};
+            VoxConstants(c, m_cubeFaceVp, m_giFullW, m_giFullH, 0.0f, l); // worldToView, invProj: the camera's
+            memcpy(c + 16, m_cubeFaceVp, 16 * sizeof(float));                // worldToPrevClip: the face's view-projection
+            c[32] = -A * s;                                                   // toWorldX: its depth (x, y), size
+            c[33] = B;
+            c[34] = static_cast<float>(dd.Width);
+            c[35] = static_cast<float>(dd.Height);
+            for (int i = 0; i < 3; i++)
+                c[52 + i] = c[56 + i] = static_cast<float>(m_voxPrevGrid[l][i]); // the level's cells as they stand
+            m_list->SetComputeRoot32BitConstants(0, kVoxConstants, c, 0);
+            m_list->SetComputeRootDescriptorTable(1, {gpu.ptr + static_cast<UINT64>(l) * kVoxTable * g.srvInc});
+            m_list->Dispatch(kVoxN / 4, kVoxN / 4, kVoxN / 4);
+            D3D12_RESOURCE_BARRIER uav[3] = {};
+            for (D3D12_RESOURCE_BARRIER& u : uav)
+                u.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav[0].UAV.pResource = m_vox[l];
+            uav[1].UAV.pResource = m_voxOcc[l];
+            uav[2].UAV.pResource = m_voxSeen[l];
+            m_list->ResourceBarrier(3, uav);
+        }
+        m_stats.voxInjectRuns++;
+        m_psoApplied = nullptr;
+    }
+
     // cubeOnly: the engine cube's face just drawn (its "end" mark: its draws' data is still current), toWorld its camera.
     void RunVoxelGeometry(const float* toWorld, uint32_t stamp, bool cubeOnly = false)
     {
@@ -12421,6 +12582,7 @@ private:
     ID3D12PipelineState* m_voxPsoDown = nullptr;
     ID3D12PipelineState* m_voxPsoLight = nullptr; // sunlight for geometry cells (kVoxShader "light")
     ID3D12PipelineState* m_voxPsoRoof = nullptr;  // cover above (kVoxShader "roof")
+    ID3D12PipelineState* m_voxPsoInject = nullptr; // the engine cube's face into the levels (kVoxShader "inject")
     ID3D12Resource* m_voxRoof = nullptr;          // its texture, R8 at half level 0's resolution
     float m_giSun[8] = {};                        // the last scene's sun (DlssSceneInfo::sun): towards it, valid, colour
     float m_giLamps[8][12] = {};                  // and its lamps (DlssSceneInfo::lamps)
@@ -12457,6 +12619,12 @@ private:
     uint64_t m_cubeDrawsFrame = ~0ull; // the frame (g_presented) whose face draws m_cubeDraws holds
     uint64_t m_cubeTurn = 0;           // cube jobs run (their axis turns)
     float m_cubeToWorld[16] = {};      // the face camera's inverse view at its first recorded draw
+    // The face being drawn, for the inject pass (CRYMT_GI_CUBEINJECT): its depth and HDR colour targets and its camera.
+    bool m_cubeFaceNoted = false;
+    ResourceInfo* m_cubeFaceDepth = nullptr;
+    ResourceInfo* m_cubeFaceColour = nullptr;
+    DXGI_FORMAT m_cubeFaceDepthFormat = DXGI_FORMAT_UNKNOWN; // its depth view's (D24_UNORM_S8_UINT...)
+    float m_cubeFaceVp[16] = {}, m_cubeFaceProj[16] = {};
     float m_passMv[16] = {}, m_passProj[16] = {}; // the renderer's matrices now (stream order, kOpMatrices)
     float m_shadowMv[16] = {};                    // the light matrix of the current shadow map
     bool m_shadowRecording = false;               // the current shadow map's draws are this frame's job
@@ -12858,6 +13026,16 @@ void Device::PassName(const char* text)
         if (end && !m_cubeDraws.empty())
         {
             RunVoxelGeometry(m_cubeToWorld, 1, true);
+            RestoreListState();
+        }
+        // The surfaces the face shows (its depth and colour) into the levels, outside the camera's view.
+        if (!end)
+            m_cubeFaceNoted = false;
+        else if (m_cubeFaceNoted)
+        {
+            PassName("CryMT GI cube inject");
+            RunCubeInject();
+            PassNameEnd();
             RestoreListState();
         }
         return;
@@ -15817,6 +15995,9 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu\n",
             static_cast<unsigned long long>(s.sssRuns), s.sssRuns ? static_cast<double>(s.sssDispatches) / s.sssRuns : 0.0,
             static_cast<unsigned long long>(s.sssNoDepth));
+    if (s.voxInjectRuns || s.voxInjectSkipped)
+        fprintf(f, "  GI cells from the engine cube's faces (inject): faces %llu (%.2f per frame), skipped (depth and colour sizes differ) %llu\n",
+                static_cast<unsigned long long>(s.voxInjectRuns), s.voxInjectRuns / frames, static_cast<unsigned long long>(s.voxInjectSkipped));
     if (s.voxCubeSeen)
         fprintf(f, "  GI geometry from the engine cube's faces: draws seen %.1f per frame, recorded %.1f, without the face camera %.1f, "
                    "foliage left out %.1f, repeats %.1f; jobs %llu, voxelized %.1f per frame\n",
