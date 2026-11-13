@@ -74,6 +74,8 @@ def main():
     if os.path.exists(p):
         for line in open(p):
             t = line.split()
+            if len(t) < 4 or t[1] != 'jitter':
+                continue
             info[int(t[0])] = (float(t[2]), float(t[3]), int(t[5]), float(t[7]), float(t[9]))
     frames = []
     for n in range(100):

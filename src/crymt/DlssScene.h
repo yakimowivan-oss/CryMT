@@ -39,4 +39,10 @@ struct DlssSceneInfo
     // vegetation's motion vectors, written per 1/60 s, are scaled to the time between frames.
     float time, frameTime;
     uint32_t pad6[2];
+    // Diagnosis (2026-11-13, DLAA textures flowing on a still camera): at the hand-over, the renderer's own view (+0x50,
+    // what the motion blur pass takes as now) and previous view (+0xD0), and the top of its modelview stack.
+    float viewLate[16], viewPrevLate[16], viewStackLate[16];
+    // The camera's place in the world (the CCamera's matrix translation, as the engine renders camera-relative; w 1 when
+    // set): the reprojections take the camera's move from these, not from the view matrix's rounded translation.
+    float camPos[4];
 };

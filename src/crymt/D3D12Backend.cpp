@@ -3216,6 +3216,67 @@ void MatMul(const float* a, const float* b, float* out)
             out[r * 4 + c] = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c] + a[r * 4 + 3] * b[12 + c];
 }
 
+// This view's points (row vectors: x, y, -distance, 1) to the previous frame's clip space, in double, from the two
+// views' rotations and the camera's two places (2026-11-13). The float product RigidInverse(view) x previous view lost
+// ~0.3 mm of the camera's place 2 km from the world's origin (the view's translation ~3000 has a float step of 0.24 mm,
+// and the product cancels it): on a surface 1.5 m away that is 0.2-0.3 px at 5120x1440, the same every frame on a still
+// camera (a false zoom) and noise while moving. DLSS kept sliding its history under the textures of near ground and walls
+// ("textures flow after the camera moves"; edges, clamped by DLSS, stayed). The place comes from the CCamera (camPos, w
+// 1); without it, from the view's translation in double. world = v R^T + c; previous view = world P + t' = v (R^T P) +
+// (c - c') P.
+void CameraPlace(const float* view, const float* camPos, double* c)
+{
+    if (camPos && camPos[3] == 1.0f)
+    {
+        for (int i = 0; i < 3; i++)
+            c[i] = camPos[i];
+        return;
+    }
+    for (int i = 0; i < 3; i++)
+        c[i] = -(static_cast<double>(view[12]) * view[i * 4] + static_cast<double>(view[13]) * view[i * 4 + 1] + static_cast<double>(view[14]) * view[i * 4 + 2]);
+}
+
+void ReprojDouble(const float* view, const float* camPos, const float* prevView, const float* prevCamPos, const float* prevProj, float* out)
+{
+    double c[3], cp[3];
+    CameraPlace(view, camPos, c);
+    CameraPlace(prevView, prevCamPos, cp);
+    double m[16] = {};
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+        {
+            double s = 0.0;
+            for (int k = 0; k < 3; k++)
+                s += static_cast<double>(view[k * 4 + i]) * prevView[k * 4 + j];
+            m[i * 4 + j] = s;
+        }
+    for (int j = 0; j < 3; j++)
+    {
+        double s = 0.0;
+        for (int k = 0; k < 3; k++)
+            s += (c[k] - cp[k]) * prevView[k * 4 + j];
+        m[12 + j] = s;
+    }
+    m[15] = 1.0;
+    for (int r = 0; r < 4; r++)
+        for (int col = 0; col < 4; col++)
+        {
+            double s = 0.0;
+            for (int k = 0; k < 4; k++)
+                s += m[r * 4 + k] * prevProj[k * 4 + col];
+            out[r * 4 + col] = static_cast<float>(s);
+        }
+}
+
+// The camera's move between two frames (metres), for the cut test.
+double CameraJump(const float* view, const float* camPos, const float* prevView, const float* prevCamPos)
+{
+    double c[3], cp[3];
+    CameraPlace(view, camPos, c);
+    CameraPlace(prevView, prevCamPos, cp);
+    return sqrt((c[0] - cp[0]) * (c[0] - cp[0]) + (c[1] - cp[1]) * (c[1] - cp[1]) + (c[2] - cp[2]) * (c[2] - cp[2]));
+}
+
 // Inverse of a rotation and translation (the view matrix): transposed rotation, translation moved back through it.
 void RigidInverse(const float* m, float* out)
 {
@@ -7537,6 +7598,7 @@ public:
         {
             memcpy(m_giView, info->view, sizeof(m_giView));
             memcpy(m_giProj, info->proj, sizeof(m_giProj));
+            memcpy(m_giCamPos, info->camPos, sizeof(m_giCamPos));
             m_giHaveCamera = true;
         }
     }
@@ -8812,18 +8874,17 @@ public:
                 g.dev->CreateUnorderedAccessView(env ? m_envAtlas[m_envCur] : m_giFull, nullptr, nullptr, at(b4 + i));
         }
         // History reprojection: this view to the world, then the previous view and projection. A camera cut has none.
-        float toWorld[16], toPrevView[16], reproj[16];
+        float toWorld[16], reproj[16];
         RigidInverse(m_giView, toWorld);
-        const float jx = toWorld[12] - m_giPrevToWorld[12], jy = toWorld[13] - m_giPrevToWorld[13], jz = toWorld[14] - m_giPrevToWorld[14];
-        if (jx * jx + jy * jy + jz * jz > 100.0f)
+        if (CameraJump(m_giView, m_giCamPos, m_giPrevView, m_giPrevCamPos) > 10.0)
             m_giReset = true;
         if (m_giReset)
         {
             memcpy(m_giPrevView, m_giView, sizeof(m_giPrevView));
             memcpy(m_giPrevProj, m_giProj, sizeof(m_giPrevProj));
+            memcpy(m_giPrevCamPos, m_giCamPos, sizeof(m_giPrevCamPos));
         }
-        MatMul(toWorld, m_giPrevView, toPrevView);
-        MatMul(toPrevView, m_giPrevProj, reproj);
+        ReprojDouble(m_giView, m_giCamPos, m_giPrevView, m_giPrevCamPos, m_giPrevProj, reproj);
         const GiSettings& s = Gi();
         float c[kGiConstants] = {static_cast<float>(m_giFullW), static_cast<float>(m_giFullH), static_cast<float>(m_giW), static_cast<float>(m_giH),
                                  1.0f / m_giProj[0], 1.0f / m_giProj[5], m_giProj[10], m_giProj[14],
@@ -8855,6 +8916,7 @@ public:
 
         memcpy(m_giPrevView, m_giView, sizeof(m_giPrevView));
         memcpy(m_giPrevProj, m_giProj, sizeof(m_giPrevProj));
+        memcpy(m_giPrevCamPos, m_giCamPos, sizeof(m_giPrevCamPos));
         memcpy(m_giPrevToWorld, toWorld, sizeof(m_giPrevToWorld));
         const UINT groupsX = (m_giW + 7) / 8, groupsY = (m_giH + 7) / 8;
         m_list->SetComputeRootSignature(m_giRoot);
@@ -10955,6 +11017,19 @@ public:
                     fprintf(f, "%d jitter %.5f %.5f reset %d proj8 %.7f proj9 %.7f cam %.4f %.4f %.4f fwd %.5f %.5f %.5f time %.5f\n", index, info->jitterX,
                             info->jitterY, info->reset ? 1 : 0, info->proj[8], info->proj[9], toWorld[12], toWorld[13], toWorld[14], -toWorld[8], -toWorld[9],
                             -toWorld[10], info->time);
+                    // The matrices themselves (tools: which view explains the picture's move).
+                    const auto put = [&](const char* name, const float* m) {
+                        fprintf(f, "%d %s", index, name);
+                        for (int i = 0; i < 16; i++)
+                            fprintf(f, " %.9g", m[i]);
+                        fprintf(f, "\n");
+                    };
+                    put("view", info->view);
+                    put("proj", info->proj);
+                    put("viewLate", info->viewLate);
+                    put("viewPrevLate", info->viewPrevLate);
+                    put("viewStackLate", info->viewStackLate);
+                    fprintf(f, "%d camPos %.6f %.6f %.6f %.1f\n", index, info->camPos[0], info->camPos[1], info->camPos[2], info->camPos[3]);
                     fclose(f);
                 }
             }
@@ -11715,16 +11790,15 @@ public:
         g.dev->CreateUnorderedAccessView(m_dlssMvec, nullptr, nullptr, at(4)); // not written
         g.dev->CreateUnorderedAccessView(m_dlssMvec, nullptr, nullptr, at(5)); // not written
         // This view to the world, then the previous view and projection; a cut (or the first frame) has no motion.
-        float toWorld[16], toPrevView[16], reproj[16];
+        float toWorld[16], reproj[16];
         RigidInverse(info.view, toWorld);
-        const float jx = toWorld[12] - m_mvPrevToWorld[12], jy = toWorld[13] - m_mvPrevToWorld[13], jz = toWorld[14] - m_mvPrevToWorld[14];
-        if (info.reset || !m_mvHavePrev || jx * jx + jy * jy + jz * jz > 100.0f)
+        if (info.reset || !m_mvHavePrev || CameraJump(info.view, info.camPos, m_mvPrevView, m_mvPrevCamPos) > 10.0)
         {
             memcpy(m_mvPrevView, info.view, sizeof(m_mvPrevView));
             memcpy(m_mvPrevProj, info.proj, sizeof(m_mvPrevProj));
+            memcpy(m_mvPrevCamPos, info.camPos, sizeof(m_mvPrevCamPos));
         }
-        MatMul(toWorld, m_mvPrevView, toPrevView);
-        MatMul(toPrevView, m_mvPrevProj, reproj);
+        ReprojDouble(info.view, info.camPos, m_mvPrevView, m_mvPrevCamPos, m_mvPrevProj, reproj);
         float c[kGiConstants] = {static_cast<float>(color->width), static_cast<float>(color->height), 0.0f, 0.0f,
                                  1.0f / info.proj[0], 1.0f / info.proj[5], info.proj[10], info.proj[14]};
         memcpy(c + 16, reproj, sizeof(reproj));
@@ -11741,6 +11815,7 @@ public:
         c[35] = bend ? 1.0f : 0.0f;
         memcpy(m_mvPrevView, info.view, sizeof(m_mvPrevView));
         memcpy(m_mvPrevProj, info.proj, sizeof(m_mvPrevProj));
+        memcpy(m_mvPrevCamPos, info.camPos, sizeof(m_mvPrevCamPos));
         memcpy(m_mvPrevToWorld, toWorld, sizeof(m_mvPrevToWorld));
         m_mvHavePrev = true;
         m_list->SetComputeRootSignature(m_giRoot);
@@ -12006,6 +12081,7 @@ private:
     UINT m_giW = 0, m_giH = 0, m_giFullW = 0, m_giFullH = 0;
     int m_giCur = 0;
     float m_giView[16] = {}, m_giProj[16] = {}; // the frame's main camera (GiCamera)
+    float m_giCamPos[4] = {}, m_giPrevCamPos[4] = {}; // its place (DlssSceneInfo::camPos), and the previous GI pass's
     float m_giPrevView[16] = {}, m_giPrevProj[16] = {}, m_giPrevToWorld[16] = {}; // the last GI pass's camera
     bool m_giHaveCamera = false;
     // The object motion blur pass's target this frame (r_MotionBlur 3, Very High): RGBA16F, full size, drawn before
@@ -12024,6 +12100,7 @@ private:
     uint64_t m_ombDiagFrame = ~0ull;
     uint64_t m_ombFrame = ~0ull;
     float m_mvPrevView[16] = {}, m_mvPrevProj[16] = {}, m_mvPrevToWorld[16] = {}; // the last motion pass's camera
+    float m_mvPrevCamPos[4] = {};                                                  // its place (DlssSceneInfo::camPos)
     bool m_mvHavePrev = false;
     ID3D12Resource* m_giDist[2] = {};
     ID3D12PipelineState* m_mvPso = nullptr;

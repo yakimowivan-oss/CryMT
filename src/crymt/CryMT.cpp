@@ -2784,6 +2784,11 @@ void DlssCamera(uintptr_t renderer, const uint8_t* camera, int level)
     {
         memcpy(g_dlssScene.view, **reinterpret_cast<float***>(renderer + kModelViewStackOffset), sizeof(g_dlssScene.view));
         memcpy(g_dlssScene.proj, proj, sizeof(g_dlssScene.proj));
+        const float* camMatrix = reinterpret_cast<const float*>(camera); // CCamera: Matrix34 at +0, the place in m03 m13 m23
+        g_dlssScene.camPos[0] = camMatrix[3];
+        g_dlssScene.camPos[1] = camMatrix[7];
+        g_dlssScene.camPos[2] = camMatrix[11];
+        g_dlssScene.camPos[3] = 1.0f;
         g_dlssScene.nearZ = nearZ;
         g_dlssScene.farZ = *reinterpret_cast<const float*>(camera + kCamFar);
         g_dlssScene.fov = fov;
@@ -3001,6 +3006,9 @@ void DlssBeforeList(uintptr_t renderer)
     g_dlssScene.reset = g_dlssReset;
     g_dlssScene.time = g_timerSnap ? g_tCurr[0] : 0.0f;
     g_dlssScene.frameTime = g_timerSnap ? g_tFrame[0] : 0.0f;
+    memcpy(g_dlssScene.viewLate, reinterpret_cast<const uint8_t*>(renderer) + 0x50, sizeof(g_dlssScene.viewLate));
+    memcpy(g_dlssScene.viewPrevLate, reinterpret_cast<const uint8_t*>(renderer) + 0xD0, sizeof(g_dlssScene.viewPrevLate));
+    memcpy(g_dlssScene.viewStackLate, **reinterpret_cast<float***>(renderer + kModelViewStackOffset), sizeof(g_dlssScene.viewStackLate));
     g_dlssReset = false;
     // The sun for the GI's voxel light: the level-1 light farthest away (its origin is the sun ~1000 km out; CRYMT_SUNDUMP
     // on island: one light, origin (-823130, 509032, 252289), colour at +0x1C 8.25 6.90 5.16 1).

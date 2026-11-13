@@ -322,7 +322,11 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
     // Matrices without jitter; the view is orthonormal, so its inverse is the camera's placement in the world.
     const sl::float4x4 view = Load(scene.view);
     const sl::float4x4 proj = Load(scene.proj);
-    const sl::float4x4 viewToWorld = Invert(view);
+    sl::float4x4 viewToWorld = Invert(view);
+    // The camera's place from the CCamera (the inverse of the view's float translation is off by ~0.2 mm 2 km from the
+    // world's origin, a different amount each frame: see D3D12Backend ReprojDouble).
+    if (scene.camPos[3] == 1.0f)
+        viewToWorld[3] = sl::float4(scene.camPos[0], scene.camPos[1], scene.camPos[2], 1.0f);
     // A camera cut (teleport, level start, cutscene) has no usable history.
     const float dx = viewToWorld[3].x - g_prevViewToWorld[3].x, dy = viewToWorld[3].y - g_prevViewToWorld[3].y, dz = viewToWorld[3].z - g_prevViewToWorld[3].z;
     const bool reset = scene.reset || !g_havePrev || dx * dx + dy * dy + dz * dz > 100.0f;

@@ -40,6 +40,8 @@ p = os.path.join(folder, f'{tag}_mvinfo.txt')
 if os.path.exists(p):
     for line in open(p):
         t = line.split()
+        if len(t) < 4 or t[1] != 'jitter':
+            continue
         jit[int(t[0])] = (float(t[2]), float(t[3]))
 allrows = []
 for n in range(1, 64):
