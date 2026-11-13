@@ -17,6 +17,8 @@ struct GiControl
     std::atomic<int> contact{-1};  // contact shadows: 0 off, 1 the old 12 steps, 2 Bend's screen-space shadows
     std::atomic<int> sssReach{-1}; // the screen-space shadows' reach (metres); -1 as CRYMT_SSS_REACH says
     std::atomic<int> sssWeapon{-1}; // their thickness on the weapon and hands, the panel's list index; -1 as CRYMT_SSS_WEAPONTHICK
+    std::atomic<int> giNear{-1};    // the GI at full strength up to (out by 2.5 x, the baked occlusion in): the panel's list
+                                    // index (30 40 50 62 m); -1 as CRYMT_GI_TERRAINAONEAR
     std::atomic<int> particles{-1}; // blended particles (smoke, dust) take the GI 1 / 0
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> dlssPreset{-1}; // the DLAA model, the panel's list index (K J L M F E); -1 as CRYMT_DLSS_PRESET

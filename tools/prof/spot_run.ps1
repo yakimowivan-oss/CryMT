@@ -64,6 +64,8 @@ $defs = [ordered]@{
     nocube = @{Gi = '1'; Env = @{CRYMT_WATERCUBE = '0'; CRYMT_ENVMAP = 'game'}}
     # The voxel light pass's march towards the sun: the whole grid (128 cells) instead of 24, GPU per pass.
     sunmarch128_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_SUNMARCH = '128'}}
+    # The GI at full strength up to 62 m (out by 155 m) instead of 30 (out by 75): the far brightness (Sponza).
+    ginear62 = @{Gi = '1'; Env = @{CRYMT_GI_TERRAINAONEAR = '62'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}

@@ -7134,6 +7134,7 @@ public:
         g.sss = g_giControl.contact == 2;
         g.sssReach = g_giControl.sssReach > 0 ? static_cast<float>(g_giControl.sssReach) : b.sssReach;
         g.sssWeaponThickness = g_giControl.sssWeapon >= 0 && g_giControl.sssWeapon < 5 ? kSssWeaponThick[g_giControl.sssWeapon] : b.sssWeaponThickness;
+        g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -10754,6 +10755,15 @@ public:
     // The screen-space shadows' reach on the panel (metres): the list's entry nearest a value.
     static constexpr int kSssReaches[6] = {100, 200, 500, 1000, 2000, 4000};
     static constexpr float kSssWeaponThick[5] = {0.005f, 0.02f, 0.05f, 0.1f, 0.2f}; // the panel's list for the weapon and hands
+    static constexpr int kGiNears[4] = {30, 40, 50, 62}; // the panel's "GI at full strength up to" (metres; 62: the field's top)
+    static int GiNearIndex(float metres)
+    {
+        int best = 0;
+        for (int i = 1; i < 4; i++)
+            if (fabsf(static_cast<float>(kGiNears[i]) - metres) < fabsf(static_cast<float>(kGiNears[best]) - metres))
+                best = i;
+        return best;
+    }
     static int SssWeaponIndex(float t)
     {
         int best = 0;
@@ -10802,6 +10812,8 @@ public:
         static const char* const cubeMip[] = {"АВТО|AUTO", "0", "1", "2", "3", "4", "5", "6", "7", "8"};
         static const char* const cubeBlend[] = {"ВЫКЛ|OFF", "50%", "25%"};
         static const char* const cubeSize[] = {"64", "128", "256", "512"};
+        static const char* const giNear[] = {"30 М (ДО 75)|30 M (TO 75)", "40 М (ДО 100)|40 M (TO 100)", "50 М (ДО 125)|50 M (TO 125)",
+                                             "62 М (ДО 155)|62 M (TO 155)"};
         static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
@@ -10837,6 +10849,11 @@ public:
             {1, "SSS: толщина рук и оружия|SSS: hands and weapon thickness", 0, 4, 1, false, sssWeapon, 0, nullptr,
              [] { const int v = g_giControl.sssWeapon; return v >= 0 ? v : SssWeaponIndex(GiBase().sssWeaponThickness); },
              [] { return SssWeaponIndex(GiBase().sssWeaponThickness); }, [](int v) { g_giControl.sssWeapon = v; }, true, nullptr},
+            // How far the GI works in full; it fades out by 2.5 x that and the engine's baked occlusion comes back (the
+            // user, Sponza 2026-11-13: "everything far away much lighter" - where the baked occlusion is weak).
+            {0, "GI в полную силу до|GI at full strength up to", 0, 3, 1, false, giNear, 0, nullptr,
+             [] { const int v = g_giControl.giNear; return v >= 0 ? v : GiNearIndex(GiBase().terrainAoNear); },
+             [] { return GiNearIndex(GiBase().terrainAoNear); }, [](int v) { g_giControl.giNear = v; }, true, nullptr},
             {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
              [] { return GiBase().particlesGi ? 1 : 0; }, [](int v) { g_giControl.particles = v; }, true, nullptr},
