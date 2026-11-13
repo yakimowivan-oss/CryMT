@@ -5337,14 +5337,24 @@ public:
     {
         static const int env = [] {
             wchar_t v[8] = {};
-            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_CULL", v, 8) ? std::min(std::max(_wtoi(v), 0), 2) : 2;
+            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_CULL", v, 8) ? std::min(std::max(_wtoi(v), 0), 3) : 3;
         }();
         return env;
     }
     static int EngineCubeCull()
     {
         const int panel = g_giControl.envCubeCull;
-        return panel < 0 ? EngineCubeCullBase() : std::min(panel, 2);
+        return panel < 0 ? EngineCubeCullBase() : std::min(panel, 3);
+    }
+    // 3 (the default since 2026-11-13 night): per face. Village, each face drawn with every mode and compared with no
+    // culling (closed meshes look the same with the right one): faces 0 1 2 4 5 the inverted one (11-15% of pixels off,
+    // the noise of the faces' blending; the engine's 50-88%), face 3 the engine's (5% against 27%: its image is not
+    // mirrored; the walls had holes in it - the user).
+    static int EngineCubeCullFor(int face)
+    {
+        static constexpr int kPerFace[6] = {2, 2, 2, 0, 2, 2};
+        const int mode = EngineCubeCull();
+        return mode < 3 ? mode : face >= 0 && face < 6 ? kPerFace[face] : 2;
     }
     // A new face mixed into the HDR copy (CRYMT_ENVCUBE_BLEND, the reflections page): 1 replaces, 0.5 half (default), 0.25.
     static float EngineCubeBlend()
@@ -10814,7 +10824,7 @@ public:
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE", "КУБ ДВИЖКА|ENGINE CUBE"};
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
         static const char* const waterSource[] = {"ВОКСЕЛИ|VOXELS", "ДВИЖОК|ENGINE"};
-        static const char* const cubeCull[] = {"КАК В ДВИЖКЕ|ENGINE'S", "НЕТ|NONE", "ОБРАТНОЕ|INVERTED"};
+        static const char* const cubeCull[] = {"КАК В ДВИЖКЕ|ENGINE'S", "НЕТ|NONE", "ОБРАТНОЕ|INVERTED", "ПО ГРАНЯМ|PER FACE"};
         static const char* const cubeMip[] = {"АВТО|AUTO", "0", "1", "2", "3", "4", "5", "6", "7", "8"};
         static const char* const cubeBlend[] = {"ВЫКЛ|OFF", "50%", "25%"};
         static const char* const cubeSize[] = {"64", "128", "256", "512"};
@@ -10915,7 +10925,7 @@ public:
             {3, "Грань кубкарты рисуется|Cube map face drawn", 0, 5, 1, false, cubeRate, 0, nullptr,
              [] { const int v = g_giControl.envCubeRate; return EnvCubeRateIndex(v > 0 ? v : EnvCubeRateBase()); },
              [] { return EnvCubeRateIndex(EnvCubeRateBase()); }, [](int v) { g_giControl.envCubeRate = kEnvCubeRates[v]; }, true, nullptr},
-            {3, "Отсечение в кубкарте|Cube map culling", 0, 2, 1, true, cubeCull, 0, nullptr, [] { return EngineCubeCull(); },
+            {3, "Отсечение в кубкарте|Cube map culling", 0, 3, 1, true, cubeCull, 0, nullptr, [] { return EngineCubeCull(); },
              [] { return EngineCubeCullBase(); }, [](int v) { g_giControl.envCubeCull = v; }, true, nullptr},
             {3, "Mip кубкарты (отладка)|Cube map mip (debug)", 0, 9, 1, false, cubeMip, 0, nullptr,
              [] { return std::max(g_giControl.envCubeMip.load(), -1) + 1; }, [] { return 0; }, [](int v) { g_giControl.envCubeMip = v - 1; }, true,
@@ -12784,6 +12794,7 @@ private:
     bool m_engineCubeDumpWanted = false;
     D3D12_CPU_DESCRIPTOR_HANDLE m_trilinearClamp{}; // the water's sampler for CryMT's cube
     bool m_engineCubePass = false; // between CryMT's "CryMT engine cube" marks (PassName), stream order
+    int m_engineCubeFace = -1;     // the engine's face being drawn (the start mark's " f<n>"), -1 not told
     bool m_envReady = false, m_envFailed = false;
     ID3D12Resource* m_pvol = nullptr;         // its atlas: 1024 x 513 RGBA32F (fine, coarse; shares, place row, tints), pvol.dds
     D3D12_CPU_DESCRIPTOR_HANDLE m_pvolCpu{};  // its view for the pixel shaders
@@ -13083,13 +13094,20 @@ void Device::PassName(const char* text)
 {
     // CryMT.cpp EnvCubeUpdate marks the engine's cube render in stream order (with or without pass names).
     // "CryMT engine cube" (a face mixed in), "... fresh" (it replaces the old one), "... end" (the HDR copy takes it).
-    if (strncmp(text, "CryMT engine cube", 17) == 0 && (!text[17] || !strcmp(text + 17, " fresh") || !strcmp(text + 17, " end")))
+    // A start mark may end in " f<n>": the engine's face this render draws (the culling per face).
+    const char* cubeRest = strncmp(text, "CryMT engine cube", 17) == 0 ? text + 17 : nullptr;
+    const char* cubeF = cubeRest ? strrchr(cubeRest, 'f') : nullptr;
+    const int cubeFace = cubeF && cubeF > cubeRest && cubeF[-1] == ' ' && cubeF[1] >= '0' && cubeF[1] <= '5' && !cubeF[2] ? cubeF[1] - '0' : -1;
+    const size_t cubeBase = cubeRest ? (cubeFace >= 0 ? static_cast<size_t>(cubeF - 1 - cubeRest) : strlen(cubeRest)) : 0;
+    const bool cubeFreshMark = cubeRest && cubeBase == 6 && !strncmp(cubeRest, " fresh", 6);
+    if (cubeRest && (cubeBase == 0 || cubeFreshMark || !strcmp(cubeRest, " end")))
     {
-        const bool end = !strcmp(text + 17, " end");
+        const bool end = !strcmp(cubeRest, " end");
         if (!end)
         {
-            m_engineCubeFresh = text[17] != 0;
+            m_engineCubeFresh = cubeFreshMark;
             m_engineCubeLastFace = -1;
+            m_engineCubeFace = cubeFace;
         }
         m_engineCubePass = !end;
         m_psoDirty = true; // its culling (EngineCubeCull)
@@ -13246,7 +13264,7 @@ ID3D12PipelineState* Device::Pso(bool indexed)
     k.layout = m_layout ? m_layout->Id() : 0;
     k.blend = m_blend ? m_blend->Id() : 0;
     k.depth = m_depth ? m_depth->Id() : 0;
-    const int cubeCull = m_engineCubePass ? EngineCubeCull() : 0;
+    const int cubeCull = m_engineCubePass ? EngineCubeCullFor(m_engineCubeFace) : 0;
     k.raster = (m_raster ? m_raster->Id() : 0) | static_cast<uint32_t>(cubeCull) << 28;
     k.sampleMask = m_sampleMask;
     UINT numRtv = 0;

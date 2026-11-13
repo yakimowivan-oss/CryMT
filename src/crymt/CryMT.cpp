@@ -6145,8 +6145,12 @@ void EnvCubeUpdate()
         memcpy(lightsBefore[l], renderer + kRdLevelLights + l * 16, 16);
     EnvDepthSnapshot(renderer);
     // The back end lets the encode pass read its source (Device::ReleaseOutput) and takes the face into its HDR copy at the
-    // end, replacing the old one while the cube is new here (fresh).
-    D3DLayerPassName(facesDrawn < 6 ? "CryMT engine cube fresh" : "CryMT engine cube");
+    // end, replacing the old one while the cube is new here (fresh). " f<n>": the engine's face this render draws (entry +8),
+    // for the back end's culling per face.
+    char cubeMark[48];
+    snprintf(cubeMark, sizeof(cubeMark), "%s f%d", facesDrawn < 6 ? "CryMT engine cube fresh" : "CryMT engine cube",
+             std::min(std::max(*reinterpret_cast<const int*>(entry + 8), 0), 5));
+    D3DLayerPassName(cubeMark);
     const EngineLightState lightsIn = ReadEngineLights();
     g_cubeLightIdCount = 0;
     if (EnvCubeOwnFrame())
@@ -8790,9 +8794,9 @@ void RunTestCommands()
         FocusLog("frame %llu: materials' reflection mode %d", static_cast<unsigned long long>(g_frame), g_giControl.env.load());
         return;
     }
-    if (_strnicmp(command, "crymt_envcubecull ", 18) == 0) // the engine's cube faces' culling: 0 the engine's, 1 none, 2 inverted
+    if (_strnicmp(command, "crymt_envcubecull ", 18) == 0) // the engine's cube faces' culling: 0 the engine's, 1 none, 2 inverted, 3 per face
     {
-        g_giControl.envCubeCull = std::min(std::max(atoi(command + 18), 0), 2);
+        g_giControl.envCubeCull = std::min(std::max(atoi(command + 18), 0), 3);
         g_giControl.active = true;
         FocusLog("frame %llu: engine cube culling %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeCull.load());
         return;
