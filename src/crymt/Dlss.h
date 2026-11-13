@@ -36,6 +36,10 @@ struct Images
     D3D12_RESOURCE_STATES exposureState;
     ID3D12Resource* bias; // R16F bias towards the current colour (water, particles), else null
     D3D12_RESOURCE_STATES biasState;
+    // The model comparison (GiControl::dlssCompare): a second DLSS (viewport 1, its own history) with the other model
+    // into this, like output; the caller puts its right half over output's. Null: no comparison.
+    ID3D12Resource* output2;
+    D3D12_RESOURCE_STATES output2State;
 };
 
 // DLAA on the list; the caller restores its own list state afterwards (descriptor heaps, root signature, pipeline).

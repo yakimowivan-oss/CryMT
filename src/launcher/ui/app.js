@@ -383,10 +383,11 @@
     }
     function seg(items, cur, onPick) {
         const box = el('div', 'seg');
-        items.forEach(([v, label]) => {
+        items.forEach(([v, label, title]) => {
             const b = el('button', v === cur ? 'on' : '', esc(label));
             b.type = 'button';
             b.dataset.v = v;
+            if (title) b.title = title;
             b.addEventListener('click', () => onPick(v));
             box.append(b);
         });
@@ -410,7 +411,7 @@
             box.addEventListener('change', () => set(o.id, box.value));
             wrap.append(box);
         } else if (o.type === 'select') {
-            wrap.append(seg(o.choices.map(c => [c.v, c.label]), S.values[o.id], v => set(o.id, v)));
+            wrap.append(seg(o.choices.map(c => [c.v, c.label, c.desc]), S.values[o.id], v => set(o.id, v)));
         } else {
             const box = el('div', 'sl');
             const track = el('div', 'sl-track');
@@ -783,6 +784,8 @@
             '<h3>' + esc(o.label) + '</h3>' +
             (b ? tt('<div class="warn">Сейчас не действует: нужно — ', '<div class="warn">No effect now: needs ') + esc(b) + '</div>' : '') +
             '<p>' + esc(o.hint || '') + '</p>' +
+            // A choice's own description (e.g. the DLAA models): the current one.
+            (o.type === 'select' && o.choices ? row(tt('Этот вариант', 'This choice'), esc((o.choices.find(c => c.v === v) || {}).desc || '')) : '') +
             row(tt('Влияет на', 'Affects'), esc(o.affects || '')) +
             row(tt('Цена', 'Cost'), o.cost ? esc(o.cost) : tt('<span class="dim">незаметна</span>', '<span class="dim">negligible</span>')) +
             row(tt('В игре', 'In game'), o.hotkey ? '<kbd>' + esc(o.hotkey) + tt('</kbd> <span class="dim">до выхода из игры</span>', '</kbd> <span class="dim">until the game exits</span>') : '') +

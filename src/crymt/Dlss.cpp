@@ -31,6 +31,7 @@ const char* const kProjectId = "6f3c2b1e-9a4d-4c8e-b7f2-1d5e8a9c0b37";
 void (*g_log)(const char*);
 bool g_active;
 PFun_slInit* g_slInit;
+PFun_slFreeResources* g_slFreeResources; // optional: the comparison's second DLSS let go
 PFun_slSetD3DDevice* g_slSetD3DDevice;
 PFun_slIsFeatureSupported* g_slIsFeatureSupported;
 PFun_slGetNewFrameToken* g_slGetNewFrameToken;
@@ -172,6 +173,7 @@ bool Init(ID3D12Device* device, const LUID& adapter, void (*log)(const char*))
         Logf("streamline: sl.interposer.dll not loaded (%lu)", GetLastError());
         return false;
     }
+    Resolve(sl, "slFreeResources", g_slFreeResources);
     if (!Resolve(sl, "slInit", g_slInit) || !Resolve(sl, "slSetD3DDevice", g_slSetD3DDevice) || !Resolve(sl, "slIsFeatureSupported", g_slIsFeatureSupported) ||
         !Resolve(sl, "slGetNewFrameToken", g_slGetNewFrameToken) || !Resolve(sl, "slSetConstants", g_slSetConstants) ||
         !Resolve(sl, "slSetTagForFrame", g_slSetTagForFrame) || !Resolve(sl, "slEvaluateFeature", g_slEvaluateFeature) ||
@@ -298,6 +300,62 @@ int PresetDefaultIndex()
     return 0;
 }
 
+sl::DLSSOptions g_options{};      // the main DLSS's, for the comparison's copy
+uint64_t g_compareEvaluations;      // the comparison's second DLSS (viewport 1)
+bool g_compareLive;                 // it has resources
+
+// The model comparison: the same inputs into a second DLSS (viewport 1, its own history) with another model, into
+// images.output2. Called after the main one, with its frame token and constants.
+void EvaluateCompare(const Images& images, sl::FrameToken& token, const sl::Constants& c, const sl::ResourceTag* tags, uint32_t tagCount,
+                     sl::CommandBuffer* cmd)
+{
+    static int optionsPreset = -1;
+    static uint32_t optionsWidth, optionsHeight;
+    const int compare = g_giControl.dlssCompare.load();
+    const sl::ViewportHandle viewport(1);
+    if (compare < 0 || compare >= 6 || !images.output2)
+    {
+        if (g_compareLive && g_slFreeResources)
+            g_slFreeResources(sl::kFeatureDLSS, viewport);
+        g_compareLive = false;
+        optionsPreset = -1;
+        return;
+    }
+    if (compare != optionsPreset || images.width != optionsWidth || images.height != optionsHeight)
+    {
+        sl::DLSSOptions options = g_options;
+        options.dlaaPreset = static_cast<sl::DLSSPreset>(kPresetLetters[compare] - 'A' + 1);
+        if (g_slDLSSSetOptions(viewport, options) != sl::Result::eOk)
+        {
+            if (g_failures++ < 5)
+                Logf("streamline: comparison options failed");
+            return;
+        }
+        optionsPreset = compare;
+        optionsWidth = images.width;
+        optionsHeight = images.height;
+        Logf("streamline: comparison DLAA preset %u on the right half", static_cast<unsigned>(options.dlaaPreset));
+    }
+    if (g_slSetConstants(c, token, viewport) != sl::Result::eOk)
+        return;
+    sl::Resource output(sl::ResourceType::eTex2d, images.output2, static_cast<uint32_t>(images.output2State));
+    sl::ResourceTag mine[6];
+    for (uint32_t i = 0; i < tagCount && i < 6; i++)
+        mine[i] = tags[i];
+    const sl::Extent extent{0, 0, images.width, images.height};
+    mine[1] = sl::ResourceTag(&output, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent, &extent);
+    if (g_slSetTagForFrame(token, viewport, mine, tagCount, cmd) != sl::Result::eOk)
+        return;
+    const sl::BaseStructure* inputs[] = {&viewport};
+    if (g_slEvaluateFeature(sl::kFeatureDLSS, token, inputs, 1, cmd) == sl::Result::eOk)
+    {
+        g_compareEvaluations++;
+        g_compareLive = true;
+    }
+    else if (g_failures++ < 5)
+        Logf("streamline: comparison evaluate failed");
+}
+
 bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssSceneInfo& scene)
 {
     if (!g_active)
@@ -333,6 +391,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
             g_failures++;
             return false;
         }
+        g_options = options;
         g_optionsWidth = images.width;
         g_optionsHeight = images.height;
         optionsExposure = ownExposure;
@@ -443,12 +502,14 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
         return false;
     }
     g_evaluations++;
+    EvaluateCompare(images, *token, c, tags, tagCount, cmd);
     return true;
 }
 
 void WriteStats(FILE* f)
 {
-    fprintf(f, "  dlss: active %d, evaluations %llu, failures %llu, history resets %llu\n", g_active, static_cast<unsigned long long>(g_evaluations),
-            static_cast<unsigned long long>(g_failures), static_cast<unsigned long long>(g_resets));
+    fprintf(f, "  dlss: active %d, evaluations %llu, failures %llu, history resets %llu; model comparison (right half) %llu\n", g_active,
+            static_cast<unsigned long long>(g_evaluations), static_cast<unsigned long long>(g_failures), static_cast<unsigned long long>(g_resets),
+            static_cast<unsigned long long>(g_compareEvaluations));
 }
 } // namespace dlss

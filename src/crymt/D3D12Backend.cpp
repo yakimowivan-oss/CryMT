@@ -4518,6 +4518,7 @@ struct Stats
     uint64_t depthToSrv, rtClears, dsClears;
     uint64_t scenes, dlssFrames, giPasses, motionPasses, objectMotionPasses, objectMotionCopies, bendMotionPasses, biasFrames, biasDraws, biasGiven, voxPasses, giLateReads, giOtherDepth;
     uint64_t objectMotionExactFrames, objectMotionExactDraws, objectMotionExactPasses;
+    uint64_t dlssCompares; // frames the DLAA model comparison put its right half over the output
     uint64_t voxGeomDraws, voxGeomNoCamera, voxGeomSkipped, voxGeomNoPso, voxGeomPsos, voxGeomFoliage; // RunVoxelGeometry
     uint64_t voxGeomSolid; // of voxGeomDraws: not foliage
     uint64_t voxGeomStale; // replays skipped: the draw's list was done, its ring data possibly reused (VoxDraw::serial)
@@ -10494,6 +10495,8 @@ public:
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
         static const char* const dlssModel[] = {"K (ТРАНСФОРМЕР)|K (TRANSFORMER)", "J", "L (DLSS 4.5)|L (DLSS 4.5)", "M (DLSS 4.5)|M (DLSS 4.5)",
                                                 "F (CNN)|F (CNN)", "E (CNN)|E (CNN)"};
+        static const char* const dlssCompare[] = {"ВЫКЛ|OFF", "СПРАВА K|RIGHT: K", "СПРАВА J|RIGHT: J", "СПРАВА L|RIGHT: L", "СПРАВА M|RIGHT: M",
+                                                  "СПРАВА F|RIGHT: F", "СПРАВА E|RIGHT: E"};
         static const std::vector<PanelItem> items = {
             // GI
             {0, "GI|GI", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.enabled ? 1 : 0; }, [] { return 1; },
@@ -10629,6 +10632,9 @@ public:
             {4, "Модель DLAA|DLAA model", 0, 5, 1, true, dlssModel, 0, nullptr,
              [] { const int v = g_giControl.dlssPreset; return v < 0 ? dlss::PresetDefaultIndex() : v; },
              [] { return dlss::PresetDefaultIndex(); }, [](int v) { g_giControl.dlssPreset = v; }, true, nullptr},
+            // A second DLSS with another model on the right half (each half its own history; DLAA's cost twice).
+            {4, "Сравнить модели (слева/справа)|Compare models (left/right)", 0, 6, 1, true, dlssCompare, 0, nullptr,
+             [] { return g_giControl.dlssCompare + 1; }, [] { return 0; }, [](int v) { g_giControl.dlssCompare = v - 1; }, true, nullptr},
             // Time
             {5, "Время суток|Time of day", 0, 47, 2, true, nullptr, 0, nullptr,
              [] { const float t = g_giControl.timeOfDay; return t < 0 ? 0 : static_cast<int>(lroundf(t * 2.0f)) % 48; },
@@ -11137,9 +11143,27 @@ public:
             FlushBarriers();
             m_stats.biasGiven++;
         }
+        // The model comparison (panel: Engine > Compare DLAA models): a second DLSS with the other model into m_dlssOut2,
+        // its right half put over the main output below.
+        const bool compare = g_giControl.dlssCompare >= 0;
+        if (compare && !m_dlssOut2)
+        {
+            D3D12_RESOURCE_DESC d = m_dlssOut->GetDesc();
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, __uuidof(ID3D12Resource),
+                                                      reinterpret_cast<void**>(&m_dlssOut2))))
+                m_dlssOut2 = nullptr;
+        }
+        else if (!compare && m_dlssOut2)
+        {
+            DeferRelease(m_dlssOut2);
+            m_dlssOut2 = nullptr;
+        }
         const dlss::Images images{sanitized ? m_dlssIn : color->res, sanitized ? kSrvState : color->state, depth->res, depth->state, m_dlssMvec, kSrvState,
                                   m_dlssOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, color->width, color->height, motion,
-                                  exposure ? m_dlssExposure : nullptr, kSrvState, bias ? bias->info->res : nullptr, kSrvState};
+                                  exposure ? m_dlssExposure : nullptr, kSrvState, bias ? bias->info->res : nullptr, kSrvState,
+                                  compare ? m_dlssOut2 : nullptr, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
         PassName("CryMT DLAA");
         const bool done = dlss::Evaluate(m_list, images, *info);
         PassNameEnd();
@@ -11150,6 +11174,38 @@ public:
             m_barriers.push_back(Transition(m_dlssIn, kSrvState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
         if (!done)
             return;
+        if (compare && m_dlssOut2)
+        {
+            // The right half from the comparison's DLSS; the halves meet at the screen's middle.
+            D3D12_RESOURCE_BARRIER cb[2] = {Transition(m_dlssOut2, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                            Transition(m_dlssOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)};
+            m_list->ResourceBarrier(2, cb);
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = m_dlssOut;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.pResource = m_dlssOut2;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const UINT half = color->width / 2;
+            const D3D12_BOX box{half, 0, 0, color->width, color->height, 1};
+            m_list->CopyTextureRegion(&dst, half, 0, 0, &src, &box);
+            cb[0] = Transition(m_dlssOut2, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            cb[1] = Transition(m_dlssOut, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            m_list->ResourceBarrier(2, cb);
+            // A light 2-pixel line where the halves meet (the same scene on both sides hides the seam otherwise).
+            D3D12_CPU_DESCRIPTOR_HANDLE rcpu;
+            D3D12_GPU_DESCRIPTOR_HANDLE rgpu;
+            if (m_srvRing.TryAlloc(1, rcpu, rgpu))
+            {
+                const D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_srvCpu.Alloc();
+                g.dev->CreateUnorderedAccessView(m_dlssOut, nullptr, nullptr, cpu);
+                g.dev->CreateUnorderedAccessView(m_dlssOut, nullptr, nullptr, rcpu);
+                const FLOAT light[4] = {3.0f, 3.0f, 3.0f, 1.0f};
+                const D3D12_RECT line{static_cast<LONG>(half) - 1, 0, static_cast<LONG>(half) + 1, static_cast<LONG>(color->height)};
+                m_list->ClearUnorderedAccessViewFloat(rgpu, cpu, m_dlssOut, light, 1, &line);
+                g_srvCpu.Free(cpu); // read when the clear was recorded
+            }
+            m_stats.dlssCompares++;
+        }
         RunSanitizeOut(color->width, color->height);
         Require(color, D3D12_RESOURCE_STATE_COPY_DEST);
         m_barriers.push_back(Transition(m_dlssOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE));
@@ -11576,7 +11632,8 @@ public:
         DeferRelease(m_dlssOut);
         DeferRelease(m_dlssMvec);
         DeferRelease(m_dlssIn);
-        m_dlssOut = m_dlssMvec = m_dlssIn = nullptr;
+        DeferRelease(m_dlssOut2);
+        m_dlssOut = m_dlssMvec = m_dlssIn = m_dlssOut2 = nullptr;
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC d{};
@@ -12260,6 +12317,7 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE m_nullRtv{}; // for gaps between bound render targets
     size_t m_activeQueries = 0;              // occlusion queries begun and not ended
     ID3D12Resource* m_dlssOut = nullptr;
+    ID3D12Resource* m_dlssOut2 = nullptr; // the model comparison's second DLSS output (GiControl::dlssCompare)
     ID3D12Resource* m_dlssMvec = nullptr;
     int m_sceneDumpIndex = 0; // the frame number of a motion vector sequence dump (CRYMT_MVSEQ)
     UINT m_dlssWidth = 0, m_dlssHeight = 0;

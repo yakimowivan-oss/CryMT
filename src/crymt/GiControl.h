@@ -20,6 +20,7 @@ struct GiControl
     std::atomic<int> particles{-1}; // blended particles (smoke, dust) take the GI 1 / 0
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> dlssPreset{-1}; // the DLAA model, the panel's list index (K J L M F E); -1 as CRYMT_DLSS_PRESET
+    std::atomic<int> dlssCompare{-1}; // a second DLAA model for the right half of the screen (same index), -1 off
     std::atomic<int> particleOut{-1}; // their darkening outdoors, percent of the indoor one (50 70 100 150 200)
     std::atomic<int> bakedOff{-1}; // the engine's baked occlusion the GI replaces (bits 2 the objects' RAM, 4 their sky
                                    // amount, 8 TerrainAO, 16 the terrain's vertex AO)

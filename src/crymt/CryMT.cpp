@@ -8848,6 +8848,12 @@ void RunTestCommands()
         FocusLog("frame %llu: DLAA model index %d", static_cast<unsigned long long>(g_frame), g_giControl.dlssPreset.load());
         return;
     }
+    if (_strnicmp(command, "crymt_dlsscompare ", 18) == 0) // the panel's comparison row: -1 off, else the right half's model index
+    {
+        g_giControl.dlssCompare = atoi(command + 18);
+        FocusLog("frame %llu: DLAA model comparison %d", static_cast<unsigned long long>(g_frame), g_giControl.dlssCompare.load());
+        return;
+    }
     if (_strnicmp(command, "crymt_capture ", 14) == 0)
     {
         Dx12CaptureNow(atoi(command + 14), (g_giControl.enabled ? 1 : 0) | (g_giControl.contact != 0 ? 4 : 0));
