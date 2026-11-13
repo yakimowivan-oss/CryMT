@@ -1407,9 +1407,9 @@ Texture3D<float4> dirTex3 : register(t10);
 Buffer<float4> visAreas : register(t11); // [0].x count; per area 10: x, y box, (z min, z max, points, 0), 16 points (x, y pairs)
 Texture3D<float> roofTex : register(t12); // cover above per cell of level 0 at half its resolution (RoofAt)
 
-// 1 inside one of the VisAreas near the camera (the rooms the level marks as indoors; with a margin of 0.3 m, so walls
-// on their border count), else 0.
-float VisInside(float3 P)
+// The VisArea near the camera that holds P (the rooms the level marks as indoors; with a margin of 0.3 m, so walls on
+// their border count), else -1.
+int VisAreaAt(float3 P)
 {
     int count = (int)visAreas[0].x;
     [loop] for (int k = 0; k < count; k++)
@@ -1432,9 +1432,34 @@ float VisInside(float3 P)
             edge = min(edge, length(w - e * saturate(dot(w, e) / max(dot(e, e), 1e-6))));
         }
         if (odd || edge < 0.3)
-            return 1;
+            return k;
     }
-    return 0;
+    return -1;
+}
+
+// 1 inside one of the VisAreas near the camera, else 0.
+float VisInside(float3 P) { return VisAreaAt(P) >= 0 ? 1 : 0; }
+
+// The room the GI's cones start in (CRYMT_GI_ROOMLIGHT, visAreas[0].y): its VisArea's box (with the 0.3 m margin);
+// samples outside it bring no light, they still block. Sunlit roofs and outer walls came in through the coarse mips of
+// thin walls (the user, village 2026-11-13: "the sun outside lights the walls inside, they are overexposed"; the GI
+// darkened the stair 52.8 -> 27.2 but its upper walls and ceiling stayed light). g_roomZ.x > g_roomZ.y: no room.
+static float4 g_roomXY = 0;
+static float2 g_roomZ = float2(1, 0);
+void SetRoom(int k)
+{
+    int b = 1 + k * 10;
+    g_roomXY = visAreas[b] + float4(-0.3, -0.3, 0.3, 0.3);
+    g_roomZ = visAreas[b + 1].xy + float2(-0.3, 0.3);
+}
+// How much of a sample's footprint (radius r) lies inside the room's box: 1 wholly inside, 0.5 centred on its wall,
+// 0 wholly outside; 1 without a room.
+float RoomWeight(float3 X, float r)
+{
+    if (g_roomZ.x > g_roomZ.y)
+        return 1;
+    float3 inside = min(X - float3(g_roomXY.xy, g_roomZ.x), float3(g_roomXY.zw, g_roomZ.y) - X);
+    return saturate(min(inside.x, min(inside.y, inside.z)) / max(2 * r, 0.25) + 0.5);
 }
 SamplerState linearWrap : register(s2);
 
@@ -1560,7 +1585,7 @@ float4 ConeTrace(float3 O, float3 dir, float halfTan, float start, float reach, 
             v = lerp(w, v, edge);
         }
         float above = plane ? saturate((dot(X - Ps, Ns) - diameter * 0.5) / (diameter * 0.5)) : 1;
-        light += (1 - blocked) * v.rgb * above;
+        light += (1 - blocked) * v.rgb * above * RoomWeight(X, diameter * 0.5);
         // Distant cover (hills, forest tens of metres away) took the ambient of open ground: occlusion counts fully up
         // to occRange.x, fading out by occRange.y (Crytek's cone max length is 12 m); indoors the cover is near.
         float near = occRange.x > 0 ? saturate((occRange.x - d) / (occRange.x * 0.5)) : 1;
@@ -1962,6 +1987,9 @@ void trace(uint3 id : SV_DispatchThreadID)
             float3 B = cross(Nw, T);
             float3 O = Pw + Nw * (voxParams.x * 2);
             float start = voxParams.x * 2;
+            const int area = VisAreaAt(Pw);
+            if (area >= 0 && visAreas[0].y > 0.5)
+                SetRoom(area);
             float4 cone = ConeTrace(O, Nw, 0.577, start, voxParams.z, false, true, Pw, Nw, noise);
             float3 farLight = cone.rgb;
             float farOcc = cone.a;
@@ -1977,7 +2005,7 @@ void trace(uint3 id : SV_DispatchThreadID)
             farOcc /= 3;
             // Indoors: a VisArea; else the cover above (houses without one): the roof texture half a metre off the
             // surface and, when the two strengths differ, a ray up leaned off the surface and turned per texel.
-            float roof = VisInside(Pw);
+            float roof = area >= 0 ? 1 : 0;
             if (roof < 1 && ((uint)options & 128) != 0) // CRYMT_GI_ROOFCELLS=1
                 roof = max(roof, RoofAt(Pw + Nw * (voxParams.x * 2)));
             if (roof < 1 && occRange.y != motionParams.w)
@@ -2008,6 +2036,12 @@ void trace(uint3 id : SV_DispatchThreadID)
                 }
                 farOcc = 1 - (1 - farOcc) * (1 - saturate(near / 3 * voxParams2.w));
             }
+            // The grid's outer edge: the voxel part fades over the outer level's last 16 cells (32 m), else it ended in a
+            // sharp line where the pixels left the grid (the user, village beach 2026-11-13: a hard edge that did not move
+            // with the GI's distance).
+            const float outer = saturate(EdgeCells(3, Pw, 0) / 16);
+            farLight *= outer;
+            farOcc *= outer;
             if (voxParams.y == 2)
             {
                 nearLight = 0;
@@ -6915,6 +6949,8 @@ public:
         float outdoorStrength = 1.0f;      // CRYMT_GI_OUTDOOR: the occlusion strength outdoors (Num4 / Num7 set the indoor one)
         bool roofCells = false;            // CRYMT_GI_ROOFCELLS=1: the roof texture (kVoxShader "roof") as well as the ray
         bool thinFix = true;               // CRYMT_GI_THIN=0: thin features keep their own (chance) GI
+        bool roomLight = true;             // CRYMT_GI_ROOMLIGHT=0: cones from inside a VisArea take light from outside it too
+                                           // (2026-11-13: sunlit roofs and outer walls leaked in through the coarse mips)
         float gtaoRadius = 0.5f;           // CRYMT_GI_GTAORADIUS, metres
         bool contactShadows = true;        // CRYMT_CONTACTSHADOWS=0: no screen-space contact shadows in the sun's shadow mask
         float contactLength = 0.35f;       // CRYMT_CONTACTLENGTH: the march's length at 10 m (metres; scales with distance)
@@ -7032,6 +7068,7 @@ public:
             read(L"CRYMT_GI_OUTDOOR", v.outdoorStrength);
             v.roofCells = GetEnvironmentVariableW(L"CRYMT_GI_ROOFCELLS", text, 32) && wcscmp(text, L"0") != 0;
             v.thinFix = !(GetEnvironmentVariableW(L"CRYMT_GI_THIN", text, 32) && wcscmp(text, L"0") == 0);
+            v.roomLight = !(GetEnvironmentVariableW(L"CRYMT_GI_ROOMLIGHT", text, 32) && wcscmp(text, L"0") == 0);
             v.replaceSsao = !(GetEnvironmentVariableW(L"CRYMT_GI_SSAO", text, 32) && wcscmp(text, L"0") != 0);
             read(L"CRYMT_GI_GTAO", v.gtao);
             read(L"CRYMT_GI_GTAORADIUS", v.gtaoRadius);
@@ -8925,6 +8962,7 @@ public:
             auto* f = reinterpret_cast<float*>(visUp.cpu);
             memset(f, 0, kVisFloat4s * 16);
             f[0] = static_cast<float>(m_giVisAreaCount);
+            f[1] = Gi().roomLight ? 1.0f : 0.0f; // [0].y: the cones from inside a room take no light from outside its box
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
         }

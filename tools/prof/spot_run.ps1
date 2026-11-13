@@ -70,6 +70,8 @@ $defs = [ordered]@{
     voxview = @{Gi = '1'; Env = @{CRYMT_GI_VOXELVIEW = '2'}}
     # The engine cube's down face drawn every turn (culling checks per face with crymt_envcubecull + crymt_cubepic).
     cubedown = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_DOWN = '1'}}
+    # GI cones from inside a VisArea take light from outside it too (before 2026-11-13 night).
+    noroom = @{Gi = '1'; Env = @{CRYMT_GI_ROOMLIGHT = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}
