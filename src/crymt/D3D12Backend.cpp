@@ -1600,6 +1600,40 @@ float4 SampleGrid(int level, float3 X, float mip)
     return voxelTex3.SampleLevel(linearWrap, uvw, mip);
 }
 
+// The cell X lies in at mip 0, no filtering (the probes' thin rays): a trilinear sample took the neighbouring cells, so
+// a probe a few centimetres over sunlit sand saw the sand in every direction, up too, and the ground lit itself through
+// the probes (the user, 2026-11-14: "outside everything is overexposed"; the bounce on island's beach 3.3 x the cones').
+int4 GridCell(int level, float3 X)
+{
+    const int n = (int)voxGrid.w;
+    const int3 c = (int3)floor(X / (voxParams.x * (1 << level)));
+    return int4(c & (n - 1), 0); // n = 128: a mask wraps negative cells too
+}
+
+float4 LoadGrid(int level, float3 X)
+{
+    const int4 c = GridCell(level, X);
+    if (level == 0)
+        return voxelTex.Load(c);
+    if (level == 1)
+        return voxelTex1.Load(c);
+    if (level == 2)
+        return voxelTex2.Load(c);
+    return voxelTex3.Load(c);
+}
+
+float3 LoadL1(int level, float3 X)
+{
+    const int4 c = GridCell(level, X);
+    if (level == 0)
+        return l1Tex.Load(c).xyz;
+    if (level == 1)
+        return l1Tex1.Load(c).xyz;
+    if (level == 2)
+        return l1Tex2.Load(c).xyz;
+    return l1Tex3.Load(c).xyz;
+}
+
 // The cone samples the finest grid level that holds it and has a mip as coarse as its diameter (mip m of level l has
 // cells of voxParams.x * 2^(l + m)); past the outer level's edge it stops. A sample whose footprint still reaches the
 // plane of the surface the cone starts from (Ps, Ns) counts only for the part above it: near starts would otherwise take
@@ -1904,10 +1938,12 @@ static const int3 kProbeN = int3(32, 32, 16);
 static const float kProbeSpacing = 1.0;
 static const float2 kProbeAtlas = float2(1024, 1152);
 // Phase 2, visibility (DDGI's): per probe the mean distance to what its rays hit and its square over the sphere, a tile
-// of 14 x 14 texels with a border of one (16 x 16) in a 2048 x 2048 atlas; distances clamped at 1.5 x the probe cell's
-// diagonal, the rays weighted by cos^50 around the texel's direction. A pixel takes a probe by Chebyshev's bound on the
-// chance that nothing stands between them (a probe behind a wall gets almost no weight).
-static const float2 kProbeDepthAtlas = float2(2048, 2048);
+// laid out as the light's (6 x 6 and a border, 1024 x 1024 RG16F); distances clamped at 1.5 x the probe cell's diagonal,
+// the rays weighted by cos^8 around the texel's direction. A pixel takes a probe by Chebyshev's bound on the chance that
+// nothing stands between them (a probe behind a wall gets almost no weight). DDGI's 14 x 14 at cos^50 cost ~1.5 ms here
+// (256 texels x 64 rays x pow a probe) and was undersampled by 64 rays anyway.
+static const float2 kProbeDepthAtlas = float2(1024, 1024);
+static const float kProbeDepthSharpness = 8;
 static const float kProbeMaxDistance = 1.5 * 1.7320508 * kProbeSpacing;
 groupshared float4 g_probeRay[64]; // a ray's light and occlusion
 groupshared float4 g_probeDir[64]; // its direction; w its distance (clamped)
@@ -1916,11 +1952,11 @@ int3 ProbeOrigin() { return (int3)floor(float3(toWorldX.w, toWorldY.w, toWorldZ.
 float3 ProbePos(int3 wc) { return (wc + 0.5) * kProbeSpacing; }
 int ProbeSlot(int3 wc)
 {
-    int3 s = ((wc % kProbeN) + kProbeN) % kProbeN;
+    int3 s = wc & (kProbeN - 1); // powers of two
     return s.x + s.y * kProbeN.x + s.z * kProbeN.x * kProbeN.y;
 }
 int2 ProbeTile(int slot) { return int2(slot & 127, slot >> 7) * 8; }
-int2 ProbeDepthTile(int slot) { return int2(slot & 127, slot >> 7) * 16; }
+int2 ProbeDepthTile(int slot) { return ProbeTile(slot); }
 
 // A border texel's interior one in a tile of (n + 2)^2: across an edge the octahedral neighbour, flipped; corners the
 // opposite corner (DDGI's border copy).
@@ -1940,7 +1976,7 @@ int2 OctInterior(int2 t, int n)
     return ip;
 }
 int2 ProbeStateTexel(int slot) { return int2(slot & 127, 1024 + (slot >> 7)); }
-float3 ProbeKey(int3 wc) { return float3(((wc % 1024) + 1024) % 1024); }
+float3 ProbeKey(int3 wc) { return float3(wc & 1023); }
 
 float2 OctEncode(float3 n)
 {
@@ -1973,13 +2009,17 @@ float3 ProbeRayDir(uint i, float f)
 // A thin ray through the grid from O along dir: front-to-back over the cells at mip 0 of the finest level that holds the
 // point (level 0 up to 6 m in half cells, 1 to 12 m, 2 to 24 m, then 3, a cell a step), the cells' light as the cones
 // take it (L1 / six directions); rgb light, a occlusion faded with distance as the cones' (occRange); hit where it was
-// half blocked (reach if never).
-float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
+// half blocked (reach if never). back: what it hit was a surface's back (DDGI's backface): the cells' light direction
+// around the hit (L1 at mip 1, which takes the surface's own cell: the cells filled behind a surface have none) points
+// along the ray. The probes under island's beach saw the sand's underside, sunlit, in every upward direction and lit the
+// beach (the user: "outside everything is overexposed").
+float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit, out bool back)
 {
     const float vs = voxParams.x;
     float3 light = 0;
     float blocked = 0, occ = 0, t = vs * 0.5 * (0.5 + jitter);
     hit = reach;
+    back = false;
     [loop] for (int i = 0; i < 128 && blocked < 0.95 && t < reach; i++)
     {
         const float3 X = O + dir * t;
@@ -1997,20 +2037,27 @@ float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
             t += cell * 3;
             continue;
         }
-        float4 v = SampleGrid(level, X, 0);
+        float4 v = LoadGrid(level, X); // the cell itself (GridCell)
         if (v.a > 0.004) // the cells' light direction only where there is a cell
         {
             if (visAreas[0].z > 1.5)
                 v.rgb = SixToward(level, X, 0, dir);
             else if (visAreas[0].z > 0.5)
-                v.rgb *= max(1 - dot(SampleL1(level, X, 0), dir), 0);
+                v.rgb *= max(1 - dot(LoadL1(level, X), dir), 0);
         }
+        // Mip 0 keeps the cells' colour as it is (mip 1 premultiplies it by the opacity; the cones start at mip 1): a
+        // nearly empty cell by a surface carried its full colour, and the probes over island's beach took 4-7 of light
+        // from above at an occlusion of 0.1.
+        v.rgb *= v.a;
         light += (1 - blocked) * v.rgb;
         const float near = occRange.x > 0 ? saturate((occRange.x - t) / (occRange.x * 0.5)) : 1;
         occ += (1 - blocked) * v.a * near;
         blocked += (1 - blocked) * v.a;
         if (blocked > 0.5 && hit >= reach)
+        {
             hit = t;
+            back = visAreas[0].z > 0.5 && dot(SampleL1(level, X, 1), dir) > 0.1;
+        }
         t += level == 0 ? cell * 0.5 : cell;
     }
     return float4(light, occ);
@@ -2023,7 +2070,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const int slot = gid.x + gid.y * 128;
     const int3 s = int3(slot % kProbeN.x, (slot / kProbeN.x) % kProbeN.y, slot / (kProbeN.x * kProbeN.y));
     const int3 origin = ProbeOrigin();
-    const int3 wc = origin + (((s - origin) % kProbeN) + kProbeN) % kProbeN; // the probe in the grid now at this slot
+    const int3 wc = origin + ((s - origin) & (kProbeN - 1)); // the probe in the grid now at this slot
     const int2 st = ProbeStateTexel(slot), texel = ProbeTile(slot) + int2(tid.xy);
     const float4 state = historyTex.Load(int3(st, 0));
     const bool valid = state.w >= 1 && all(state.xyz == ProbeKey(wc)) && temporal > 0;
@@ -2031,71 +2078,66 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     float4 ray = 0;
     float3 dir = 0;
     float hit = 0;
+    bool back = false;
     if (due)
     {
         dir = ProbeRayDir(gi, frame);
-        ray = RayTrace(ProbePos(wc), dir, voxParams.z, frac(gi * 0.618034 + frame * 0.381966), hit);
+        ray = RayTrace(ProbePos(wc), dir, voxParams.z, frac(gi * 0.618034 + frame * 0.381966), hit, back);
     }
-    g_probeRay[gi] = ray;
-    g_probeDir[gi] = float4(dir, min(hit, kProbeMaxDistance));
+    // A backface hit brings no light, and its distance is cut to a fifth (stored negative): the probe looks closed in
+    // that way, so the visibility test keeps it from the surface's front (RTXGI does the same).
+    g_probeRay[gi] = back ? float4(0, 0, 0, ray.a) : ray;
+    g_probeDir[gi] = float4(dir, back ? -0.2 * min(hit, kProbeMaxDistance) : min(hit, kProbeMaxDistance));
     GroupMemoryBarrierWithGroupSync();
     const float4 old = historyTex.Load(int3(texel, 0));
-    const int2 depthTile = ProbeDepthTile(slot);
+    const int2 dt = ProbeDepthTile(slot) + int2(tid.xy); // the distances' texel, laid out as the light's
+    const float2 oldM = srcTex.Load(int3(dt, 0)).xy;
     if (!due)
     {
         outTex[texel] = old;
-        [unroll] for (int j = 0; j < 4; j++)
-        {
-            const int k = gi + j * 64;
-            const int2 dt = depthTile + int2(k & 15, k >> 4);
-            probeDepthOut[dt] = srcTex.Load(int3(dt, 0));
-        }
+        probeDepthOut[dt] = float4(oldM, 0, 1);
         if (gi == 0)
             outTex[st] = state;
         return;
     }
-    // Light: the texel's interior one (the border copies the octahedral neighbour across the edge), cosine weights.
+    // The texel's interior one (the border copies the octahedral neighbour across the edge) and its direction: light by
+    // cosine weights, distances by cos^8.
     const float3 n = OctDecode((OctInterior(int2(tid.xy), 6) + 0.5) / 6 * 2 - 1);
     float4 sum = 0;
     float weights = 0;
+    float2 m = 0;
+    float mw = 0;
     [loop] for (int r = 0; r < 64; r++)
     {
-        const float w = max(dot(n, g_probeDir[r].xyz), 0);
+        const float c = dot(n, g_probeDir[r].xyz);
+        const float w = max(c, 0);
         sum += g_probeRay[r] * w;
         weights += w;
+        const float c2 = w * w, c4 = c2 * c2, wd = c4 * c4; // cos^8 (kProbeDepthSharpness)
+        const float dist = abs(g_probeDir[r].w);
+        m += float2(dist, dist * dist) * wd;
+        mw += wd;
     }
     const float4 fresh = sum / max(weights, 1e-4);
-    // Hysteresis 0.93 (64 rays a fourth frame: ~900 rays' worth; at 0.8 the probes boiled and one frame's look at the
-    // stair varied by 2.5 of 255 between runs); a big change (the light more than doubled or halved) goes in faster.
-    const float oldMax = max(max(old.r, old.g), old.b), freshMax = max(max(fresh.r, fresh.g), fresh.b);
-    const float hysteresis = abs(freshMax - oldMax) > max(oldMax, 0.02) ? 0.6 : 0.93;
-    outTex[texel] = valid ? lerp(fresh, old, hysteresis) : fresh;
-    // Distances: four texels a thread, cos^50 weights.
-    [loop] for (int j = 0; j < 4; j++)
-    {
-        const int k = gi + j * 64;
-        const int2 dt = depthTile + int2(k & 15, k >> 4);
-        const float3 dn = OctDecode((OctInterior(int2(k & 15, k >> 4), 14) + 0.5) / 14 * 2 - 1);
-        float2 m = 0;
-        float mw = 0;
-        [loop] for (int r = 0; r < 64; r++)
-        {
-            const float w = pow(saturate(dot(dn, g_probeDir[r].xyz)), 50);
-            const float dist = g_probeDir[r].w;
-            m += float2(dist, dist * dist) * w;
-            mw += w;
-        }
-        const float2 oldM = srcTex.Load(int3(dt, 0)).xy;
-        const float2 freshM = mw > 1e-4 ? m / mw : oldM;
-        probeDepthOut[dt] = float4(valid ? lerp(freshM, oldM, 0.93) : freshM, 0, 1);
-    }
+    const float2 freshM = mw > 1e-4 ? m / mw : oldM;
+    probeDepthOut[dt] = float4(valid ? lerp(freshM, oldM, 0.95) : freshM, 0, 1);
+    // Hysteresis 0.95 (64 rays a fourth frame: ~1300 rays' worth; at 0.8 the probes boiled and one frame's look at the
+    // stair varied by 2.5 of 255 between runs). A faster blend on big changes (0.6 when the light doubled or halved) made
+    // dim probes jump at their updates: the noise of 64 rays crossed that line (the user: voxels light up and go out).
+    outTex[texel] = valid ? lerp(fresh, old, 0.95) : fresh;
     if (gi == 0)
     {
-        float closeShare = 0;
+        // Inside geometry: most rays end within 0.35 m (in a wall), or a fifth or more hit backs (under the ground, in a
+        // closed rock): DDGI turns such a probe off at a quarter of backface hits.
+        float closeShare = 0, backShare = 0;
         [loop] for (int k = 0; k < 64; k++)
-            closeShare += g_probeDir[k].w < 0.35 ? 1 : 0;
-        closeShare /= 64;
-        outTex[st] = float4(ProbeKey(wc), 1 + (valid ? lerp(closeShare, state.w - 1, 0.5) : closeShare));
+        {
+            closeShare += abs(g_probeDir[k].w) < 0.35 ? 1 : 0;
+            backShare += g_probeDir[k].w < 0 ? 1 : 0;
+        }
+        // Kept slowly (0.9): a probe by a wall whose share of 64 rays wavered went on and off.
+        const float inside = saturate(max(closeShare, backShare * 4) / 64);
+        outTex[st] = float4(ProbeKey(wc), 1 + (valid ? lerp(inside, state.w - 1, 0.9) : inside));
     }
 }
 
@@ -2134,7 +2176,7 @@ float4 ProbeLight(float3 P, float3 N, out float inside)
         const float3 fromProbe = Pb - ProbePos(wc);
         const float dist = length(fromProbe);
         const float2 dOct = OctEncode(fromProbe / max(dist, 1e-4)) * 0.5 + 0.5;
-        const float2 m = probeDepthTex.SampleLevel(linearClamp, (ProbeDepthTile(slot) + 1 + dOct * 14) / kProbeDepthAtlas, 0).xy;
+        const float2 m = probeDepthTex.SampleLevel(linearClamp, (ProbeDepthTile(slot) + 1 + dOct * 6) / kProbeDepthAtlas, 0).xy;
         const float variance = abs(m.y - m.x * m.x);
         const float over = max(dist - m.x, 0);
         const float chebyshev = dist <= m.x ? 1 : variance / (variance + over * over);
@@ -8697,7 +8739,7 @@ public:
         return SUCCEEDED(hr);
     }
 
-    // GI v2's two probe atlases (kGiShader "probes"): made when first asked for, 2 x (9 MB light and states + 16 MB
+    // GI v2's two probe atlases (kGiShader "probes"): made when first asked for, 2 x (9 MB light and states + 4 MB
     // distances), zeroed (no probe traced yet).
     bool EnsureProbes()
     {
@@ -8715,7 +8757,7 @@ public:
         d.SampleDesc.Count = 1;
         d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         D3D12_RESOURCE_DESC dd = d;
-        dd.Width = dd.Height = 2048;
+        dd.Width = dd.Height = 1024;
         dd.Format = DXGI_FORMAT_R16G16_FLOAT;
         for (int i = 0; i < 2; i++)
         {
@@ -9792,9 +9834,11 @@ public:
         if (probesOn)
         {
             // GI v2: a group a probe slot (128 x 128 = kProbeN's 16384), then the atlas for the trace to read (t41).
+            PassName("CryMT GI probes"); // its own GPU time in the census (CRYMT_GPUPASSES)
             m_list->SetPipelineState(m_giPsoProbes);
             m_list->SetComputeRootDescriptorTable(1, {gpu.ptr + (aoTables + 30) * g.srvInc});
             m_list->Dispatch(128, 128, 1);
+            PassNameEnd();
             D3D12_RESOURCE_BARRIER toRead[2] = {Transition(probeCur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                                                 Transition(probeDepthCur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
             m_list->ResourceBarrier(2, toRead);
@@ -13480,7 +13524,7 @@ private:
     ID3D12Resource* m_giCam = nullptr;              // its 1x1 texture
     ID3D12PipelineState* m_giPsoProbes = nullptr;   // GI v2: the probes' rays and atlas (kGiShader "probes")
     ID3D12Resource* m_probeAtlas[2] = {};           // their atlases, written in turn (1024 x 1152 RGBA16F: tiles, states)
-    ID3D12Resource* m_probeDepth[2] = {};           // their distances (2048 x 2048 RG16F), with the atlas of the same index
+    ID3D12Resource* m_probeDepth[2] = {};           // their distances (1024 x 1024 RG16F, tiles as the light's), with the atlas of the same index
     D3D12_RESOURCE_STATES m_probeAtlasState[2] = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
     int m_probeCur = 0;                             // the one written next
     bool m_probeFailed = false;

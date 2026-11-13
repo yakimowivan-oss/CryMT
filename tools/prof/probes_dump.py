@@ -41,8 +41,9 @@ def main():
     v = mean[valid]
     print('light rgb mean %.4f %.4f %.4f (max %.3f), occlusion mean %.3f (min %.3f max %.3f)' % (
         v[:, 0].mean(), v[:, 1].mean(), v[:, 2].mean(), v[:, :3].max(), v[:, 3].mean(), v[:, 3].min(), v[:, 3].max()))
-    dt = dist[:2048, :2048, :].reshape(128, 16, 128, 16, 2).transpose(0, 2, 1, 3, 4).reshape(128 * 128, 16, 16, 2)[:n]
-    dmean = dt[:, 1:15, 1:15, 0].reshape(n, -1).mean(axis=1)
+    t = 16 if dist.shape[0] == 2048 else 8  # distance tiles: 16 x 16 before 2026-11-14 ~04:00, then as the light's
+    dt = dist[:128 * t, :128 * t, :].reshape(128, t, 128, t, 2).transpose(0, 2, 1, 3, 4).reshape(128 * 128, t, t, 2)[:n]
+    dmean = dt[:, 1:t - 1, 1:t - 1, 0].reshape(n, -1).mean(axis=1)
     print('distance mean over the sphere: %.3f m (min %.3f max %.3f)' % (dmean[valid].mean(), dmean[valid].min(), dmean[valid].max()))
     # world coordinate per slot from the states (mod 1024) and the probes nearest a point
     key = st[:, :3]
@@ -53,10 +54,18 @@ def main():
     pos = key + 0.5
     d2 = ((pos - (p % 1024)) ** 2).sum(axis=1)
     d2[~valid] = 1e9
+    count = int(sys.argv[5]) if len(sys.argv) >= 6 else 12
+    # 'up': the four centre texels of the 6x6 interior (octahedral +Z), 'down': its four corners (-Z)
+    up = inner.reshape(n, 6, 6, 4)[:, 2:4, 2:4, :].reshape(n, 4, 4).mean(axis=1)
+    corners = inner.reshape(n, 6, 6, 4)[:, [0, 0, 5, 5], [0, 5, 0, 5], :]
+    down = corners.mean(axis=1)
+    c0 = t // 2 - 1
+    dup = dt[:, c0:c0 + 2, c0:c0 + 2, 0].reshape(n, -1).mean(axis=1)  # the distance tile's centre: +Z
+    ddown = dt[:, [1, 1, t - 2, t - 2], [1, t - 2, 1, t - 2], 0].mean(axis=1)
     print('nearest probes to %.1f %.1f %.1f (mod 1024):' % tuple(p))
-    for i in np.argsort(d2)[:12]:
-        print('  slot %5d at %6.1f %6.1f %6.1f  inside %.2f  light %.3f %.3f %.3f  occ %.3f  dist %.2f' % (
-            i, *pos[i], inside[i], *mean[i, :3], mean[i, 3], dmean[i]))
+    for i in np.argsort(d2)[:count]:
+        print('  slot %5d at %6.1f %6.1f %6.1f  inside %.2f  light %.3f  up %.3f/occ %.2f/%.2fm  down %.3f/occ %.2f/%.2fm  occ %.3f' % (
+            i, *pos[i], inside[i], mean[i, :3].mean(), up[i, :3].mean(), up[i, 3], dup[i], down[i, :3].mean(), down[i, 3], ddown[i], mean[i, 3]))
 
 
 if __name__ == '__main__':
