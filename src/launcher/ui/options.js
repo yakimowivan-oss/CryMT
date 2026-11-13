@@ -92,9 +92,11 @@ window.CRYMT = (function () {
          hint: L('Пост-обработка игры читает копии сцены, сделанные до DLAA (с джиттером камеры). Без этого картинка на стоящей камере дрожала по листве и мелким деталям.', 'The game\'s post-processing reads copies of the scene made before DLAA (with the camera jitter). Without this, foliage and fine detail shimmered on a still camera.'),
          affects: L('дрожание на стоящей камере', 'shimmer on a still camera'), cost: L('≈ 0.03 мс', '≈ 0.03 ms'), needs: 'dlaaMode', ms: v => (v ? 0.03 : 0)},
         {id: 'preset', section: 'aa', label: L('Модель DLAA', 'DLAA model'), type: 'select', def: 'auto', expert: true, needs: 'dlaaMode',
-         choices: [{v: 'auto', label: L('По умолчанию (K)', 'Default (K)')}, {v: 'K', label: L('K — трансформер', 'K — transformer')}, {v: 'J', label: 'J'}, {v: 'F', label: 'F — CNN'}, {v: 'E', label: 'E — CNN'}],
-         ini: ['Env', 'CRYMT_DLSS_PRESET'], codec: pick({auto: null, K: 'K', J: 'J', F: 'F', E: 'E'}),
-         hint: L('Нейросеть DLAA. Трансформер (K) лучше держит листву и мелкие детали; старые CNN (E/F) мягче и дешевле.', 'The DLAA network. The transformer (K) holds foliage and fine detail better; the older CNN ones (E/F) are softer and cheaper.'), affects: L('резкость, шлейфы', 'sharpness, trails')},
+         choices: [{v: 'auto', label: L('По умолчанию (K)', 'Default (K)')}, {v: 'K', label: L('K — трансформер', 'K — transformer')}, {v: 'J', label: 'J'},
+                   {v: 'L', label: L('L — DLSS 4.5, меньше шлейфов', 'L — DLSS 4.5, less ghosting')}, {v: 'M', label: L('M — DLSS 4.5, быстрее L', 'M — DLSS 4.5, faster than L')},
+                   {v: 'F', label: 'F — CNN'}, {v: 'E', label: 'E — CNN'}],
+         ini: ['Env', 'CRYMT_DLSS_PRESET'], codec: pick({auto: null, K: 'K', J: 'J', L: 'L', M: 'M', F: 'F', E: 'E'}),
+         hint: L('Нейросеть DLAA. Трансформер (K) лучше держит листву и мелкие детали; L и M — трансформер DLSS 4.5 (по NVIDIA: резче, стабильнее, меньше шлейфов, но дороже); старые CNN (E/F) мягче и дешевле. В игре: Num/ ▸ Движок ▸ Модель DLAA.', 'The DLAA network. The transformer (K) holds foliage and fine detail better; L and M are the DLSS 4.5 transformer (per NVIDIA: sharper, steadier, less ghosting, dearer); the older CNN ones (E/F) are softer and cheaper. In game: Num/ ▸ Engine ▸ DLAA model.'), affects: L('резкость, шлейфы', 'sharpness, trails')},
 
         // ---- GI
         {id: 'gi', section: 'gi', label: L('Глобальное освещение', 'Global illumination'), type: 'toggle', def: true, ini: ['CryMT', 'GI'], codec: flag(false), shaders: true, hotkey: L('Num/ ▸ GI', 'Num/ ▸ GI'), needs: 'dx12Mode',

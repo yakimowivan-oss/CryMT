@@ -18,6 +18,7 @@
 #include <string>
 
 #include "Dlss.h"
+#include "GiControl.h"
 #include "Paths.h"
 
 namespace dlss
@@ -270,14 +271,43 @@ IDXGIFactory4* ProxyFactory(IDXGIFactory4* factory)
     return result;
 }
 
+// The DLAA model (2026-11-13: the panel switches it live; the launcher sets CRYMT_DLSS_PRESET): K the transformer (the
+// default), J (a little less ghosting, more flicker), L and M the second transformer generation of DLSS 4.5 (sharper,
+// steadier, less ghosting; dearer), F and E the old CNN models.
+const char kPresetLetters[] = "KJLMFE";
+int PresetIndex()
+{
+    const int panel = g_giControl.dlssPreset.load();
+    if (panel >= 0 && panel < 6)
+        return panel;
+    char text[8] = {};
+    if (GetEnvironmentVariableA("CRYMT_DLSS_PRESET", text, sizeof(text)))
+        for (int i = 0; i < 6; i++)
+            if ((text[0] & ~0x20) == kPresetLetters[i])
+                return i;
+    return 0;
+}
+
+int PresetDefaultIndex()
+{
+    char text[8] = {};
+    if (GetEnvironmentVariableA("CRYMT_DLSS_PRESET", text, sizeof(text)))
+        for (int i = 0; i < 6; i++)
+            if ((text[0] & ~0x20) == kPresetLetters[i])
+                return i;
+    return 0;
+}
+
 bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssSceneInfo& scene)
 {
     if (!g_active)
         return false;
     const sl::ViewportHandle viewport(0);
     static int optionsExposure = -1; // the exposure source the options were set for
+    static int optionsPreset = -1;
     const int ownExposure = images.exposure ? 1 : 0;
-    if (images.width != g_optionsWidth || images.height != g_optionsHeight || ownExposure != optionsExposure)
+    const int preset = PresetIndex();
+    if (images.width != g_optionsWidth || images.height != g_optionsHeight || ownExposure != optionsExposure || preset != optionsPreset)
     {
         sl::DLSSOptions options{};
         options.mode = sl::DLSSMode::eDLAA;
@@ -293,9 +323,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
         options.useAutoExposure = autoExposure ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         if (GetEnvironmentVariableA("CRYMT_DLSS_EXPOSURESCALE", text, sizeof(text)))
             options.exposureScale = static_cast<float>(atof(text));
-        // CRYMT_DLSS_PRESET=<letter> (tests): the DLAA preset (default K, the transformer model; E/F the older CNN ones).
-        if (GetEnvironmentVariableA("CRYMT_DLSS_PRESET", text, sizeof(text)) && text[0] >= 'A' && text[0] <= 'O')
-            options.dlaaPreset = static_cast<sl::DLSSPreset>(text[0] - 'A' + 1);
+        options.dlaaPreset = static_cast<sl::DLSSPreset>(kPresetLetters[preset] - 'A' + 1);
         Logf("streamline: DLAA preset %u", static_cast<unsigned>(options.dlaaPreset));
         Logf("streamline: auto exposure %d, exposure scale %g", autoExposure ? 1 : 0, options.exposureScale);
         const sl::Result r = g_slDLSSSetOptions(viewport, options);
@@ -308,6 +336,7 @@ bool Evaluate(ID3D12GraphicsCommandList* list, const Images& images, const DlssS
         g_optionsWidth = images.width;
         g_optionsHeight = images.height;
         optionsExposure = ownExposure;
+        optionsPreset = preset;
         g_havePrev = false;
         Logf("streamline: DLAA %ux%u", images.width, images.height);
     }

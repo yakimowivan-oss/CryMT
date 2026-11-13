@@ -14,6 +14,8 @@ namespace dlss
 // Loads Streamline and gives it the device; true when DLSS can run on the adapter.
 bool Init(ID3D12Device* device, const LUID& adapter, void (*log)(const char*));
 bool Active();
+// The DLAA model as the launcher / environment set it (CRYMT_DLSS_PRESET), the panel's list index: K J L M F E.
+int PresetDefaultIndex();
 // The command queue and swap chain go through Streamline's proxies so it sees every Present (manual hooking).
 HRESULT CreateQueue(ID3D12Device* device, const D3D12_COMMAND_QUEUE_DESC* desc, ID3D12CommandQueue** queue);
 IDXGIFactory4* ProxyFactory(IDXGIFactory4* factory); // AddRef'd; the factory itself when Streamline is off

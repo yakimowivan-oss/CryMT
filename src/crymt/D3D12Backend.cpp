@@ -10492,6 +10492,8 @@ public:
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
+        static const char* const dlssModel[] = {"K (ТРАНСФОРМЕР)|K (TRANSFORMER)", "J", "L (DLSS 4.5)|L (DLSS 4.5)", "M (DLSS 4.5)|M (DLSS 4.5)",
+                                                "F (CNN)|F (CNN)", "E (CNN)|E (CNN)"};
         static const std::vector<PanelItem> items = {
             // GI
             {0, "GI|GI", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.enabled ? 1 : 0; }, [] { return 1; },
@@ -10624,6 +10626,9 @@ public:
                  return GetEnvironmentVariableW(L"CRYMT_DLSS_FIXCOPIES", t, 8) && wcscmp(t, L"0") == 0 ? 0 : 1;
              },
              [](int v) { g_giControl.fixCopies = v; }, true, nullptr},
+            {4, "Модель DLAA|DLAA model", 0, 5, 1, true, dlssModel, 0, nullptr,
+             [] { const int v = g_giControl.dlssPreset; return v < 0 ? dlss::PresetDefaultIndex() : v; },
+             [] { return dlss::PresetDefaultIndex(); }, [](int v) { g_giControl.dlssPreset = v; }, true, nullptr},
             // Time
             {5, "Время суток|Time of day", 0, 47, 2, true, nullptr, 0, nullptr,
              [] { const float t = g_giControl.timeOfDay; return t < 0 ? 0 : static_cast<int>(lroundf(t * 2.0f)) % 48; },
