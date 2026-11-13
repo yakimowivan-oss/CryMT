@@ -17,7 +17,12 @@ def lum(img):
 
 def main():
     args = sys.argv[1:]
-    pair = args[args.index('--pair') + 1:args.index('--pair') + 3]
+    # --pair A B, or --vars A,B,C for more columns
+    if '--vars' in args:
+        pair = args[args.index('--vars') + 1].split(',')
+        args = args[:args.index('--vars')] + ['--pair'] + args[args.index('--vars') + 2:]
+    else:
+        pair = args[args.index('--pair') + 1:args.index('--pair') + 3]
     kinds = ['frame']
     if '--kinds' in args:
         kinds = args[args.index('--kinds') + 1].split(',')
@@ -34,7 +39,7 @@ def main():
                 ims.append(im.resize((int(im.width * scale), int(im.height * scale))))
             rows.append(ims)
     w, h = rows[0][0].size
-    sheet = Image.new('RGB', (w * 2 + 6, (h + 6) * len(rows)), (255, 255, 255))
+    sheet = Image.new('RGB', ((w + 6) * len(pair) - 6, (h + 6) * len(rows)), (255, 255, 255))
     for r, ims in enumerate(rows):
         for c, im in enumerate(ims):
             sheet.paste(im.resize((w, h)), (c * (w + 6), r * (h + 6)))

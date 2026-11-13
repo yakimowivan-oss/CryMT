@@ -2012,17 +2012,13 @@ float3 ProbeRayDir(uint i, float f)
 // A thin ray through the grid from O along dir: front-to-back over the cells at mip 0 of the finest level that holds the
 // point (level 0 up to 6 m in half cells, 1 to 12 m, 2 to 24 m, then 3, a cell a step), the cells' light as the cones
 // take it (L1 / six directions); rgb light, a occlusion faded with distance as the cones' (occRange); hit where it was
-// half blocked (reach if never). back: what it hit was a surface's back (DDGI's backface): the cells' light direction
-// around the hit (L1 at mip 1, which takes the surface's own cell: the cells filled behind a surface have none) points
-// along the ray. The probes under island's beach saw the sand's underside, sunlit, in every upward direction and lit the
-// beach (the user: "outside everything is overexposed").
-float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit, out bool back)
+// half blocked (reach if never).
+float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
 {
     const float vs = voxParams.x;
     float3 light = 0;
     float blocked = 0, occ = 0, t = vs * 0.5 * (0.5 + jitter);
     hit = reach;
-    back = false;
     [loop] for (int i = 0; i < 128 && blocked < 0.95 && t < reach; i++)
     {
         const float3 X = O + dir * t;
@@ -2057,10 +2053,7 @@ float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit, 
         occ += (1 - blocked) * v.a * near;
         blocked += (1 - blocked) * v.a;
         if (blocked > 0.5 && hit >= reach)
-        {
             hit = t;
-            back = visAreas[0].z > 0.5 && dot(SampleL1(level, X, 1), dir) > 0.1;
-        }
         t += level == 0 ? cell * 0.5 : cell;
     }
     return float4(light, occ);
@@ -2083,16 +2076,18 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     float4 ray = 0;
     float3 dir = 0;
     float hit = 0;
-    bool back = false;
     if (due)
     {
         dir = ProbeRayDir(gi, frame);
-        ray = RayTrace(ProbePos(wc) + offset, dir, voxParams.z, frac(gi * 0.618034 + frame * 0.381966), hit, back);
+        ray = RayTrace(ProbePos(wc) + offset, dir, voxParams.z, frac(gi * 0.618034 + frame * 0.381966), hit);
     }
-    // A backface hit brings no light, and its distance is cut to a fifth (stored negative): the probe looks closed in
-    // that way, so the visibility test keeps it from the surface's front (RTXGI does the same).
-    g_probeRay[gi] = back ? float4(0, 0, 0, ray.a) : ray;
-    g_probeDir[gi] = float4(dir, back ? -0.2 * min(hit, kProbeMaxDistance) : min(hit, kProbeMaxDistance));
+    // The distance kept up to 16 m (the classification below asks whether the ray met anything at all); the
+    // visibility's moments clamp it at kProbeMaxDistance. Backface hits by the cells' L1 direction were tried and
+    // dropped: a thin roof lit from outside has its L1 pointing out as the ground has (probes under a shed's roof counted
+    // as inside and were moved through it into the sun: blotches on ceilings), and a test of thickness missed the
+    // probes under the beach (the ground's fill is thinner than three cells).
+    g_probeRay[gi] = ray;
+    g_probeDir[gi] = float4(dir, min(hit, 16));
     GroupMemoryBarrierWithGroupSync();
     const float4 old = historyTex.Load(int3(texel, 0));
     const int2 dt = ProbeDepthTile(slot) + int2(tid.xy); // the distances' texel, laid out as the light's
@@ -2122,7 +2117,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
         sum += g_probeRay[r] * w;
         weights += w;
         const float c2 = w * w, c4 = c2 * c2, wd = c4 * c4; // cos^8 (kProbeDepthSharpness)
-        const float dist = abs(g_probeDir[r].w);
+        const float dist = min(g_probeDir[r].w, kProbeMaxDistance);
         m += float2(dist, dist * dist) * wd;
         mw += wd;
     }
@@ -2135,34 +2130,44 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     outTex[texel] = valid ? lerp(fresh, old, 0.95) : fresh;
     if (gi == 0)
     {
-        // Inside geometry: most rays end within 0.35 m (in a wall), or a fifth or more hit backs (under the ground, in a
-        // closed rock): DDGI turns such a probe off at a quarter of backface hits.
-        float closeShare = 0, backShare = 0, backMin = 1e9, frontMin = 1e9;
-        float3 backDir = 0, frontDir = 0;
+        // Inside geometry: most rays end within 0.35 m (in a wall); or under the ground: the rays going up nearly all
+        // meet the ground's underside within 16 m while those going down nearly all meet nothing (the grid is empty below
+        // the ground's fill). Under a roof the floor stops the rays going down.
+        float closeShare = 0, frontMin = 1e9, upRays = 0, upClosed = 0, upMin = 1e9, downRays = 0, downOpen = 0;
+        float3 frontDir = 0;
         [loop] for (int k = 0; k < 64; k++)
         {
-            const float d = g_probeDir[k].w;
-            closeShare += abs(d) < 0.35 ? 1 : 0;
-            backShare += d < 0 ? 1 : 0;
-            if (d < 0 && -5 * d < backMin)
-            {
-                backMin = -5 * d;
-                backDir = g_probeDir[k].xyz;
-            }
-            if (d >= 0 && d < frontMin)
+            const float d = g_probeDir[k].w, dz = g_probeDir[k].z;
+            closeShare += d < 0.35 ? 1 : 0;
+            if (d < frontMin)
             {
                 frontMin = d;
                 frontDir = g_probeDir[k].xyz;
             }
+            if (dz > 0.3)
+            {
+                upRays++;
+                if (d < 15.9)
+                {
+                    upClosed++;
+                    upMin = min(upMin, d);
+                }
+            }
+            if (dz < -0.3)
+            {
+                downRays++;
+                downOpen += d >= 15.9 ? 1 : 0;
+            }
         }
+        const bool underground = upClosed > 0.8 * upRays && downOpen > 0.8 * downRays && upRays > 0 && downRays > 0;
         // Kept slowly (0.9): a probe by a wall whose share of 64 rays wavered went on and off.
-        const float inside = saturate(max(closeShare, backShare * 4) / 64);
+        const float inside = underground ? 1 : saturate(closeShare / 48);
         outTex[st] = float4(ProbeKey(wc), 1 + (valid ? lerp(inside, state.w - 1, 0.9) : inside));
-        // Relocation (DDGI): over a quarter of backface hits, through the nearest back by its distance and a quarter of
-        // the spacing; else away from a front nearer than 0.3 of the spacing. Within 0.45 of the spacing of the centre.
+        // Relocation (DDGI's, by our classification): under the ground up through it (to the surface if it is within
+        // reach), else away from a surface nearer than 0.3 of the spacing; within 0.45 of the spacing of the centre.
         float3 moved = offset;
-        if (backShare > 16)
-            moved += backDir * (backMin + 0.25 * kProbeSpacing);
+        if (underground)
+            moved.z += upMin + 0.25 * kProbeSpacing;
         else if (frontMin < 0.3 * kProbeSpacing)
             moved -= frontDir * (0.3 * kProbeSpacing - frontMin);
         outTex[ot] = float4(clamp(moved, -0.45 * kProbeSpacing, 0.45 * kProbeSpacing), 0);
@@ -7748,6 +7753,7 @@ public:
         g.occStrength = b.occStrength * occlusion; // Num4 / Num7: where there is cover above (Strengthen), not everywhere
         g.bounce = b.bounce * bounce;
         g.voxelStrength = b.voxelStrength * bounce;
+        g.probeStrength = b.probeStrength * bounce; // GI v2 too (the user liked Sponza's strong bounce)
         g.voxels = b.on; // the grid keeps up, so the cones and the view switch on at once
         if (g_giControl.parts < 0)
             g_giControl.parts = b.voxelMix == 2 ? 1 : 0;
