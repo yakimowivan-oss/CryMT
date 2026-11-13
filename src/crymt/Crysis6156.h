@@ -266,8 +266,10 @@ constexpr uint32_t kLightFlagsFake = (1u << 23) | (1u << 17);
 // Every light entity of the level: C3DEngine (k3DEngineGlobal) + 0x788 a PodArray of CLightEntity* (count + 0x790; the
 // destructor 0x301AD120 takes it out through 0x300FEF80, which also clears the sun's entity at + 0x800). A light
 // entity's CDLight is at + 0x38 (its constructor 0x301AE8D0 builds it there). Village: 19 entities, 4 of them in a
-// frame's list (lamps of the next rooms are not). + 0x8 is not the render flags (float-like values).
-constexpr uintptr_t kEngineLightEntities = 0x788, kEngineSunEntity = 0x800, kLightEntityLight = 0x38, kRenderNodeFlags = 0x8;
+// frame's list (lamps of the next rooms are not). IRenderNode::m_dwRndFlags is at + 0xC (+ 0x8 is m_fWSMaxViewDist, the
+// float-like values seen there; the entity system sets ERF_HIDDEN with "or dword ptr [rcx + 0xc], 0x100" at
+// CryEntitySystem 0x320729F4, tools\prof\find_imm_store.py).
+constexpr uintptr_t kEngineLightEntities = 0x788, kEngineSunEntity = 0x800, kLightEntityLight = 0x38, kRenderNodeFlags = 0xC;
 // VisAreas: CVisAreaManager* at 0x3022B910 (made by 0x3011ED90, vtable 0x301D5738): VisAreas + 0x28 (count + 0x30),
 // portals + 0x38 (count + 0x40), occlusion areas + 0x48 (+ 0x50) (CRYMT_VISDUMP on village: 23 "visareaN", 54
 // "portal_portalN"). CVisArea (Update = vf14 0x30126B20): box min + 0x20,

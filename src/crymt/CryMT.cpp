@@ -589,6 +589,7 @@ uint64_t g_shadowDrawTicks, g_shadowDraws; // nested flushes of PrepareDepthMap 
 uint64_t g_preSignals;
 uint64_t g_envCubeFaces, g_envCubeFull, g_envCubeTicks, g_envCubeSkips, g_envCubeSwaps, g_envDepthFreed; // EnvCubeUpdate
 uint64_t g_envCubeLightLists[4]; // EnvCubeUpdate: renders that changed the renderer's level 0..3 light list
+uint64_t g_cubePlayerHidden[4], g_cubePlayerMissed; // EnvCubeHidePlayer: faces by render nodes hidden (body, item, vehicle); no player found
 // Diagnosis (the editor crash, reproduced by tools\prof\editor_toggle.ps1: fleet, game mode toggled, ~80 s; none with the
 // cube off): what the cube render does to C3DEngine's dynamic light list (+0x760 pointer, +0x768 count, +0x76C capacity,
 // +0x778 added, +0x780) and the lights' camera array (+0x7A8 pointer, +0x7B0 count, +0x7B4 capacity), which main's octree
@@ -1305,6 +1306,12 @@ void WriteStats()
             fprintf(f, "engine env cube: renders that changed the renderer's light list, level 0 %llu, 1 %llu, 2 %llu, 3 %llu\n",
                     static_cast<unsigned long long>(g_envCubeLightLists[0]), static_cast<unsigned long long>(g_envCubeLightLists[1]),
                     static_cast<unsigned long long>(g_envCubeLightLists[2]), static_cast<unsigned long long>(g_envCubeLightLists[3]));
+        if (g_envCubeFaces)
+            fprintf(f, "engine env cube: the player left out of the faces (EnvCubeHidePlayer): faces with 0 %llu, 1 %llu, 2 %llu, 3 %llu render nodes "
+                       "hidden (body, item in the hands, vehicle); no player %llu\n",
+                    static_cast<unsigned long long>(g_cubePlayerHidden[0]), static_cast<unsigned long long>(g_cubePlayerHidden[1]),
+                    static_cast<unsigned long long>(g_cubePlayerHidden[2]), static_cast<unsigned long long>(g_cubePlayerHidden[3]),
+                    static_cast<unsigned long long>(g_cubePlayerMissed));
         {
             char bend[512];
             zpass::BendBeforeStats(bend, sizeof(bend));
@@ -5932,6 +5939,118 @@ void EnvDepthRestore(const uint8_t* renderer)
     }
 }
 
+// The player's own body and the item in the hands stay out of the engine cube's faces (the user, 2026-11-13: the legs in
+// the down face, the weapon in a side face, the reflections showed them). Their render nodes get ERF_HIDDEN (0x100 in
+// IRenderNode +0xC, kRenderNodeFlags, which the 3D engine skips) for the face's render and their own flags back after it; main is held there
+// (preprocess). A guess by the draws' matrices in the back end was tried first and failed both ways (a hut's floor gone,
+// the feet kept). The way to the nodes (the game's interfaces; slots read from the 6156 binaries, the SDK headers are off
+// by 7 for IGameFramework): gEnv (the renderer's copy) +0x08 IGame, slot 9 GetIGameFramework (CGame: [this+0x10]);
+// IGameFramework slot 46 GetClientActor (CCryAction; slot 47 GetClientActorId reads the actor's +0x10); the actor, the
+// item and the vehicle are IGameObjectExtensions (+0x10 entity id, +0x18 IEntity*); IActor slot 33 GetCurrentItem(false)
+// (CPlayer: inventory and item system lookups), slot 48 GetLinkedVehicle (the vehicle system's lookup; in a vehicle the
+// cube's eye is inside it, its hull and cabin would fill the faces); each entity checked against gEnv +0x70
+// IEntitySystem slot 8 GetEntity(id); IEntity slot 54 GetProxy(ENTITY_PROXY_RENDER = 0) (CEntity: a switch reading its
+// proxies); IEntityRenderProxy slot 16 GetRenderNode (CRenderProxy: lea rax, [rcx + 8]). Every object's vtable must lie
+// in its module (CryGame, CryAction, CryEntitySystem), so another build or a wrong pointer finds nothing instead of
+// calling elsewhere. CRYMT_ENVCUBE_PLAYER=1 keeps the player in the cube.
+struct CubeHiddenNode
+{
+    uint32_t* flags;
+    uint32_t was;
+};
+
+struct ModuleSpan
+{
+    uintptr_t lo, hi;
+    bool Has(const void* p) const { return reinterpret_cast<uintptr_t>(p) >= lo && reinterpret_cast<uintptr_t>(p) < hi; }
+};
+
+ModuleSpan ModuleSpanOf(const wchar_t* name)
+{
+    const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(name));
+    if (!base)
+        return {0, 0};
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    return {reinterpret_cast<uintptr_t>(base), reinterpret_cast<uintptr_t>(base) + nt->OptionalHeader.SizeOfImage};
+}
+
+// Slot k of an object whose vtable and that function lie in the module; nullptr otherwise.
+template <class F>
+F GameSlot(const void* object, int k, const ModuleSpan& module)
+{
+    if (!object || !module.lo)
+        return nullptr;
+    auto* const* vtable = *static_cast<void* const* const*>(object);
+    if (!module.Has(vtable) || !module.Has(vtable + k))
+        return nullptr;
+    return module.Has(vtable[k]) ? reinterpret_cast<F>(vtable[k]) : nullptr;
+}
+
+// Hides the player's nodes into out[] (0..3 of them), returns the count.
+int EnvCubeHidePlayer(CubeHiddenNode out[3])
+{
+    static const bool keep = EnvCubeSetting("CRYMT_ENVCUBE_PLAYER", 0) != 0;
+    if (keep)
+        return 0;
+    static const ModuleSpan game = ModuleSpanOf(L"CryGame.dll"), action = ModuleSpanOf(L"CryAction.dll"),
+                            entities = ModuleSpanOf(L"CryEntitySystem.dll");
+    const auto* env = *reinterpret_cast<const uint8_t* const*>(0x382E74D0);
+    void* const gameObject = env ? *reinterpret_cast<void* const*>(env + 0x08) : nullptr;
+    void* const entitySystem = env ? *reinterpret_cast<void* const*>(env + 0x70) : nullptr;
+    const auto getFramework = GameSlot<void*(__fastcall*)(void*)>(gameObject, 9, game);
+    void* const framework = getFramework ? getFramework(gameObject) : nullptr;
+    const auto getActor = GameSlot<uint8_t*(__fastcall*)(void*)>(framework, 46, action);
+    uint8_t* const actor = getActor ? getActor(framework) : nullptr;
+    const auto getEntity = GameSlot<void*(__fastcall*)(void*, uint32_t)>(entitySystem, 8, entities);
+    const auto getItem = GameSlot<uint8_t*(__fastcall*)(void*, bool)>(actor, 33, game); // the actor's vtable in CryGame
+    const auto getVehicle = GameSlot<uint8_t*(__fastcall*)(void*)>(actor, 48, game);
+    if (!actor || !getEntity || !getItem || !getVehicle)
+    {
+        g_cubePlayerMissed++;
+        return 0;
+    }
+    // The render node flags of a game object extension's entity (the actor, the item, the vehicle).
+    const auto nodeFlags = [&](const uint8_t* extension) -> uint32_t* {
+        const uint32_t id = *reinterpret_cast<const uint32_t*>(extension + 0x10);
+        void* const entity = *reinterpret_cast<void* const*>(extension + 0x18);
+        if (!id || !entity || getEntity(entitySystem, id) != entity)
+            return nullptr;
+        const auto getProxy = GameSlot<void*(__fastcall*)(void*, int)>(entity, 54, entities);
+        void* const proxy = getProxy ? getProxy(entity, 0) : nullptr;
+        const auto getNode = GameSlot<uint8_t*(__fastcall*)(void*)>(proxy, 16, entities);
+        uint8_t* const node = getNode ? getNode(proxy) : nullptr;
+        return node ? reinterpret_cast<uint32_t*>(node + kRenderNodeFlags) : nullptr;
+    };
+    const uint8_t* const item = getItem(actor, false);
+    const uint8_t* const vehicle = getVehicle(actor);
+    int n = 0;
+    for (const uint8_t* extension : {static_cast<const uint8_t*>(actor), item, vehicle})
+        if (uint32_t* flags = extension ? nodeFlags(extension) : nullptr)
+        {
+            out[n] = {flags, *flags};
+            *flags |= 0x100u; // ERF_HIDDEN
+            n++;
+        }
+        else if (extension == actor) // the body first: without it nothing (the caller keeps the near plane far)
+            break;
+    g_cubePlayerHidden[n]++;
+    static bool logged;
+    if (!logged)
+    {
+        logged = true;
+        FocusLog("engine cube: the player left out of the faces: actor %p, item %p, vehicle %p, %d render nodes hidden (their flags %x %x %x)",
+                 static_cast<void*>(actor), static_cast<const void*>(item), static_cast<const void*>(vehicle), n, n > 0 ? out[0].was : 0u,
+                 n > 1 ? out[1].was : 0u, n > 2 ? out[2].was : 0u);
+    }
+    return n;
+}
+
+void EnvCubeShowPlayer(const CubeHiddenNode* nodes, int n)
+{
+    for (int i = n - 1; i >= 0; i--)
+        *nodes[i].flags = (*nodes[i].flags & ~0x100u) | (nodes[i].was & 0x100u);
+}
+
 void EnvCubeUpdate()
 {
     static const int flags = EnvCubeSetting("CRYMT_ENVCUBE_FLAGS", 0x89C);
@@ -6051,9 +6170,12 @@ void EnvCubeUpdate()
     }
     static const int entitiesBase = EnvCubeSetting("CRYMT_ENVCUBE_ENTITIES", 1) != 0 ? 1 : 0;
     const bool entities = g_envCubeEntitiesPatched && (g_giControl.envCubeEntities >= 0 ? g_giControl.envCubeEntities.load() : entitiesBase) != 0;
-    // With the entities the player's own body and weapon are drawn too, around the cube's centre (the eye): the face
-    // cameras then clip at CRYMT_ENVCUBE_NEAR centimetres (default 150) rather than the engine's 0.25 m. DrawCubeSide's one
-    // load of its near plane (kEnvCubeNearLoad) is pointed once at a float of ours in a page within 2 GB of the renderer.
+    // With the entities the player's own body and weapon would be drawn too, around the cube's centre (the eye): they are
+    // hidden (EnvCubeHidePlayer) and the face cameras clip at CRYMT_ENVCUBE_NEARHIDDEN centimetres (default 50: walls right
+    // by the player stay in, a wall clipped away showed the outside in indoor reflections); when the player is not found,
+    // at CRYMT_ENVCUBE_NEAR (default 150, the clip that used to keep the body out) rather than the engine's 0.25 m.
+    // DrawCubeSide's one load of its near plane (kEnvCubeNearLoad) is pointed once at a float of ours in a page within
+    // 2 GB of the renderer.
     static float* nearPlane;
     static bool nearTried;
     if (!nearTried)
@@ -6130,8 +6252,7 @@ void EnvCubeUpdate()
         FocusLog("engine cube: near plane %s", nearPlane ? "ours" : "the engine's (unexpected bytes or no page)");
     }
     static const float nearWithEntities = static_cast<float>(std::max(EnvCubeSetting("CRYMT_ENVCUBE_NEAR", 150), 1)) / 100.0f;
-    if (nearPlane)
-        *nearPlane = entities ? nearWithEntities : 0.25f;
+    static const float nearPlayerHidden = static_cast<float>(std::max(EnvCubeSetting("CRYMT_ENVCUBE_NEARHIDDEN", 50), 1)) / 100.0f;
     const uint32_t drawFlags = (static_cast<uint32_t>(flags) & ~0x400u) | (entities ? 0x400u : 0u);
     static bool tableFixed;
     if (!tableFixed)
@@ -6164,9 +6285,31 @@ void EnvCubeUpdate()
     g_cubeLightIdCount = 0;
     if (EnvCubeOwnFrame())
         ++*reinterpret_cast<volatile int*>(renderer + kFrameIdAllOffset); // the cube's own frame id (EnvCubeOwnFrame)
+    CubeHiddenNode hidden[3];
+    const int hiddenCount = entities ? EnvCubeHidePlayer(hidden) : 0;
+    if (nearPlane)
+        *nearPlane = !entities ? 0.25f : hiddenCount > 0 ? nearPlayerHidden : nearWithEntities;
+    // No clouds in the cube (the user, 2026-11-14; they were drawn inside rooms too): the 3D engine's e_Clouds (its CVars
+    // object k3DCVarsGlobal + 0x23C, an int registered at 0x3012F795, tools\prof\cvarfield.py) is 0 for the face's
+    // render, as the engine itself zeroes its cvars around a pass. CRYMT_ENVCUBE_CLOUDS=1 keeps them.
+    static const bool cloudsKept = EnvCubeSetting("CRYMT_ENVCUBE_CLOUDS", 0) != 0;
+    const uintptr_t cvars3d = *reinterpret_cast<const uintptr_t*>(k3DCVarsGlobal);
+    int* const clouds = cvars3d && !cloudsKept ? reinterpret_cast<int*>(cvars3d + 0x23C) : nullptr;
+    const int cloudsWas = clouds ? *clouds : 0;
+    if (clouds)
+        *clouds = 0;
+    static bool cloudsLogged;
+    if (clouds && !cloudsLogged)
+    {
+        cloudsLogged = true;
+        FocusLog("engine cube: clouds left out of the faces (e_Clouds %d outside them)", cloudsWas);
+    }
     g_cubeRendering = true;
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, drawFlags, ~0ull, 0);
     g_cubeRendering = false;
+    if (clouds)
+        *clouds = cloudsWas;
+    EnvCubeShowPlayer(hidden, hiddenCount);
     // The face is drawn: the lights' ids as main's pass left them (in reverse, a light added twice ends as it was).
     for (int i = g_cubeLightIdCount - 1; i >= 0; i--)
     {
