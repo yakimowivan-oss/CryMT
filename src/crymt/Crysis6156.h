@@ -66,6 +66,8 @@ constexpr uintptr_t kEnvCubeInvFovLoad = 0x380CFF95, kEnvCubeInvFovConst = 0x382
 constexpr uintptr_t kEnvCubeHalfFovLoad = 0x380CFFCA, kEnvCubeHalfFovConst = 0x38255DC0;
 // CTerrain (kTerrainGlobal below): its ocean level, the float at +0x1E0 (what I3DEngine::GetWaterLevel(NULL) returns).
 constexpr uintptr_t kTerrainOceanLevel = 0x1E0;
+// r_WaterReflections (int, default 1): the renderer's planar water reflection pass (registered at 0x3810E831).
+constexpr uintptr_t kCvarWaterReflections = 0x382E982C;
 constexpr uintptr_t kRdCameraX = 0x28D14;            // the camera's position: floats at +0x28D14, +0x28D24, +0x28D34
 // The renderer's temporary depth surfaces (FUN_380212B0 FX_GetDepthSurface(w, h, aa): the first free one of that size,
 // else a new D3D texture and view): pointers at +0x2D848, count +0x2D850; each {int w, h; char busy at +8; ...}. The

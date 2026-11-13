@@ -1182,12 +1182,17 @@ Texture2DArray<float4> ldr : register(t0);
 TextureCube<float4> prev : register(t1);
 SamplerState linearClamp : register(s0);
 RWTexture2DArray<float4> dst : register(u0);
+RWTexture2DArray<float4> dst2 : register(u1);
 cbuffer C : register(b0)
 {
   uint size;
   uint face;
   float blend;
   float k; // tan of the engine faces' half field of view (1: 90 degrees)
+  float alpha;    // cubePrefilter: the level's GGX roughness (alpha = r^2, r = level / 6)
+  float scaleAll; // ... the materials' copies: every material's (dst), those with their own map (dst2)
+  float scaleOwn;
+  uint size0;     // ... the HDR copy's level-0 size
 };
 
 // The direction of a D3D cube face's point (s, t in -1..1, t down).
@@ -1248,13 +1253,60 @@ void cubeDecode(uint3 id : SV_DispatchThreadID)
   dst[id] = float4(lerp(old, hdr, blend), 1);
 }
 
-// The materials' copy: each level of the HDR copy (an array view in ldr) encoded as the voxel cube (1 - exp(-0.5 x)).
+float RadicalInverse(uint b)
+{
+  b = (b << 16u) | (b >> 16u);
+  b = ((b & 0x55555555u) << 1u) | ((b & 0xAAAAAAAAu) >> 1u);
+  b = ((b & 0x33333333u) << 2u) | ((b & 0xCCCCCCCCu) >> 2u);
+  b = ((b & 0x0F0F0F0Fu) << 4u) | ((b & 0xF0F0F0F0u) >> 4u);
+  b = ((b & 0x00FF00FFu) << 8u) | ((b & 0xFF00FF00u) >> 8u);
+  return float(b) * 2.3283064365386963e-10;
+}
+
+// The materials' copies, one level: the HDR copy (prev, all its levels) convolved with GGX of this level's roughness
+// (32 samples by importance, each read at the level its solid angle covers: filtered importance sampling; the view
+// along the normal), then encoded as the voxel cube (1 - exp(-0.5 x)) with each copy's scale. Level 0: the mirror.
 [numthreads(8, 8, 1)]
-void cubeEncode(uint3 id : SV_DispatchThreadID)
+void cubePrefilter(uint3 id : SV_DispatchThreadID)
 {
   if (id.x >= size || id.y >= size)
     return;
-  dst[id] = float4(1 - exp(-0.5 * ldr.Load(int4(id.xy, id.z, 0)).rgb), 1);
+  float2 st = (id.xy + 0.5) / size * 2 - 1;
+  float3 n = normalize(CubeDir(id.z, st.x, st.y));
+  float3 c;
+  if (alpha <= 0)
+    c = prev.SampleLevel(linearClamp, n, 0).rgb;
+  else
+  {
+    float3 up = abs(n.z) < 0.999 ? float3(0, 0, 1) : float3(1, 0, 0);
+    float3 tx = normalize(cross(up, n));
+    float3 ty = cross(n, tx);
+    float a2 = alpha * alpha;
+    float texelSa = 4 * 3.14159265 / (6.0 * size0 * size0);
+    float3 sum = 0;
+    float weight = 0;
+    for (uint i = 0; i < 32; i++)
+    {
+      float2 xi = float2((i + 0.5) / 32, RadicalInverse(i));
+      float phi = 6.2831853 * xi.x;
+      float cosT = sqrt((1 - xi.y) / (1 + (a2 - 1) * xi.y));
+      float sinT = sqrt(1 - cosT * cosT);
+      float3 h = tx * (sinT * cos(phi)) + ty * (sinT * sin(phi)) + n * cosT;
+      float3 l = 2 * dot(n, h) * h - n;
+      float nl = dot(n, l);
+      if (nl > 0)
+      {
+        float d = cosT * cosT * (a2 - 1) + 1;
+        float pdf = a2 / (3.14159265 * d * d) / 4; // D(h) n.h / (4 v.h), v = n
+        float lod = max(0.5 * log2(1 / (32 * pdf + 1e-4) / texelSa) + 1, 0);
+        sum += prev.SampleLevel(linearClamp, l, lod).rgb * nl;
+        weight += nl;
+      }
+    }
+    c = sum / max(weight, 1e-4);
+  }
+  dst[id] = float4(1 - exp(-0.5 * c * scaleAll), 1);
+  dst2[id] = float4(1 - exp(-0.5 * c * scaleOwn), 1);
 }
 
 [numthreads(8, 8, 1)]
@@ -4959,14 +5011,14 @@ public:
 
     // CRYMT_ENVMAP=voxels: the materials' environment maps from the voxel grid (with the GI's voxel part on).
     // ... or the panel's Num0 on its environment page (CRYMT_GI_KEYS).
-    // The materials' reflection: 0 the game's maps, 1 the voxel grid's cube (CRYMT_ENVMAP=voxels), 2 the engine's own cube
-    // (CRYMT_ENVMAP=engine: its HDR copy encoded as the voxel one, with mips by gloss); the reflections page.
+    // The materials' reflection: 0 the game's maps (CRYMT_ENVMAP=game), 1 the voxel grid's cube (=voxels), 2 the engine's own
+    // cube (=engine, the default since 2026-11-13: its HDR copy encoded as the voxel one, with mips by gloss); the page.
     static int EnvModeBase()
     {
         static const int mode = [] {
             char v[16] = {};
             if (!GetEnvironmentVariableA("CRYMT_ENVMAP", v, sizeof(v)))
-                return 0;
+                return 2;
             return _stricmp(v, "voxels") == 0 ? 1 : _stricmp(v, "engine") == 0 ? 2 : 0;
         }();
         return mode;
@@ -4981,14 +5033,19 @@ public:
 
     // The ocean's reflection (reflections phases 0 and 1): 0 planar, 1 the environment cube, 2 SSR + the cube;
     // CRYMT_WATERCUBE=1/2 or the reflections page.
-    static int WaterMode()
+    // Default 2 since 2026-11-13 (the user: "turn our new reflections on by default").
+    static int WaterModeBase()
     {
         static const int env = [] {
             wchar_t v[8] = {};
-            return GetEnvironmentVariableW(L"CRYMT_WATERCUBE", v, 8) ? std::min(std::max(_wtoi(v), 0), 2) : 0;
+            return GetEnvironmentVariableW(L"CRYMT_WATERCUBE", v, 8) ? std::min(std::max(_wtoi(v), 0), 2) : 2;
         }();
+        return env;
+    }
+    static int WaterMode()
+    {
         const int panel = g_giControl.waterCube;
-        return panel < 0 ? env : std::min(panel, 2);
+        return panel < 0 ? WaterModeBase() : std::min(panel, 2);
     }
     static bool WaterCubeOn() { return WaterMode() >= 1; }
     // The cube's brightness on the water (CRYMT_WATERSKY, the reflections page, crymt_watersky), 1 = as decoded. Default
@@ -5246,8 +5303,8 @@ public:
         {
             if (EnvEngineOn() && m_ldrCubeReady && slot == m_ps->envCubeSlot)
             {
-                v.info = &m_ldrCube;
-                v.cpu = m_ldrCubeSrv;
+                v.info = &m_ldrCubeOwn;
+                v.cpu = m_ldrCubeOwnSrv;
             }
             else if (Srv12* s = EnvOn() && m_envReady ? (slot == m_ps->envCubeSlot ? m_envCube : m_env2D) : nullptr)
             {
@@ -7966,7 +8023,7 @@ public:
         if (!compile || !g_serializeRoot)
             return false;
         ID3DBlob* code[3] = {};
-        const char* entries[3] = {"cubeDecode", "cubeDown", "cubeEncode"};
+        const char* entries[3] = {"cubeDecode", "cubeDown", "cubePrefilter"};
         for (int i = 0; i < 3; i++)
         {
             ID3DBlob* errors = nullptr;
@@ -7982,10 +8039,10 @@ public:
             if (errors)
                 errors->Release();
         }
-        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 2}};
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.Num32BitValues = 4;
+        params[0].Constants.Num32BitValues = 8;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {2, ranges};
         D3D12_STATIC_SAMPLER_DESC linear{};
@@ -8099,7 +8156,7 @@ public:
         Require(&m_hdrCube, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu0;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu0;
-        while (!m_srvRing.TryAlloc(3 * mips, cpu0, gpu0)) // per level: t0 the engine's cube (level 0), t1 the level above, u0
+        while (!m_srvRing.TryAlloc(4 * mips, cpu0, gpu0)) // per level: t0 the engine's cube (level 0), t1 the level above, u0, u1
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -8111,8 +8168,9 @@ public:
         for (UINT m = 0; m < mips; m++)
         {
             const UINT dsize = std::max(1u, size >> m);
-            const D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu0.ptr + 3 * m * g.srvInc};
-            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu0.ptr + 3 * m * g.srvInc};
+            const D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu0.ptr + 4 * m * g.srvInc};
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu0.ptr + 4 * m * g.srvInc};
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 3 * g.srvInc}, m_hdrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); // u1: unused here
             if (m == 0)
             {
                 D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
@@ -8138,7 +8196,7 @@ public:
             else
                 g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_hdrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            uint32_t k[4] = {dsize, static_cast<uint32_t>(face), 0, 0};
+            uint32_t k[8] = {dsize, static_cast<uint32_t>(face), 0, 0, 0, 0, 0, 0};
             memcpy(&k[2], &blend, sizeof(float));
             const float tanHalf = g_engineCubeTanHalf.load();
             memcpy(&k[3], &tanHalf, sizeof(float));
@@ -8153,7 +8211,7 @@ public:
             if (m > 0)
                 m_list->ResourceBarrier(6, above);
             m_list->SetPipelineState(m ? m_cubeDownPso : m_cubeDecodePso);
-            m_list->SetComputeRoot32BitConstants(0, 4, k, 0);
+            m_list->SetComputeRoot32BitConstants(0, 8, k, 0);
             m_list->SetComputeRootDescriptorTable(1, gpu);
             m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, 6); // level 0 too: the faces' edges blend from their neighbours
             if (m > 0)
@@ -8173,63 +8231,70 @@ public:
         m_stats.engineCubeHdrRuns++;
     }
 
-    // The materials' copy (m_ldrCube) from the HDR copy, every level; the HDR copy is in kSrvState, the root signature set.
+    // A materials' copy at the HDR copy's size and levels (RGBA16F, unordered access), with its cube view and level UAVs.
+    bool EnsureMaterialsCube(TextureCore& t, D3D12_CPU_DESCRIPTOR_HANDLE& srv, D3D12_CPU_DESCRIPTOR_HANDLE* uav, UINT size, UINT mips)
+    {
+        if (t.res && t.width == size)
+            return true;
+        DeferRelease(t.res);
+        t.res = nullptr;
+        m_ldrCubeReady = false;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = size;
+        d.Height = size;
+        d.DepthOrArraySize = 6;
+        d.MipLevels = static_cast<UINT16>(mips);
+        d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        d.SampleDesc.Count = 1;
+        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                  __uuidof(ID3D12Resource), reinterpret_cast<void**>(&t.res))))
+        {
+            t.res = nullptr;
+            t.width = 0;
+            return false;
+        }
+        t.width = t.height = size;
+        t.depthOrArray = 6;
+        t.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        t.samples = 1;
+        t.mips = mips;
+        t.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (!srv.ptr)
+            srv = g_srvCpu.Alloc();
+        D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
+        vd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        vd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        vd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        vd.TextureCube.MipLevels = mips;
+        g.dev->CreateShaderResourceView(t.res, &vd, srv);
+        for (UINT m = 0; m < mips; m++)
+        {
+            if (!uav[m].ptr)
+                uav[m] = g_srvCpu.Alloc();
+            D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+            ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            ud.Texture2DArray = {m, 0, 6, 0};
+            g.dev->CreateUnorderedAccessView(t.res, nullptr, &ud, uav[m]);
+        }
+        Log("engine cube for the materials: %ux%u, %u levels (GGX)", size, size, mips);
+        return true;
+    }
+
+    // The materials' copies (every material, own maps) from the HDR copy: level m convolved with GGX of roughness m / 6
+    // (alpha = (m / 6)^2, up to 1); the HDR copy is in kSrvState. ~0.1 ms GPU at 256.
     void EncodeMaterialsCube(UINT size, UINT mips)
     {
-        if (!m_cubeEncodePso)
+        if (!m_cubeEncodePso || !EnsureMaterialsCube(m_ldrCube, m_ldrCubeSrv, m_ldrCubeUav, size, mips) ||
+            !EnsureMaterialsCube(m_ldrCubeOwn, m_ldrCubeOwnSrv, m_ldrCubeOwnUav, size, mips))
             return;
-        if (!m_ldrCube.res || m_ldrCube.width != size)
-        {
-            DeferRelease(m_ldrCube.res);
-            m_ldrCube.res = nullptr;
-            m_ldrCubeReady = false;
-            D3D12_HEAP_PROPERTIES hp{};
-            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC d{};
-            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            d.Width = size;
-            d.Height = size;
-            d.DepthOrArraySize = 6;
-            d.MipLevels = static_cast<UINT16>(mips);
-            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            d.SampleDesc.Count = 1;
-            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_ldrCube.res))))
-            {
-                m_ldrCube.res = nullptr;
-                m_ldrCube.width = 0;
-                return;
-            }
-            m_ldrCube.width = m_ldrCube.height = size;
-            m_ldrCube.depthOrArray = 6;
-            m_ldrCube.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            m_ldrCube.samples = 1;
-            m_ldrCube.mips = mips;
-            m_ldrCube.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            if (!m_ldrCubeSrv.ptr)
-                m_ldrCubeSrv = g_srvCpu.Alloc();
-            D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
-            vd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            vd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-            vd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            vd.TextureCube.MipLevels = mips;
-            g.dev->CreateShaderResourceView(m_ldrCube.res, &vd, m_ldrCubeSrv);
-            for (UINT m = 0; m < mips; m++)
-            {
-                if (!m_ldrCubeUav[m].ptr)
-                    m_ldrCubeUav[m] = g_srvCpu.Alloc();
-                D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
-                ud.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-                ud.Texture2DArray = {m, 0, 6, 0};
-                g.dev->CreateUnorderedAccessView(m_ldrCube.res, nullptr, &ud, m_ldrCubeUav[m]);
-            }
-            Log("engine cube for the materials: %ux%u, %u levels", size, size, mips);
-        }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu0;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu0;
-        while (!m_srvRing.TryAlloc(3 * mips, cpu0, gpu0))
+        while (!m_srvRing.TryAlloc(4 * mips, cpu0, gpu0))
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -8237,28 +8302,32 @@ public:
             m_srvRing.Reclaim();
         }
         Require(&m_ldrCube, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Require(&m_ldrCubeOwn, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         FlushBarriers();
+        const bool keys = g_giControl.active;
+        const float scaleAll = keys ? g_giControl.envAllScale.load() : 1.0f, scaleOwn = keys ? g_giControl.envOwnScale.load() : 1.0f;
         m_list->SetComputeRootSignature(m_cubeRoot);
         m_list->SetPipelineState(m_cubeEncodePso);
         for (UINT m = 0; m < mips; m++)
         {
             const UINT dsize = std::max(1u, size >> m);
-            const D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu0.ptr + 3 * m * g.srvInc};
-            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu0.ptr + 3 * m * g.srvInc};
-            D3D12_SHADER_RESOURCE_VIEW_DESC av{};
-            av.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            av.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-            av.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            av.Texture2DArray = {m, 1, 0, 6, 0, 0.0f};
-            g.dev->CreateShaderResourceView(m_hdrCube.res, &av, cpu);
-            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            const D3D12_CPU_DESCRIPTOR_HANDLE cpu{cpu0.ptr + 4 * m * g.srvInc};
+            const D3D12_GPU_DESCRIPTOR_HANDLE gpu{gpu0.ptr + 4 * m * g.srvInc};
+            g.dev->CopyDescriptorsSimple(1, cpu, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, m_hdrCubeSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
             g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 2 * g.srvInc}, m_ldrCubeUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            const uint32_t k[4] = {dsize, 0, 0, 0};
-            m_list->SetComputeRoot32BitConstants(0, 4, k, 0);
+            g.dev->CopyDescriptorsSimple(1, {cpu.ptr + 3 * g.srvInc}, m_ldrCubeOwnUav[m], D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            const float r = std::min(m / 6.0f, 1.0f), alpha = r * r;
+            uint32_t k[8] = {dsize, 0, 0, 0, 0, 0, 0, size};
+            memcpy(&k[4], &alpha, sizeof(float));
+            memcpy(&k[5], &scaleAll, sizeof(float));
+            memcpy(&k[6], &scaleOwn, sizeof(float));
+            m_list->SetComputeRoot32BitConstants(0, 8, k, 0);
             m_list->SetComputeRootDescriptorTable(1, gpu);
             m_list->Dispatch((dsize + 7) / 8, (dsize + 7) / 8, 6);
         }
         Require(&m_ldrCube, kSrvState);
+        Require(&m_ldrCubeOwn, kSrvState);
         FlushBarriers();
         m_ldrCubeReady = true;
     }
@@ -10104,7 +10173,7 @@ public:
              [] { const int v = g_giControl.env; return v < 0 ? EnvModeBase() : v; }, [] { return EnvModeBase(); },
              [](int v) { g_giControl.env = v; }, true, nullptr},
             {3, "Отражение воды|Water reflection", 0, 2, 1, true, water, 0, nullptr, [] { return WaterMode(); },
-             [] { return 0; },
+             [] { return WaterModeBase(); },
              [](int v) {
                  g_giControl.waterCube = v;
                  CryMTConsoleCommand(v ? "r_WaterReflections 0" : "r_WaterReflections 1"); // the engine's planar pass
@@ -11521,9 +11590,10 @@ private:
     ID3D12PipelineState* m_cubeDecodePso = nullptr;
     ID3D12PipelineState* m_cubeDownPso = nullptr;
     ID3D12PipelineState* m_cubeEncodePso = nullptr;
-    // The materials' copy of it (cubeEncode: as the voxel cube, 1 - exp(-0.5 x), all levels): what their reflections read.
-    TextureCore m_ldrCube{};
-    D3D12_CPU_DESCRIPTOR_HANDLE m_ldrCubeSrv{}, m_ldrCubeUav[12]{};
+    // The materials' copies of it (cubePrefilter: GGX by level, encoded as the voxel cube, 1 - exp(-0.5 x)): every
+    // material's (fragLib's CryMT_EnvSampler; the panel's "every material" scale) and their own maps' (its "own map" scale).
+    TextureCore m_ldrCube{}, m_ldrCubeOwn{};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_ldrCubeSrv{}, m_ldrCubeUav[12]{}, m_ldrCubeOwnSrv{}, m_ldrCubeOwnUav[12]{};
     bool m_ldrCubeReady = false;
     bool m_cubeFailed = false;
     bool m_hdrFaceValid[6] = {};
@@ -14538,6 +14608,11 @@ void Dx12EngineEnvCubeFov(float tanHalf)
 void Dx12DumpEngineCube()
 {
     dx12::g_cubeDumpWanted = true;
+}
+
+bool Dx12WaterReplacesPlanar()
+{
+    return dx12::g_device && dx12::Device::WaterCubeOn();
 }
 
 bool Dx12WantsEngineEnvCube()

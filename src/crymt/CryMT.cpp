@@ -5653,6 +5653,7 @@ void SetPolicies()
 // CRYMT_ENVCUBE_FLAGS (EDrawLowDetailFlags; default terrain, its water and light, static objects, far sprites). The entry
 // stays busy between our updates, so the pool never hands it to another position. The back end gets its device texture.
 bool Dx12WantsEngineEnvCube();                  // D3D12Backend.cpp: the water reflection reads the engine's cube
+bool Dx12WaterReplacesPlanar();                 // ... the water's reflection is CryMT's (the planar pass is not needed)
 void Dx12EngineEnvCube(ID3D10Resource* cube);   // ... this one (null: none)
 void Dx12DumpEngineCube();                      // ... as one picture at the next present (logs\play\cube_*_envcube.bmp)
 void Dx12EngineEnvCubeFov(float tanHalf);       // ... its faces' field of view (tan of the half angle; 1 = 90 degrees)
@@ -5704,6 +5705,10 @@ void EnvCubeUpdate()
     const int rate = g_giControl.envCubeRate > 0 ? g_giControl.envCubeRate.load() : rateBase; // the reflections page
     static const float jump = static_cast<float>(std::max(EnvCubeSetting("CRYMT_ENVCUBE_JUMP", 25), 1));
     static uint64_t flushes;
+    // CryMT's water reflection on (the default): the engine's planar pass off, kept so where the game sets the cvar again
+    // (its settings); the panel's planar mode sends r_WaterReflections 1.
+    if (D3DLayerPacketsAvailable() && Dx12WaterReplacesPlanar() && *reinterpret_cast<volatile int*>(kCvarWaterReflections) != 0)
+        *reinterpret_cast<volatile int*>(kCvarWaterReflections) = 0;
     if (g_levelChange || !D3DLayerPacketsAvailable() || !Dx12WantsEngineEnvCube())
         return;
     auto* entry = reinterpret_cast<uint8_t*>(kEnvCubePool) + (kEnvCubeEntries - 1) * kEnvCubeEntryBytes;

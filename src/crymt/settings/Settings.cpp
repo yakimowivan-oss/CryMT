@@ -88,9 +88,9 @@ const char* const kEnvAll = R"(#if D3D10
     half crymtF = 1 - saturate(pPass.fNdotE);
     crymtF *= crymtF;
     crymtF *= crymtF;
-    // The level by the gloss (the engine's cube has its mips; the voxel cube one level): the specular lobe's width
-    // (sqrt(2 / (n + 2)) radians) against a texel of a 256 cube's level (0.0061 x 2^L), two levels sharper.
-    half crymtLod = clamp(log2(sqrt(2 / (pPass.fSpecPow + 2)) / 0.0061) - 2, 0, 7);
+    // The level by the gloss: the engine's cube holds GGX of roughness L / 6 at level L (the voxel cube one level):
+    // alpha from the specular power (sqrt(2 / (n + 2))), roughness sqrt(alpha).
+    half crymtLod = 6 * sqrt(sqrt(2 / (pPass.fSpecPow + 2)));
     pPass.cEnvironment = texCUBElod(CryMT_EnvSampler, float4(pPass.vReflVec.xyz, crymtLod)).rgb * (0.04 + 0.96 * crymtF) * 0.35;
     pPass.nReflectionMapping = 3;
   }
@@ -107,7 +107,9 @@ const char* const kEnvAll = R"(#if D3D10
 // FidelityFX SSSR's hierarchical ray march (ffx_sssr_intersect.h, FidelityFX SDK 1.1.4, Copyright (C) 2024 Advanced Micro
 // Devices, Inc., MIT license: licenses\fidelityfx.license.txt) over the back end's depth pyramid (Textures/CryMT/hiz.dds:
 // near / view depth, 0 for the sky and the first-person view, the largest of 2x2 per level, 7 levels), the scene before
-// the water (envMapSamplerRefr) at the hit, the cube where it misses. Ported to SM4 for inverted depth and mirror rays.
+// the water (the shader's own scene map, a parameter) at the hit, the cube where it misses. Ported to SM4 for inverted
+// depth and mirror rays. Rivers and lakes (WaterVols.cfx WaterSurfacePS) take the same reflection in place of their
+// planar one, their static cube or none (the user, 2026-11-13).
 const char* const kWaterEnvDecl = R"(#if D3D10
 samplerCUBE CryMT_WaterEnvSampler = sampler_state
 {
@@ -230,7 +232,7 @@ float CryMT_HiZConfidence(float3 hit, float2 uv, float2 screenSize, float nearZ)
 
 // The reflection towards the mirrored view direction (world): the cube (the voxel grid's holds 1 - exp(-0.5 x), alpha 1;
 // the engine's RGBK: back to HDR) or the planar one; with SSR the scene where the ray meets it. screenProj: the pixel's (u, v) * w and w (Water.cfx's).
-half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj)
+half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj, sampler2D sceneMap)
 {
   float wP = screenProj.w;
   float2 uvP = screenProj.xy / wP;
@@ -264,7 +266,7 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
     float2 skyEdge = smoothstep(0, 0.04, uvSky) * (1 - smoothstep(0.96, 1, uvSky));
     float wSky = skyEdge.x * skyEdge.y;
     if (wSky > 0 && tex2Dlod(CryMT_WaterDepthSampler, float4(uvSky, 0, 0)).r >= 0.999)
-      base.rgb = lerp(base.rgb, tex2Dlod(envMapSamplerRefr, float4(uvSky, 0, 0)).rgb, wSky);
+      base.rgb = lerp(base.rgb, tex2Dlod(sceneMap, float4(uvSky, 0, 0)).rgb, wSky);
   }
   float3 Eh = float3(uvP * wP, wP) + t0 * Rh;
   float3 origin = float3(uvP, hz.z / wP);
@@ -274,11 +276,11 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   float confidence = valid ? CryMT_HiZConfidence(hit, uvP, screenSize, hz.z) : 0;
   if (confidence <= 0)
     return base;
-  half3 seen = tex2Dlod(envMapSamplerRefr, float4(hit.xy, 0, 0)).rgb;
+  half3 seen = tex2Dlod(sceneMap, float4(hit.xy, 0, 0)).rgb;
   return half4(lerp(base.rgb, seen, confidence), base.a);
 }
 #else
-half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj)
+half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj, sampler2D sceneMap)
 {
   return planar;
 }
@@ -765,6 +767,7 @@ const wchar_t* kParticles = L"Shaders\\HWScripts\\CryFX\\Particles.cfi";
 const wchar_t* kMetal = L"Shaders\\HWScripts\\CryFX\\Metal.cfx";
 const wchar_t* kVegetation = L"Shaders\\HWScripts\\CryFX\\Vegetation.cfx";
 const wchar_t* kWater = L"Shaders\\HWScripts\\CryFX\\Water.cfx";
+const wchar_t* kWaterVols = L"Shaders\\HWScripts\\CryFX\\WaterVols.cfx";
 const wchar_t* kPlaceholder = L"Textures\\CryMT\\gi.dds";
 // The patch goes into the game as a pak: without -DEVMODE CryPak reads files only from paks (loose files are ignored)
 // and a later pak by name overrides the earlier ones (as the official ZPatch1.pak does), so zzCryMT.pak's sources
@@ -904,12 +907,13 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
                 particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal)),
-                vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater));
+                vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater)),
+                waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
@@ -917,7 +921,15 @@ std::wstring InstallGi()
     const bool ok = // The ocean's reflection from CryMT's cube when it is bound (kWaterEnvDecl).
                     Replace(water, "// Anisotropic not working ..\nsampler2D oceanBumpMapSampler\n", std::string(kWaterEnvDecl) + "// Anisotropic not working ..\nsampler2D oceanBumpMapSampler\n") &&
                     Replace(water, "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n\n//  OUT.Color = reflectColor;",
-                            "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n  reflectColor = CryMT_WaterReflection(reflectColor, viewVec, bumpNormal, IN.screenProj); // CryMT\n\n//  OUT.Color = reflectColor;") &&
+                            "  half4 reflectColor = tex2D(envMapSamplerRefl, reflNewst);\n  reflectColor = CryMT_WaterReflection(reflectColor, viewVec, bumpNormal, IN.screenProj, envMapSamplerRefr); // CryMT\n\n//  OUT.Color = reflectColor;") &&
+                    // Rivers and lakes: the same reflection after theirs (planar, static cube or none).
+                    Replace(waterVols, "\nsampler2D envMapSamplerRefl\n<\n", "\n" + std::string(kWaterEnvDecl) + "sampler2D envMapSamplerRefl\n<\n") &&
+                    Replace(waterVols, "#endif\n\n  //////////////////////////////////////////////////////////////////////////////////////////////////\n  // Compute coeficients",
+                            "#endif\n  reflectColor = CryMT_WaterReflection(half4(reflectColor, 1), viewVec, bumpNormal.xyz, IN.projTC, screenMapSampler).rgb; // CryMT\n\n"
+                            "  //////////////////////////////////////////////////////////////////////////////////////////////////\n  // Compute coeficients") &&
+                    // A material's own cube map at the level of its gloss (the engine's copy holds GGX by level).
+                    Replace(frag, "pPass.cEnvironment = GetEnvironmentCMap(envMapSamplerCUBE, pPass.vReflVec.xyz);",
+                            "pPass.cEnvironment = texCUBElod(envMapSamplerCUBE, float4(pPass.vReflVec.xyz, 6 * sqrt(sqrt(2 / (pPass.fSpecPow + 2))))).xyz; // CryMT") &&
                     Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl) &&
                     // The sun's shadow mask with CryMT's screen-space shadows, also beyond the shadow maps.
                     Replace(frag, "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);",
@@ -1057,6 +1069,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/Metal.cfx", Crlf(metal)},
                               {"Shaders/HWScripts/CryFX/Vegetation.cfx", Crlf(vegetation)},
                               {"Shaders/HWScripts/CryFX/Water.cfx", Crlf(water)},
+                              {"Shaders/HWScripts/CryFX/WaterVols.cfx", Crlf(waterVols)},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/hiz.dds", hiz},
                               {"Textures/CryMT/env.dds", env},
