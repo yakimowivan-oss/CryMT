@@ -80,6 +80,9 @@ $defs = [ordered]@{
     dirl1_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '1'}}
     dirl1_noroom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '1'; CRYMT_GI_ROOMLIGHT = '0'}}
     noroom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_ROOMLIGHT = '0'}}
+    # Six directions (CRYMT_GI_DIRLIGHT 2), with and without the room fix.
+    dirl6_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '2'}}
+    dirl6_noroom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '2'; CRYMT_GI_ROOMLIGHT = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}

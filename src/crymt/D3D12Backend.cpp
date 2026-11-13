@@ -1410,6 +1410,8 @@ Texture3D<float4> l1Tex : register(t13);  // the levels' light direction g (CRYM
 Texture3D<float4> l1Tex1 : register(t14); // the colour times 1 + g.w
 Texture3D<float4> l1Tex2 : register(t15);
 Texture3D<float4> l1Tex3 : register(t16);
+// The levels' six directions (CRYMT_GI_DIRLIGHT 2, visAreas[0].z 2): t17 + level x 6 + face (+X, -X, +Y, -Y, +Z, -Z).
+Texture3D<float3> sixTex[24] : register(t17);
 
 // The VisArea near the camera that holds P (the rooms the level marks as indoors; with a margin of 0.3 m, so walls on
 // their border count), else -1.
@@ -1528,6 +1530,46 @@ float3 SampleDir(int level, float3 X, float mip)
     return dirTex3.SampleLevel(linearWrap, uvw, mip - 1).xyz;
 }
 
+float3 SampleSix(int level, int face, float3 X, float mip)
+{
+    float3 uvw = X / (voxParams.x * (1 << level) * voxGrid.w);
+    [forcecase] switch (level * 6 + face)
+    {
+    case 0: return sixTex[0].SampleLevel(linearWrap, uvw, mip);
+    case 1: return sixTex[1].SampleLevel(linearWrap, uvw, mip);
+    case 2: return sixTex[2].SampleLevel(linearWrap, uvw, mip);
+    case 3: return sixTex[3].SampleLevel(linearWrap, uvw, mip);
+    case 4: return sixTex[4].SampleLevel(linearWrap, uvw, mip);
+    case 5: return sixTex[5].SampleLevel(linearWrap, uvw, mip);
+    case 6: return sixTex[6].SampleLevel(linearWrap, uvw, mip);
+    case 7: return sixTex[7].SampleLevel(linearWrap, uvw, mip);
+    case 8: return sixTex[8].SampleLevel(linearWrap, uvw, mip);
+    case 9: return sixTex[9].SampleLevel(linearWrap, uvw, mip);
+    case 10: return sixTex[10].SampleLevel(linearWrap, uvw, mip);
+    case 11: return sixTex[11].SampleLevel(linearWrap, uvw, mip);
+    case 12: return sixTex[12].SampleLevel(linearWrap, uvw, mip);
+    case 13: return sixTex[13].SampleLevel(linearWrap, uvw, mip);
+    case 14: return sixTex[14].SampleLevel(linearWrap, uvw, mip);
+    case 15: return sixTex[15].SampleLevel(linearWrap, uvw, mip);
+    case 16: return sixTex[16].SampleLevel(linearWrap, uvw, mip);
+    case 17: return sixTex[17].SampleLevel(linearWrap, uvw, mip);
+    case 18: return sixTex[18].SampleLevel(linearWrap, uvw, mip);
+    case 19: return sixTex[19].SampleLevel(linearWrap, uvw, mip);
+    case 20: return sixTex[20].SampleLevel(linearWrap, uvw, mip);
+    case 21: return sixTex[21].SampleLevel(linearWrap, uvw, mip);
+    case 22: return sixTex[22].SampleLevel(linearWrap, uvw, mip);
+    default: return sixTex[23].SampleLevel(linearWrap, uvw, mip);
+    }
+}
+
+// The light the cells send back along a cone going along dir (out towards -dir): the three faces turned to it, by dir^2.
+float3 SixToward(int level, float3 X, float mip, float3 dir)
+{
+    float3 w2 = dir * dir;
+    return w2.x * SampleSix(level, dir.x > 0 ? 1 : 0, X, mip) + w2.y * SampleSix(level, dir.y > 0 ? 3 : 2, X, mip) +
+           w2.z * SampleSix(level, dir.z > 0 ? 5 : 4, X, mip);
+}
+
 float3 SampleL1(int level, float3 X, float mip)
 {
     float3 uvw = X / (voxParams.x * (1 << level) * voxGrid.w);
@@ -1600,8 +1642,15 @@ float4 ConeTrace(float3 O, float3 dir, float halfTan, float start, float reach, 
                 w.a = dot(dir * dir * axes, SampleDir(level + 1, X, mip1));
             v = lerp(w, v, edge);
         }
-        // CRYMT_GI_DIRLIGHT 1: the light the cells send back along the cone (out towards -dir): colour x (1 - g.dir).
-        if (visAreas[0].z > 0.5)
+        // CRYMT_GI_DIRLIGHT 2: the six directions' faces turned to the cone; 1: colour x (1 - g.dir) (out towards -dir).
+        if (visAreas[0].z > 1.5)
+        {
+            float3 c6 = SixToward(level, X, mip, dir);
+            if (edge < 1)
+                c6 = lerp(SixToward(level + 1, X, clamp(lod - level - 1, 1, 4), dir), c6, edge);
+            v.rgb = c6;
+        }
+        else if (visAreas[0].z > 0.5)
         {
             float3 gl = SampleL1(level, X, mip);
             if (edge < 1)
@@ -2702,7 +2751,8 @@ constexpr UINT kVoxConstants = 60;
 constexpr int kVoxN = 128;
 constexpr UINT kVoxMips = 5; // 128 .. 8
 constexpr int kVoxLevels = 4;  // cells of voxelSize (0.25 m), 2, 4 and 8 times that: 32, 64, 128 and 256 m around the camera
-constexpr UINT kVoxTable = 11; // descriptors per table: t0..t2, u0..u7 (u6/u7 the light direction, CRYMT_GI_DIRLIGHT)
+constexpr UINT kVoxTable = 23; // descriptors per table: t0..t2, u0..u19 (u6/u7 the light direction, u8..u19 the six
+                               // directions: CRYMT_GI_DIRLIGHT)
 const char* const kVoxShader = R"(
 cbuffer VoxConstants : register(b0)
 {
@@ -2750,6 +2800,57 @@ RWTexture3D<snorm float4> l1Grid : register(u6);
 RWTexture3D<snorm float4> l1Dst : register(u7);
 cbuffer VoxFlags : register(b2) { uint voxFlags; };
 float Luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+// Six directions (CRYMT_GI_DIRLIGHT 2, voxFlags bit 1): the light going out towards +X, -X, +Y, -Y, +Z, -Z (kSixAxis).
+// u8..u13 the level (downsample: the mip below), u14..u19 the downsample's mip.
+RWTexture3D<float3> six0 : register(u8);
+RWTexture3D<float3> six1 : register(u9);
+RWTexture3D<float3> six2 : register(u10);
+RWTexture3D<float3> six3 : register(u11);
+RWTexture3D<float3> six4 : register(u12);
+RWTexture3D<float3> six5 : register(u13);
+RWTexture3D<float3> sixDst0 : register(u14);
+RWTexture3D<float3> sixDst1 : register(u15);
+RWTexture3D<float3> sixDst2 : register(u16);
+RWTexture3D<float3> sixDst3 : register(u17);
+RWTexture3D<float3> sixDst4 : register(u18);
+RWTexture3D<float3> sixDst5 : register(u19);
+static const float3 kSixAxis[6] = {float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1)};
+float3 SixLoad(int f, uint3 p)
+{
+    [forcecase] switch (f)
+    {
+    case 0: return six0[p];
+    case 1: return six1[p];
+    case 2: return six2[p];
+    case 3: return six3[p];
+    case 4: return six4[p];
+    default: return six5[p];
+    }
+}
+void SixStore(int f, uint3 p, float3 c)
+{
+    [forcecase] switch (f)
+    {
+    case 0: six0[p] = c; break;
+    case 1: six1[p] = c; break;
+    case 2: six2[p] = c; break;
+    case 3: six3[p] = c; break;
+    case 4: six4[p] = c; break;
+    default: six5[p] = c; break;
+    }
+}
+void SixDstStore(int f, uint3 p, float3 c)
+{
+    [forcecase] switch (f)
+    {
+    case 0: sixDst0[p] = c; break;
+    case 1: sixDst1[p] = c; break;
+    case 2: sixDst2[p] = c; break;
+    case 3: sixDst3[p] = c; break;
+    case 4: sixDst4[p] = c; break;
+    default: sixDst5[p] = c; break;
+    }
+}
 
 static const float kWeaponDepth = 0.1;
 static const float kColourTrust = 48; // metres: screen colour taken at full weight up to here (update)
@@ -2802,6 +2903,21 @@ void ScreenL1(uint3 id, inout float4 v, float3 nView, float3 c, float trust)
     l1Grid[id] = float4(len > 1 ? gNew / len : gNew, 0);
 }
 
+// CRYMT_GI_DIRLIGHT 2: the screen's colour goes into the faces turned to the camera's side of the surface (by how much
+// they face it), the others keep theirs (a cell seen for the first time: dark).
+void ScreenSix(uint3 id, float3 nView, float3 c, float trust, bool fresh)
+{
+    float3 n = normalize(float3(dot(nView, toWorldX.xyz), dot(nView, toWorldY.xyz), dot(nView, toWorldZ.xyz)));
+    [unroll] for (int f = 0; f < 6; f++)
+    {
+        float w = dot(n, kSixAxis[f]);
+        if (fresh)
+            SixStore(f, id, w > 0.2 ? c * trust : 0);
+        else if (w > 0)
+            SixStore(f, id, lerp(SixLoad(f, id), c, 0.25 * trust * saturate(w * 2)));
+    }
+}
+
 [numthreads(4, 4, 4)]
 void update(uint3 id : SV_DispatchThreadID)
 {
@@ -2817,6 +2933,9 @@ void update(uint3 id : SV_DispatchThreadID)
         v = 0; // entered the grid now: nothing known
         if (voxFlags & 1)
             l1Grid[id] = 0;
+        if (voxFlags & 2)
+            [unroll] for (int f0 = 0; f0 < 6; f0++)
+                SixStore(f0, id, 0);
     }
     bool track = prevGridMin.w > 0; // the geometry's levels keep which cells the screen coloured
     if (track && entered)
@@ -2921,6 +3040,8 @@ void update(uint3 id : SV_DispatchThreadID)
                         // coarse levels lit a band at their edge until the camera came near): trusted fully up to
                         // kColourTrust metres, less beyond; a first sight from afar is dimmed likewise.
                         float trust = saturate(kColourTrust / dist);
+                        if ((voxFlags & 2) && dot(surfN, surfN) > 0)
+                            ScreenSix(id, surfN, c, trust, v.a <= 0.01);
                         if ((voxFlags & 1) && dot(surfN, surfN) > 0)
                             ScreenL1(id, v, surfN, c, trust);
                         else
@@ -3061,6 +3182,9 @@ void light(uint3 id : SV_DispatchThreadID)
         const float3 dirT = lt > 1e-5 ? side * (0.5 * Luma(sunPart) / lt) : 0;
         v.rgb = lerp(v.rgb, target, 0.25);
         l1Grid[id] = float4(lerp(l1Grid[id].xyz, dirT, 0.25), 0);
+        if (voxFlags & 2) // six directions: the sun into the faces turned to the lit side, the rest into all
+            [unroll] for (int f = 0; f < 6; f++)
+                SixStore(f, id, lerp(SixLoad(f, id), rest + sunPart * saturate(2 * dot(side, kSixAxis[f])), 0.25));
     }
     else
         v.rgb = lerp(v.rgb, sunPart + rest, 0.25);
@@ -3243,6 +3367,14 @@ void downsample(uint3 id : SV_DispatchThreadID)
         }
         l1Dst[id] = float4(ws > 1e-6 ? gs / ws : 0, 0);
     }
+    if (voxFlags & 2) // the six directions: premultiplied means, as the colour
+        [unroll] for (int f = 0; f < 6; f++)
+        {
+            float3 s6 = 0;
+            [unroll] for (int j4 = 0; j4 < 8; j4++)
+                s6 += SixLoad(f, id * 2 + uint3(j4 & 1, (j4 >> 1) & 1, j4 >> 2)) * (mode == 1 ? a[j4] : 1);
+            SixDstStore(f, id, s6 / 8);
+        }
 }
 
 // The info panel (GI test keys), its rectangle in pixels in worldToPrevClip's first row (width 0: none): the frame
@@ -7038,9 +7170,10 @@ public:
         bool thinFix = true;               // CRYMT_GI_THIN=0: thin features keep their own (chance) GI
         bool roomLight = true;             // CRYMT_GI_ROOMLIGHT=0: cones from inside a VisArea take light from outside it too
                                            // (2026-11-13: sunlit roofs and outer walls leaked in through the coarse mips)
-        int dirLight = 0;                  // CRYMT_GI_DIRLIGHT: the cells' light, 0 one colour for all directions, 1 a colour
+        int dirLight = 1;                  // CRYMT_GI_DIRLIGHT: the cells' light, 0 one colour for all directions, 1 a colour
                                            // and the direction it goes out stronger (L1: a thin wall lit outside stays dark
-                                           // inside; the voxels page). 2: six directions (not yet)
+                                           // inside; the voxels page; default since 2026-11-14, the user), 2 six directions
+                                           // (+-X, +-Y, +-Z, ~220 MB more, made when first asked for)
         float gtaoRadius = 0.5f;           // CRYMT_GI_GTAORADIUS, metres
         bool contactShadows = true;        // CRYMT_CONTACTSHADOWS=0: no screen-space contact shadows in the sun's shadow mask
         float contactLength = 0.35f;       // CRYMT_CONTACTLENGTH: the march's length at 10 m (metres; scales with distance)
@@ -7160,7 +7293,7 @@ public:
             v.thinFix = !(GetEnvironmentVariableW(L"CRYMT_GI_THIN", text, 32) && wcscmp(text, L"0") == 0);
             v.roomLight = !(GetEnvironmentVariableW(L"CRYMT_GI_ROOMLIGHT", text, 32) && wcscmp(text, L"0") == 0);
             if (GetEnvironmentVariableW(L"CRYMT_GI_DIRLIGHT", text, 32))
-                v.dirLight = std::min(std::max(_wtoi(text), 0), 1);
+                v.dirLight = std::min(std::max(_wtoi(text), 0), 2);
             v.replaceSsao = !(GetEnvironmentVariableW(L"CRYMT_GI_SSAO", text, 32) && wcscmp(text, L"0") != 0);
             read(L"CRYMT_GI_GTAO", v.gtao);
             read(L"CRYMT_GI_GTAORADIUS", v.gtaoRadius);
@@ -7274,7 +7407,7 @@ public:
         g.sssReach = g_giControl.sssReach > 0 ? static_cast<float>(g_giControl.sssReach) : b.sssReach;
         g.sssWeaponThickness = g_giControl.sssWeapon >= 0 && g_giControl.sssWeapon < 5 ? kSssWeaponThick[g_giControl.sssWeapon] : b.sssWeaponThickness;
         g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
-        g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 1) : b.dirLight;
+        g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 2) : b.dirLight;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -8203,7 +8336,7 @@ public:
                 return false;
             }
         D3D12_DESCRIPTOR_RANGE ranges[3] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 3},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3 * kVoxLevels + 2, 3, 0, 0}};
+                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 9 * kVoxLevels + 2, 3, 0, 0}};
         D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = kGiConstants;
@@ -9044,6 +9177,8 @@ public:
                 m_barriers.push_back(Transition(m_vox[l], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
                 m_barriers.push_back(Transition(m_voxDir[l], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
                 m_barriers.push_back(Transition(m_voxL1[l], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+                for (int f = 0; f < 6 && m_voxSixReady; f++)
+                    m_barriers.push_back(Transition(m_voxSix[l][f], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
             }
         if (cones)
             m_barriers.push_back(Transition(m_voxRoof, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
@@ -9057,7 +9192,7 @@ public:
             memset(f, 0, kVisFloat4s * 16);
             f[0] = static_cast<float>(m_giVisAreaCount);
             f[1] = Gi().roomLight ? 1.0f : 0.0f; // [0].y: the cones from inside a room take no light from outside its box
-            f[2] = static_cast<float>(Gi().dirLight); // [0].z: the cells' light direction (CRYMT_GI_DIRLIGHT)
+            f[2] = static_cast<float>(ConeDirMode()); // [0].z: the cells' light, 0 one colour, 1 L1, 2 six directions
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
         }
@@ -9065,7 +9200,7 @@ public:
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
         // Three tables of 6: trace (depth, colour, -, raw out, -, -), filter (depth, raw, previous GI, new GI out,
         // distance out, previous distance) and upsample (depth, new GI, -, full-size out, distances, -).
-        const UINT aoTables = 24 + 3 * kVoxLevels + 2; // then three tables of 6 for the GTAO passes
+        const UINT aoTables = 24 + 9 * kVoxLevels + 2; // then three tables of 6 for the GTAO passes
         while (!m_srvRing.TryAlloc(aoTables + 30, cpu, gpu))
         {
             Submit();
@@ -9137,6 +9272,10 @@ public:
             ld.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             ld.Texture3D.MipLevels = cones ? kVoxMips : 1;
             g.dev->CreateShaderResourceView(cones ? m_voxL1[l] : nullptr, &ld, at(24 + 2 * kVoxLevels + 2 + l));
+            ld.Format = DXGI_FORMAT_R11G11B10_FLOAT; // t17..t40: the six directions, level-major (CRYMT_GI_DIRLIGHT 2)
+            ld.Texture3D.MipLevels = cones && m_voxSixReady ? kVoxMips : 1;
+            for (int f = 0; f < 6; f++)
+                g.dev->CreateShaderResourceView(cones && m_voxSixReady ? m_voxSix[l][f] : nullptr, &ld, at(24 + 3 * kVoxLevels + 2 + l * 6 + f));
         }
         // GTAO: (depth, foliage mask, -, -, raw out, -), (depth, raw, previous history, current history out, -, -),
         // (depth, current history, -, full-size GI, -, -).
@@ -9455,6 +9594,8 @@ public:
                 m_barriers.push_back(Transition(m_vox[l], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
                 m_barriers.push_back(Transition(m_voxDir[l], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
                 m_barriers.push_back(Transition(m_voxL1[l], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+                for (int f = 0; f < 6 && m_voxSixReady; f++)
+                    m_barriers.push_back(Transition(m_voxSix[l][f], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
             }
         if (cones)
             m_barriers.push_back(Transition(m_voxRoof, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
@@ -9505,7 +9646,7 @@ public:
                 Log("voxel shader %s: %s", entries[i], errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
                 return false;
             }
-        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 8, 0, 0, 3}};
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 20, 0, 0, 3}};
         D3D12_ROOT_PARAMETER params[4]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = kVoxConstants;
@@ -9621,8 +9762,54 @@ public:
         g.dev->CreateUnorderedAccessView(mip < 0 || level < 0 ? nullptr : m_voxL1[level], nullptr, &ud, at);
     }
 
-    // The voxel passes' b2 (voxFlags): bit 0 the cells' light direction is kept and used (CRYMT_GI_DIRLIGHT 1).
-    uint32_t VoxFlags() const { return Gi().dirLight == 1 ? 1u : 0u; }
+    // The voxel passes' b2 (voxFlags): bit 0 the cells' light direction (L1) is kept (CRYMT_GI_DIRLIGHT 1 and 2), bit 1
+    // the six directions too (2, once made).
+    uint32_t VoxFlags() const { return (Gi().dirLight >= 1 ? 1u : 0u) | (Gi().dirLight == 2 && m_voxSixReady ? 2u : 0u); }
+    // What the GI's cones use (visAreas[0].z): 0 one colour, 1 L1, 2 six directions.
+    int ConeDirMode() const { return Gi().dirLight == 2 && m_voxSixReady ? 2 : Gi().dirLight >= 1 ? 1 : 0; }
+
+    // The six directions (CRYMT_GI_DIRLIGHT 2): per level the light going out towards +X, -X, +Y, -Y, +Z, -Z, R11G11B10
+    // with the grid's mips, made when first asked for (~220 MB for four levels). Their contents start undefined: the
+    // grid is reset once (every cell "entered", which clears them).
+    bool EnsureVoxSix()
+    {
+        if (m_voxSixReady || m_voxSixFailed)
+            return m_voxSixReady;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        d.Width = d.Height = kVoxN;
+        d.DepthOrArraySize = kVoxN;
+        d.MipLevels = kVoxMips;
+        d.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        d.SampleDesc.Count = 1;
+        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        HRESULT hr = S_OK;
+        for (int l = 0; l < kVoxLevels && SUCCEEDED(hr); l++)
+            for (int f = 0; f < 6 && SUCCEEDED(hr); f++)
+                hr = g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                    __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_voxSix[l][f]));
+        m_voxSixReady = SUCCEEDED(hr);
+        m_voxSixFailed = !m_voxSixReady;
+        if (m_voxSixReady)
+            for (auto& level : m_voxPrevGrid)
+                for (int& v : level)
+                    v = -(1 << 28); // the next update resets every cell (and its six directions)
+        Log("voxel six directions (CRYMT_GI_DIRLIGHT 2): %s", m_voxSixReady ? "ready" : "failed");
+        return m_voxSixReady;
+    }
+
+    // A UAV of one mip of a level's direction face f (m_voxSix), or a null 3D view.
+    void SixUav(D3D12_CPU_DESCRIPTOR_HANDLE at, int f, int mip, int level = 0)
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+        ud.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        ud.Texture3D.MipSlice = mip < 0 ? 0 : static_cast<UINT>(mip);
+        ud.Texture3D.WSize = static_cast<UINT>(-1);
+        g.dev->CreateUnorderedAccessView(mip < 0 || level < 0 || !m_voxSixReady ? nullptr : m_voxSix[level][f], nullptr, &ud, at);
+    }
 
     // A UAV of one mip of a level's per-axis opacity (grid mip mip + 1), or a null 3D view.
     void DirUav(D3D12_CPU_DESCRIPTOR_HANDLE at, int mip, int level = 0)
@@ -10393,6 +10580,11 @@ public:
             VoxUav(at(b + 8), -1);
             L1Uav(at(b + 9), 0, l);
             L1Uav(at(b + 10), -1);
+            for (int f = 0; f < 6; f++)
+            {
+                SixUav(at(b + 11 + f), f, 0, l);
+                SixUav(at(b + 17 + f), f, -1);
+            }
         }
         // The face's depth to distance: clip.w = s z (s = +-1 the projection's handedness), d = A s + B / distance.
         const float A = m_cubeFaceProj[10], B = m_cubeFaceProj[14], s = m_cubeFaceProj[11] >= 0 ? 1.0f : -1.0f;
@@ -10695,6 +10887,8 @@ public:
             GiStamp(4);
             return;
         }
+        if (Gi().dirLight == 2)
+            EnsureVoxSix();
         // Geometry stamps (frames + 1, kept within float precision for the constants); the update takes the last three.
         const uint32_t stamp = static_cast<uint32_t>(m_giFrame & 0xFFFFFF) + 1;
         RunVoxelGeometry(toWorld, stamp);
@@ -10795,6 +10989,11 @@ public:
                     VoxUav(at(b + 8), -1);
                 L1Uav(at(b + 9), t == 0 ? 0 : static_cast<int>(t) - 1, l); // u6: the level's light direction (downsample: the mip below)
                 L1Uav(at(b + 10), t == 0 ? -1 : static_cast<int>(t), l);   // u7: the downsample's mip
+                for (int f = 0; f < 6; f++)
+                {
+                    SixUav(at(b + 11 + f), f, t == 0 ? 0 : static_cast<int>(t) - 1, l); // u8..u13: the six directions (the mip below)
+                    SixUav(at(b + 17 + f), f, t == 0 ? -1 : static_cast<int>(t), l);   // u14..u19: the downsample's mip
+                }
             }
             float c[kVoxConstants] = {};
             VoxConstants(c, toWorld, m_giFullW, m_giFullH, 0.0f, l);
@@ -10992,7 +11191,8 @@ public:
         static const char* const view[] = {"ВЫКЛ|OFF", "КАРКАС|WIRE", "СПЛОШНОЙ|SOLID"};
         static const char* const geometry[] = {"ВЫКЛ|OFF", "ВКЛ|ON", "ВКЛ + ЛИСТВА|ON + FOLIAGE"};
         static const char* const opacity[] = {"ЭКРАН И ГЕОМЕТРИЯ|SCREEN+GEOMETRY", "ГЕОМЕТРИЯ|GEOMETRY"};
-        static const char* const cellLight[] = {"ОДИН ЦВЕТ|ONE COLOUR", "ЦВЕТ + НАПРАВЛЕНИЕ|COLOUR + DIRECTION"};
+        static const char* const cellLight[] = {"ОДИН ЦВЕТ|ONE COLOUR", "ЦВЕТ + НАПРАВЛЕНИЕ|COLOUR + DIRECTION",
+                                                "6 НАПРАВЛЕНИЙ|6 DIRECTIONS"};
         static const char* const cache[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "КАЖДЫЙ 4-Й|EVERY 4TH"};
         static const char* const env[] = {"КАРТЫ ИГРЫ|GAME'S MAPS", "ВОКСЕЛЬНЫЙ КУБ|VOXEL CUBE", "КУБ ДВИЖКА|ENGINE CUBE"};
         static const char* const water[] = {"ПЛАНАРНОЕ|PLANAR", "КУБКАРТА|CUBE MAP", "SSR + КУБКАРТА|SSR + CUBE MAP"};
@@ -11081,8 +11281,8 @@ public:
              [] { return GiBase().opacityGeometry ? 1 : 0; }, [](int v) { g_giControl.voxOpacity = v; }, true, nullptr},
             // The cells' light (CRYMT_GI_DIRLIGHT): one colour for all directions, or a colour and the direction it goes
             // out stronger (a wall lit outside stays dark inside).
-            {2, "Свет ячейки|Cell light", 0, 1, 1, true, cellLight, 0, nullptr,
-             [] { const int v = g_giControl.dirLight; return v < 0 ? GiBase().dirLight : std::min(v, 1); },
+            {2, "Свет ячейки|Cell light", 0, 2, 1, true, cellLight, 0, nullptr,
+             [] { const int v = g_giControl.dirLight; return v < 0 ? GiBase().dirLight : std::min(v, 2); },
              [] { return GiBase().dirLight; }, [](int v) { g_giControl.dirLight = v; }, true, nullptr},
             {2, "Неизменные объекты|Unchanged objects", 0, 1, 1, true, cache, 0, nullptr,
              [] { const int v = g_giControl.geomCache; return v < 0 ? (GiBase().geometryCache ? 1 : 0) : v; },
@@ -11498,6 +11698,8 @@ public:
         VoxUav(at(8), 0, 3);
         L1Uav(at(9), -1);
         L1Uav(at(10), -1);
+        for (int f = 0; f < 12; f++)
+            SixUav(at(11 + f), f % 6, -1);
         float toWorld[16];
         RigidInverse(m_giView, toWorld);
         float c[kVoxConstants] = {};
@@ -12842,6 +13044,8 @@ private:
     ID3D12Resource* m_vox[kVoxLevels] = {};       // voxel grid levels (kVoxShader), unordered access but in the GI passes
     ID3D12Resource* m_voxDir[kVoxLevels] = {};    // their opacity per axis, RGBA8 at grid mips 1..4 (CRYMT_GI_MIPOPACITY=4)
     ID3D12Resource* m_voxL1[kVoxLevels] = {};     // their light's direction, RGBA8 SNORM with the grid's mips (CRYMT_GI_DIRLIGHT 1)
+    ID3D12Resource* m_voxSix[kVoxLevels][6] = {}; // their light per direction (CRYMT_GI_DIRLIGHT 2, EnsureVoxSix)
+    bool m_voxSixReady = false, m_voxSixFailed = false;
     ID3D12Resource* m_voxView = nullptr;          // its debug view, the back buffer's size and format
     UINT m_voxViewW = 0, m_voxViewH = 0;
     DXGI_FORMAT m_voxViewFormat = DXGI_FORMAT_UNKNOWN;
