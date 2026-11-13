@@ -5889,6 +5889,7 @@ bool Dx12WantsEngineEnvCube();                  // D3D12Backend.cpp: the water r
 bool Dx12WaterReplacesPlanar();                 // ... the water's reflection is CryMT's (the planar pass is not needed)
 void Dx12EngineEnvCube(ID3D10Resource* cube);   // ... this one (null: none)
 void Dx12DumpEngineCube();                      // ... as one picture at the next present (logs\play\cube_*_envcube.bmp)
+void Dx12VoxSnap(const char* name);             // D3D12Backend.cpp: the voxel grid to logs/play/voxsnap_<name>.bin
 void Dx12EngineEnvCubeFov(float tanHalf);       // ... its faces' field of view (tan of the half angle; 1 = 90 degrees)
 float g_envCubePos[3];
 bool g_envCubeEntitiesPatched;
@@ -8815,6 +8816,12 @@ void RunTestCommands()
         g_giControl.envCubeBlend = std::min(std::max(atoi(command + 19), 0), 2);
         g_giControl.active = true;
         FocusLog("frame %llu: engine cube blending %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeBlend.load());
+        return;
+    }
+    if (_strnicmp(command, "crymt_voxsnap ", 14) == 0) // the voxel grid's geometry levels to a file (tools/prof/voxsnap_diff.py)
+    {
+        Dx12VoxSnap(command + 14);
+        FocusLog("frame %llu: voxel snapshot '%s' asked", static_cast<unsigned long long>(g_frame), command + 14);
         return;
     }
     if (_stricmp(command, "crymt_cubepic") == 0) // the engine's cube as one picture (as Num0)

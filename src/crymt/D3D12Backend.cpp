@@ -907,6 +907,9 @@ Device* g_device;
 std::mutex g_engineCubeLock;
 ID3D10Resource* g_engineCubePending;
 std::atomic<bool> g_cubeDumpWanted; // Dx12DumpEngineCube (Num0 with the in-game keys): the cube as one picture at the next present
+std::atomic<bool> g_voxSnapWanted;  // Dx12VoxSnap (crymt_voxsnap <name>): the voxel grid's geometry levels to a file
+std::mutex g_voxSnapLock;
+std::string g_voxSnapName;
 std::atomic<float> g_engineCubeTanHalf{1.0f}; // Dx12EngineEnvCubeFov: the engine cube faces' tan(half field of view)
 ID3D10Device* DeviceInterface(); // AddRef'd
 void SubmitMain();               // context thread: submits the main list being recorded
@@ -10371,6 +10374,8 @@ public:
         }
         m_voxValid = true;
         m_stats.voxPasses++;
+        if (g_voxSnapWanted.load(std::memory_order_relaxed) && m_voxSnap.empty())
+            RecordVoxSnap(toWorld);
     }
 
     static DXGI_FORMAT VoxViewFormat(DXGI_FORMAT f)
@@ -11266,6 +11271,140 @@ public:
     };
     std::vector<PendingDump> m_dumps;
     std::string m_dumpTag;
+
+    // ---- Voxel snapshot (crymt_voxsnap <name>, measuring the grid's stability): right after a voxel update, levels
+    // 0..kVoxGeomLevels-1 (the grid, the geometry stamps, the screen's "seen") read back; after the present's wait written
+    // to logs\play\voxsnap_<name>.bin: "VXS1", n, levels, the GI frame, toWorld (16 floats), level 0's cell size, then per
+    // level its first cell (3 ints, as the content stands) and n^3 texels (x fastest) of: opacity u8 (a x 255), light u8
+    // (255 (1 - exp(-luminance))), the stamp u32 (frame + 1 << 8 | opacity byte), seen u8. tools\prof\voxsnap_diff.py.
+    struct VoxSnapPart
+    {
+        ID3D12Resource* rb;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+        int level, kind; // 0 the grid (RGBA16F), 1 the stamps (R32_UINT), 2 seen (R8_UINT)
+    };
+    std::vector<VoxSnapPart> m_voxSnap;
+    std::string m_voxSnapName;
+    float m_voxSnapToWorld[16] = {};
+    int m_voxSnapGrid[kVoxGeomLevels][3] = {};
+    uint64_t m_voxSnapFrame = 0;
+
+    void RecordVoxSnap(const float* toWorld)
+    {
+        g_voxSnapWanted = false;
+        {
+            std::lock_guard<std::mutex> guard(g_voxSnapLock);
+            m_voxSnapName = g_voxSnapName;
+        }
+        memcpy(m_voxSnapToWorld, toWorld, sizeof(m_voxSnapToWorld));
+        m_voxSnapFrame = m_giFrame;
+        for (int l = 0; l < kVoxGeomLevels; l++)
+        {
+            memcpy(m_voxSnapGrid[l], m_voxPrevGrid[l], sizeof(m_voxSnapGrid[l]));
+            for (int kind = 0; kind < 3; kind++)
+            {
+                ID3D12Resource* res = kind == 0 ? m_vox[l] : kind == 1 ? m_voxOcc[l] : m_voxSeen[l];
+                if (!res)
+                    continue;
+                const D3D12_RESOURCE_DESC rd = res->GetDesc();
+                VoxSnapPart p{nullptr, {}, l, kind};
+                UINT64 total = 0;
+                g.dev->GetCopyableFootprints(&rd, 0, 1, 0, &p.fp, nullptr, nullptr, &total);
+                p.fp.Offset = 0;
+                p.rb = CreateBufferResource(D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_STATE_COPY_DEST);
+                if (!p.rb)
+                    continue;
+                D3D12_RESOURCE_BARRIER b = Transition(res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                m_list->ResourceBarrier(1, &b);
+                D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+                dst.pResource = p.rb;
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint = p.fp;
+                src.pResource = res;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                src.SubresourceIndex = 0;
+                NoteCopy("voxel snapshot", dst, 0, 0, 0, src, nullptr);
+                m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                b = Transition(res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                m_list->ResourceBarrier(1, &b);
+                m_voxSnap.push_back(p);
+            }
+        }
+    }
+
+    // After a wait for the GPU.
+    void WriteVoxSnap()
+    {
+        const uint32_t n = kVoxN, levels = kVoxGeomLevels;
+        std::string name;
+        for (char ch : m_voxSnapName)
+            name += isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-' ? ch : '_';
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%svoxsnap_%s.bin", CryMTCapture("").c_str(), name.empty() ? "x" : name.c_str());
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "wb") == 0 && f)
+        {
+            const float cell0 = Gi().voxelSize;
+            fwrite("VXS1", 1, 4, f);
+            fwrite(&n, 4, 1, f);
+            fwrite(&levels, 4, 1, f);
+            fwrite(&m_voxSnapFrame, 8, 1, f);
+            fwrite(m_voxSnapToWorld, 4, 16, f);
+            fwrite(&cell0, 4, 1, f);
+            std::vector<uint8_t> a(n * n * n), lum(n * n * n), seen(n * n * n);
+            std::vector<uint32_t> stamp(n * n * n);
+            for (uint32_t l = 0; l < levels; l++)
+            {
+                std::fill(a.begin(), a.end(), 0);
+                std::fill(lum.begin(), lum.end(), 0);
+                std::fill(seen.begin(), seen.end(), 0);
+                std::fill(stamp.begin(), stamp.end(), 0u);
+                for (VoxSnapPart& p : m_voxSnap)
+                {
+                    void* mapped = nullptr;
+                    if (p.level != static_cast<int>(l) || FAILED(p.rb->Map(0, nullptr, &mapped)) || !mapped)
+                        continue;
+                    const auto* base = static_cast<const uint8_t*>(mapped);
+                    const size_t row = p.fp.Footprint.RowPitch, slice = row * p.fp.Footprint.Height;
+                    for (uint32_t z = 0; z < n; z++)
+                        for (uint32_t y = 0; y < n; y++)
+                        {
+                            const uint8_t* r = base + z * slice + y * row;
+                            for (uint32_t x = 0; x < n; x++)
+                            {
+                                const size_t i = (static_cast<size_t>(z) * n + y) * n + x;
+                                if (p.kind == 0)
+                                {
+                                    const auto* h = reinterpret_cast<const uint16_t*>(r + x * 8);
+                                    const float alpha = std::min(std::max(Half(h[3]), 0.0f), 1.0f);
+                                    const float y709 = 0.2126f * Half(h[0]) + 0.7152f * Half(h[1]) + 0.0722f * Half(h[2]);
+                                    a[i] = static_cast<uint8_t>(alpha * 255.0f + 0.5f);
+                                    lum[i] = static_cast<uint8_t>((1.0f - std::exp(-std::max(y709, 0.0f))) * 255.0f + 0.5f);
+                                }
+                                else if (p.kind == 1)
+                                    stamp[i] = reinterpret_cast<const uint32_t*>(r)[x];
+                                else
+                                    seen[i] = r[x];
+                            }
+                        }
+                    p.rb->Unmap(0, nullptr);
+                }
+                fwrite(m_voxSnapGrid[l], 4, 3, f);
+                fwrite(a.data(), 1, a.size(), f);
+                fwrite(lum.data(), 1, lum.size(), f);
+                fwrite(stamp.data(), 4, stamp.size(), f);
+                fwrite(seen.data(), 1, seen.size(), f);
+            }
+            fclose(f);
+            Log("voxel snapshot %s: GI frame %llu, camera %.2f %.2f %.2f", path, static_cast<unsigned long long>(m_voxSnapFrame),
+                m_voxSnapToWorld[12], m_voxSnapToWorld[13], m_voxSnapToWorld[14]);
+        }
+        else
+            Log("voxel snapshot: cannot write %s", path);
+        for (VoxSnapPart& p : m_voxSnap)
+            DeferRelease(p.rb);
+        m_voxSnap.clear();
+    }
     bool m_giDumpWanted = false;
 
     // res is in COPY_SOURCE with the barriers flushed.
@@ -14827,6 +14966,11 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
         WaitIdle();
         WriteDumps();
     }
+    if (!m_voxSnap.empty())
+    {
+        WaitIdle();
+        WriteVoxSnap();
+    }
     m_frameFences[m_frame % kFramesInFlight] = g.signaled;
     m_frame++;
     m_stats.frames++;
@@ -15340,6 +15484,15 @@ void Dx12DrawPacket(const uint8_t* packet)
 void Dx12EngineEnvCubeFov(float tanHalf)
 {
     dx12::g_engineCubeTanHalf = tanHalf;
+}
+
+void Dx12VoxSnap(const char* name)
+{
+    {
+        std::lock_guard<std::mutex> guard(dx12::g_voxSnapLock);
+        dx12::g_voxSnapName = name ? name : "";
+    }
+    dx12::g_voxSnapWanted = true;
 }
 
 void Dx12DumpEngineCube()
