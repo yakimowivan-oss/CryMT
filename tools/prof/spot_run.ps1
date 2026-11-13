@@ -2,7 +2,8 @@ param([string[]]$Variants = 'full,nogi,geomcache,nogeom,nozown', [string]$Pre = 
       [int]$Settle = 6, [int]$Measure = 20,
       [string]$GotoPos = '1103 1390 137', [string]$Pos = '{x=1103,y=1390,z=137}', [string]$Angles = '{x=-0.0873,y=0,z=-1.117}',
       [string]$Tag = 'spot', [string]$Capture = '', [string]$Commands = '', [switch]$Sample, [int]$SampleSec = 15,
-      [string]$Mode = 'dlaa') # -Mode mt: the "MT only" preset (the stock D3D10 renderer), dx12, dlaa
+      [string]$Mode = 'dlaa', # -Mode mt: the "MT only" preset (the stock D3D10 renderer), dx12, dlaa
+      [string]$Exec = 'girecord') # -Exec giplay_rooms: the user's girooms demo (VisArea rooms, lamps; quits at its end)
 # Frame times at one place on village (default: the user's spot of 2026-11-12, CamPos 1103 1390 139, Angl -5 0 -64 at
 # 7:00, flying: the ground there is under water at ~98), about 50 s a run. CryMT's test commands (crymt_wait/
 # crymt_waitlevel pace them): once the level runs, the player's physics off (holds it in the air; SimulateOnAction
@@ -46,6 +47,8 @@ $defs = [ordered]@{
     # Motion vector check (crymt_capture N in -Commands dumps N frames: colour, vectors, motion blur target, foliage
     # mask; tools\prof\mv_check.py): no jitter, so a still frame pair differs only by motion and light.
     mvseq = @{Gi = '1'; Env = @{CRYMT_MVSEQ = '1'; CRYMT_DLSS_JITTER = '0'}}
+    # The engine cube under main's frame id as before 2026-11-13 07:10 (crash A/B).
+    cube_oldframe = @{Gi = '1'; Env = @{CRYMT_ENVCUBE_OWNFRAME = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}
@@ -68,7 +71,7 @@ foreach ($v in ($Variants | ForEach-Object { $_ -split ',' })) {
     foreach ($e in $d.Env.GetEnumerator()) { $vars[$e.Key] = $e.Value }
     foreach ($e in $vars.GetEnumerator()) { Set-Item "Env:$($e.Key)" $e.Value }
     $focusLines = if (Test-Path $focus) { (Get-Content $focus).Count } else { 0 }
-    $gameArgs = "-dx10 -DEVMODE -crymt=$Mode -crymt-gi=$($d.Gi) +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map village +exec girecord"
+    $gameArgs = "-dx10 -DEVMODE -crymt=$Mode -crymt-gi=$($d.Gi) +r_Width $Width +r_Height $Height +r_Fullscreen 0 +map village +exec $Exec"
     $p = Start-Process "$g\Bin64\Crysis.exe" -ArgumentList $gameArgs -WorkingDirectory "$g\Bin64" -PassThru
     if ($Sample) {
         $t0 = Get-Date

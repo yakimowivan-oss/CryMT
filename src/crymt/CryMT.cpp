@@ -628,6 +628,22 @@ struct CubeLightId
 };
 CubeLightId g_cubeLightIds[64];
 int g_cubeLightIdCount;
+// The cube's own frame id (CRYMT_ENVCUBE_OWNFRAME, 1 the default; 2026-11-13 after the camera-index crash of 06:56 in
+// the game). The cube did not move the renderer's id that counts recursive renders (GetFrameID(true), +0x28F68), so its
+// RenderWorld ran under the id main's frame had just used: the octree nodes' light lists (FUN_3019C5D0 / FUN_3019D180
+// rebuild them when node +0xE0 differs from the id at 0x3022B930) were main's, and the cube appended its registrations
+// to them, and FUN_301020B0 added main's lights to the cube's level-2 list on the fly (0x30102592). Now the id moves by
+// one before each face, so the cube builds its own lists; main's copy (g_shadowFrameIdAll) catches up after the flush's
+// engine callbacks (HookEndEf3D), so main's next frame is above it.
+int EnvCubeOwnFrame()
+{
+    static const int on = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("CRYMT_ENVCUBE_OWNFRAME", v, sizeof(v)) ? atoi(v) : 1;
+    }();
+    return on;
+}
+uint64_t g_frameIdCaughtUp;
 bool g_cubeRendering; // render thread, inside the cube's render call
 uint64_t g_cubeIdsRestored, g_cubeIdsOutside, g_cubeIdsOverflow;
 EngineLightState g_cubeLightsAfter;
@@ -1283,6 +1299,8 @@ void WriteStats()
             fprintf(f, "engine env cube: renders that changed the renderer's light list, level 0 %llu, 1 %llu, 2 %llu, 3 %llu\n",
                     static_cast<unsigned long long>(g_envCubeLightLists[0]), static_cast<unsigned long long>(g_envCubeLightLists[1]),
                     static_cast<unsigned long long>(g_envCubeLightLists[2]), static_cast<unsigned long long>(g_envCubeLightLists[3]));
+        fprintf(f, "engine cube: own frame id %d, main's frame id caught up %llu times\n", EnvCubeOwnFrame(),
+                static_cast<unsigned long long>(g_frameIdCaughtUp));
         fprintf(f, "engine cube: light ids put back after its EF_ADDDlight %llu (lights outside the 3D engine's list %llu, overflow %llu)\n",
                 static_cast<unsigned long long>(g_cubeIdsRestored), static_cast<unsigned long long>(g_cubeIdsOutside),
                 static_cast<unsigned long long>(g_cubeIdsOverflow));
@@ -5666,6 +5684,17 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
         // here as with the barrier, so nothing of main runs alongside it (does a crash come from main or the signal?).
         EarlyFenceWait(1);
         g_preWaitTicks += Now() - waitStart;
+        // The engine callbacks of this flush are done: the engine cube (and the water reflection) moved the renderer's id
+        // that counts recursive renders; main's next frame continues above it (EnvCubeOwnFrame).
+        if (EnvCubeOwnFrame() && g_renderer)
+        {
+            const int all = *reinterpret_cast<const volatile int*>(g_renderer + kFrameIdAllOffset);
+            if (all - g_shadowFrameIdAll > 0)
+            {
+                g_shadowFrameIdAll = all;
+                g_frameIdCaughtUp++;
+            }
+        }
         if (detail)
         {
             detail->waitBarrier = static_cast<float>((Now() - waitStart) * g_qpcToMs);
@@ -6012,6 +6041,8 @@ void EnvCubeUpdate()
     D3DLayerPassName(facesDrawn < 6 ? "CryMT engine cube fresh" : "CryMT engine cube");
     const EngineLightState lightsIn = ReadEngineLights();
     g_cubeLightIdCount = 0;
+    if (EnvCubeOwnFrame())
+        ++*reinterpret_cast<volatile int*>(renderer + kFrameIdAllOffset); // the cube's own frame id (EnvCubeOwnFrame)
     g_cubeRendering = true;
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, drawFlags, ~0ull, 0);
     g_cubeRendering = false;
