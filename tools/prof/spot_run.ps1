@@ -83,6 +83,12 @@ $defs = [ordered]@{
     # Six directions (CRYMT_GI_DIRLIGHT 2), with and without the room fix.
     dirl6_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '2'}}
     dirl6_noroom_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_DIRLIGHT = '2'; CRYMT_GI_ROOMLIGHT = '0'}}
+    # GI v2: probes traced through the voxels (CRYMT_GI_PROBES=1) against the cones (dirl1_gpu, the default).
+    probes_gpu = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '1'}}
+    probes_s0 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '1'; CRYMT_GI_PROBESTRENGTH = '0'}}
+    probes_s05 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '1'; CRYMT_GI_PROBESTRENGTH = '0.5'}}
+    probes_s1 = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '1'; CRYMT_GI_PROBESTRENGTH = '1'}}
+    probes_novis = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '1'; CRYMT_GI_PROBEVIS = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}

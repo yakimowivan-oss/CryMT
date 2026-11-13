@@ -20,6 +20,7 @@ struct GiControl
     std::atomic<int> giNear{-1};    // the GI at full strength up to (out by 2.5 x, the baked occlusion in): the panel's list
                                     // index (30 40 50 62 m); -1 as CRYMT_GI_TERRAINAONEAR
     std::atomic<int> dirLight{-1};  // the voxels' light: 0 one colour, 1 colour + direction, 2 six directions; -1 as CRYMT_GI_DIRLIGHT
+    std::atomic<int> probes{-1};    // GI method: 0 the cones, 1 probes through the voxels (GI v2); -1 as CRYMT_GI_PROBES
     std::atomic<int> particles{-1}; // blended particles (smoke, dust) take the GI 1 / 0
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> dlssPreset{-1}; // the DLAA model, the panel's list index (K J L M F E); -1 as CRYMT_DLSS_PRESET

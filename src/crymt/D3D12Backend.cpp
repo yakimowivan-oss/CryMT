@@ -1412,6 +1412,12 @@ Texture3D<float4> l1Tex2 : register(t15);
 Texture3D<float4> l1Tex3 : register(t16);
 // The levels' six directions (CRYMT_GI_DIRLIGHT 2, visAreas[0].z 2): t17 + level x 6 + face (+X, -X, +Y, -Y, +Z, -Z).
 Texture3D<float3> sixTex[24] : register(t17);
+// GI v2 (ProbeLight, pass "probes"): the probes' atlases written this frame: light and states (t41), distances (t42).
+// The probes pass writes the distances through u1 (the trace's distOut there is another entry's) and reads last frame's
+// through t1.
+Texture2D<float4> probeTex : register(t41);
+Texture2D<float4> probeDepthTex : register(t42);
+RWTexture2D<float4> probeDepthOut : register(u1);
 
 // The VisArea near the camera that holds P (the rooms the level marks as indoors; with a margin of 0.3 m, so walls on
 // their border count), else -1.
@@ -1886,6 +1892,269 @@ void envmap(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
         outTex[uint2(id.x + 20 * kEnvSize, id.y)] = float4(o * reproj._12, 1);
 }
 
+// GI v2 (CRYMT_GI_PROBES=1, the GI page's "GI method", visAreas[0].w): irradiance probes in the manner of DDGI (Majercik
+// et al. 2019) whose rays go through the voxel grid's cells. kProbeN probes kProbeSpacing apart around the camera,
+// toroidal like the voxel levels. A probe's light (rgb, as the cones') and occlusion (a) over the sphere: an octahedral
+// tile of 6 x 6 texels with a border of one (8 x 8) in an atlas of 128 x 128 tiles; the rows under them hold each probe's
+// state: xyz its world probe coordinate mod 1024, w 1 + the share of its rays that hit within 0.35 m (a probe inside a
+// wall), 0 never traced. Each frame a quarter of the probes, and every probe new to the grid, trace 64 rays (spherical
+// Fibonacci, turned per frame) and blend them in; the others are copied (two atlases in turn: cs_5_0 cannot read a
+// float4 UAV). Phase 1: no visibility test yet (light can still leak through a wall between a pixel and a probe).
+static const int3 kProbeN = int3(32, 32, 16);
+static const float kProbeSpacing = 1.0;
+static const float2 kProbeAtlas = float2(1024, 1152);
+// Phase 2, visibility (DDGI's): per probe the mean distance to what its rays hit and its square over the sphere, a tile
+// of 14 x 14 texels with a border of one (16 x 16) in a 2048 x 2048 atlas; distances clamped at 1.5 x the probe cell's
+// diagonal, the rays weighted by cos^50 around the texel's direction. A pixel takes a probe by Chebyshev's bound on the
+// chance that nothing stands between them (a probe behind a wall gets almost no weight).
+static const float2 kProbeDepthAtlas = float2(2048, 2048);
+static const float kProbeMaxDistance = 1.5 * 1.7320508 * kProbeSpacing;
+groupshared float4 g_probeRay[64]; // a ray's light and occlusion
+groupshared float4 g_probeDir[64]; // its direction; w its distance (clamped)
+
+int3 ProbeOrigin() { return (int3)floor(float3(toWorldX.w, toWorldY.w, toWorldZ.w) / kProbeSpacing) - kProbeN / 2; }
+float3 ProbePos(int3 wc) { return (wc + 0.5) * kProbeSpacing; }
+int ProbeSlot(int3 wc)
+{
+    int3 s = ((wc % kProbeN) + kProbeN) % kProbeN;
+    return s.x + s.y * kProbeN.x + s.z * kProbeN.x * kProbeN.y;
+}
+int2 ProbeTile(int slot) { return int2(slot & 127, slot >> 7) * 8; }
+int2 ProbeDepthTile(int slot) { return int2(slot & 127, slot >> 7) * 16; }
+
+// A border texel's interior one in a tile of (n + 2)^2: across an edge the octahedral neighbour, flipped; corners the
+// opposite corner (DDGI's border copy).
+int2 OctInterior(int2 t, int n)
+{
+    int2 ip = t - 1;
+    if (ip.x < 0 || ip.x > n - 1)
+    {
+        ip.x = clamp(ip.x, 0, n - 1);
+        ip.y = n - 1 - ip.y;
+    }
+    if (ip.y < 0 || ip.y > n - 1)
+    {
+        ip.y = clamp(ip.y, 0, n - 1);
+        ip.x = n - 1 - ip.x;
+    }
+    return ip;
+}
+int2 ProbeStateTexel(int slot) { return int2(slot & 127, 1024 + (slot >> 7)); }
+float3 ProbeKey(int3 wc) { return float3(((wc % 1024) + 1024) % 1024); }
+
+float2 OctEncode(float3 n)
+{
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    const float2 s = float2(n.x >= 0 ? 1.0 : -1.0, n.y >= 0 ? 1.0 : -1.0);
+    return n.z >= 0 ? n.xy : (1 - abs(n.yx)) * s;
+}
+
+float3 OctDecode(float2 o)
+{
+    float3 n = float3(o, 1 - abs(o.x) - abs(o.y));
+    if (n.z < 0)
+        n.xy = (1 - abs(n.yx)) * float2(n.x >= 0 ? 1.0 : -1.0, n.y >= 0 ? 1.0 : -1.0);
+    return normalize(n);
+}
+
+// Ray i of 64 (spherical Fibonacci), turned by a rotation picked from the frame.
+float3 ProbeRayDir(uint i, float f)
+{
+    const float phi = 6.2831853 * frac(i * 0.618034);
+    const float z = 1 - (2 * i + 1) / 64.0;
+    const float r = sqrt(saturate(1 - z * z));
+    const float3 d = float3(r * cos(phi), r * sin(phi), z);
+    const float3 h = frac(sin(float3(12.9898, 78.233, 37.719) * (f + 1)) * 43758.5453);
+    const float3 axis = normalize(h * 2 - 1 + 1e-3);
+    const float a = h.z * 6.2831853, c = cos(a), sn = sin(a);
+    return d * c + cross(axis, d) * sn + axis * dot(axis, d) * (1 - c);
+}
+
+// A thin ray through the grid from O along dir: front-to-back over the cells at mip 0 of the finest level that holds the
+// point (level 0 up to 6 m in half cells, 1 to 12 m, 2 to 24 m, then 3, a cell a step), the cells' light as the cones
+// take it (L1 / six directions); rgb light, a occlusion faded with distance as the cones' (occRange); hit where it was
+// half blocked (reach if never).
+float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
+{
+    const float vs = voxParams.x;
+    float3 light = 0;
+    float blocked = 0, occ = 0, t = vs * 0.5 * (0.5 + jitter);
+    hit = reach;
+    [loop] for (int i = 0; i < 128 && blocked < 0.95 && t < reach; i++)
+    {
+        const float3 X = O + dir * t;
+        int level = t < 6 ? 0 : t < 12 ? 1 : t < 24 ? 2 : 3;
+        [loop] while (level < 3 && !InGrid(level, X, 0))
+            level++;
+        if (!InGrid(level, X, 0))
+            break;
+        // Empty space skipped: nothing in mip 3 here steps three cells at once. Mip 3's texels are 8 cells, so a wall
+        // within 3.5 cells still weighs at least 1/16 of its share (>= 1/8) in the trilinear sample; a skip of two cells
+        // over mip 2 could pass a wall with no weight (the stair came out 3-5 darker at 10:00).
+        const float cell = vs * (1 << level);
+        if (SampleGrid(level, X, 3).a < 0.002)
+        {
+            t += cell * 3;
+            continue;
+        }
+        float4 v = SampleGrid(level, X, 0);
+        if (v.a > 0.004) // the cells' light direction only where there is a cell
+        {
+            if (visAreas[0].z > 1.5)
+                v.rgb = SixToward(level, X, 0, dir);
+            else if (visAreas[0].z > 0.5)
+                v.rgb *= max(1 - dot(SampleL1(level, X, 0), dir), 0);
+        }
+        light += (1 - blocked) * v.rgb;
+        const float near = occRange.x > 0 ? saturate((occRange.x - t) / (occRange.x * 0.5)) : 1;
+        occ += (1 - blocked) * v.a * near;
+        blocked += (1 - blocked) * v.a;
+        if (blocked > 0.5 && hit >= reach)
+            hit = t;
+        t += level == 0 ? cell * 0.5 : cell;
+    }
+    return float4(light, occ);
+}
+
+// One group a probe slot (128 x 128 groups), a thread a ray and a texel of its tile. t2 the previous atlas, u0 this one.
+[numthreads(8, 8, 1)]
+void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    const int slot = gid.x + gid.y * 128;
+    const int3 s = int3(slot % kProbeN.x, (slot / kProbeN.x) % kProbeN.y, slot / (kProbeN.x * kProbeN.y));
+    const int3 origin = ProbeOrigin();
+    const int3 wc = origin + (((s - origin) % kProbeN) + kProbeN) % kProbeN; // the probe in the grid now at this slot
+    const int2 st = ProbeStateTexel(slot), texel = ProbeTile(slot) + int2(tid.xy);
+    const float4 state = historyTex.Load(int3(st, 0));
+    const bool valid = state.w >= 1 && all(state.xyz == ProbeKey(wc)) && temporal > 0;
+    const bool due = !valid || (((uint)slot + (uint)frame) & 3) == 0;
+    float4 ray = 0;
+    float3 dir = 0;
+    float hit = 0;
+    if (due)
+    {
+        dir = ProbeRayDir(gi, frame);
+        ray = RayTrace(ProbePos(wc), dir, voxParams.z, frac(gi * 0.618034 + frame * 0.381966), hit);
+    }
+    g_probeRay[gi] = ray;
+    g_probeDir[gi] = float4(dir, min(hit, kProbeMaxDistance));
+    GroupMemoryBarrierWithGroupSync();
+    const float4 old = historyTex.Load(int3(texel, 0));
+    const int2 depthTile = ProbeDepthTile(slot);
+    if (!due)
+    {
+        outTex[texel] = old;
+        [unroll] for (int j = 0; j < 4; j++)
+        {
+            const int k = gi + j * 64;
+            const int2 dt = depthTile + int2(k & 15, k >> 4);
+            probeDepthOut[dt] = srcTex.Load(int3(dt, 0));
+        }
+        if (gi == 0)
+            outTex[st] = state;
+        return;
+    }
+    // Light: the texel's interior one (the border copies the octahedral neighbour across the edge), cosine weights.
+    const float3 n = OctDecode((OctInterior(int2(tid.xy), 6) + 0.5) / 6 * 2 - 1);
+    float4 sum = 0;
+    float weights = 0;
+    [loop] for (int r = 0; r < 64; r++)
+    {
+        const float w = max(dot(n, g_probeDir[r].xyz), 0);
+        sum += g_probeRay[r] * w;
+        weights += w;
+    }
+    const float4 fresh = sum / max(weights, 1e-4);
+    // Hysteresis 0.93 (64 rays a fourth frame: ~900 rays' worth; at 0.8 the probes boiled and one frame's look at the
+    // stair varied by 2.5 of 255 between runs); a big change (the light more than doubled or halved) goes in faster.
+    const float oldMax = max(max(old.r, old.g), old.b), freshMax = max(max(fresh.r, fresh.g), fresh.b);
+    const float hysteresis = abs(freshMax - oldMax) > max(oldMax, 0.02) ? 0.6 : 0.93;
+    outTex[texel] = valid ? lerp(fresh, old, hysteresis) : fresh;
+    // Distances: four texels a thread, cos^50 weights.
+    [loop] for (int j = 0; j < 4; j++)
+    {
+        const int k = gi + j * 64;
+        const int2 dt = depthTile + int2(k & 15, k >> 4);
+        const float3 dn = OctDecode((OctInterior(int2(k & 15, k >> 4), 14) + 0.5) / 14 * 2 - 1);
+        float2 m = 0;
+        float mw = 0;
+        [loop] for (int r = 0; r < 64; r++)
+        {
+            const float w = pow(saturate(dot(dn, g_probeDir[r].xyz)), 50);
+            const float dist = g_probeDir[r].w;
+            m += float2(dist, dist * dist) * w;
+            mw += w;
+        }
+        const float2 oldM = srcTex.Load(int3(dt, 0)).xy;
+        const float2 freshM = mw > 1e-4 ? m / mw : oldM;
+        probeDepthOut[dt] = float4(valid ? lerp(freshM, oldM, 0.93) : freshM, 0, 1);
+    }
+    if (gi == 0)
+    {
+        float closeShare = 0;
+        [loop] for (int k = 0; k < 64; k++)
+            closeShare += g_probeDir[k].w < 0.35 ? 1 : 0;
+        closeShare /= 64;
+        outTex[st] = float4(ProbeKey(wc), 1 + (valid ? lerp(closeShare, state.w - 1, 0.5) : closeShare));
+    }
+}
+
+// GI v2: the light (rgb) and occlusion (a) at P for the normal N from the 8 probes around it, with DDGI's weights
+// (trilinear, the side the normal faces, Chebyshev visibility from the probe's distances, probes inside walls nearly
+// out). The point is moved off the surface towards the normal and the camera (DDGI's bias: a surface's own distance
+// otherwise fails the visibility). inside: how far P lies in the probe grid (0 at its edge, 1 from two probes in), for
+// the blend with the cones.
+float4 ProbeLight(float3 P, float3 N, out float inside)
+{
+    const int3 origin = ProbeOrigin();
+    const float3 V = normalize(float3(toWorldX.w, toWorldY.w, toWorldZ.w) - P);
+    const float3 Pb = P + (N * 0.2 + V * 0.8) * (0.3 * kProbeSpacing);
+    const float3 g = Pb / kProbeSpacing - 0.5 - origin;
+    const float3 room = min(g, (kProbeN - 1) - g);
+    inside = saturate(min(room.x, min(room.y, room.z)) / 2);
+    if (inside <= 0)
+        return 0;
+    const int3 base = (int3)floor(g);
+    const float3 f = g - base;
+    const float2 oct = OctEncode(N) * 0.5 + 0.5;
+    float4 sum = 0;
+    float weights = 0;
+    [unroll] for (int i = 0; i < 8; i++)
+    {
+        const int3 off = int3(i & 1, (i >> 1) & 1, i >> 2);
+        const int3 wc = origin + base + off;
+        const int slot = ProbeSlot(wc);
+        const float4 state = probeTex.Load(int3(ProbeStateTexel(slot), 0));
+        if (state.w < 1 || any(state.xyz != ProbeKey(wc)))
+            continue;
+        const float3 tri = lerp(1 - f, f, (float3)off);
+        const float facing = (dot(normalize(ProbePos(wc) - P), N) + 1) * 0.5;
+        float w = (facing * facing + 0.2) * lerp(1, 0.02, saturate((state.w - 1.4) / 0.4));
+        // Visibility: the biased point's distance from the probe against the probe's distances that way.
+        const float3 fromProbe = Pb - ProbePos(wc);
+        const float dist = length(fromProbe);
+        const float2 dOct = OctEncode(fromProbe / max(dist, 1e-4)) * 0.5 + 0.5;
+        const float2 m = probeDepthTex.SampleLevel(linearClamp, (ProbeDepthTile(slot) + 1 + dOct * 14) / kProbeDepthAtlas, 0).xy;
+        const float variance = abs(m.y - m.x * m.x);
+        const float over = max(dist - m.x, 0);
+        const float chebyshev = dist <= m.x ? 1 : variance / (variance + over * over);
+        if (visAreas[0].w > 0) // negative: no visibility test (CRYMT_GI_PROBEVIS=0, to measure what it stops)
+            w *= max(chebyshev * chebyshev * chebyshev, 0.05);
+        // Tiny weights crushed (DDGI): a sliver of a probe's weight no longer lifts a dark corner.
+        if (w < 0.2)
+            w *= w * w / 0.04;
+        w *= tri.x * tri.y * tri.z;
+        sum += probeTex.SampleLevel(linearClamp, (ProbeTile(slot) + 1 + oct * 6) / kProbeAtlas, 0) * w;
+        weights += w;
+    }
+    if (weights <= 0)
+    {
+        inside = 0;
+        return 0;
+    }
+    return sum / weights;
+}
+
 [numthreads(8, 8, 1)]
 void trace(uint3 id : SV_DispatchThreadID)
 {
@@ -2063,19 +2332,29 @@ void trace(uint3 id : SV_DispatchThreadID)
             const int area = VisAreaAt(Pw);
             if (area >= 0 && visAreas[0].y > 0.5)
                 SetRoom(area);
-            float4 cone = ConeTrace(O, Nw, 0.577, start, voxParams.z, false, true, Pw, Nw, noise);
-            float3 farLight = cone.rgb;
-            float farOcc = cone.a;
-            [unroll] for (int c = 0; c < 4; c++)
+            // GI v2: the probes inside their grid, the cones beyond it and across its last two probes.
+            float probeIn = 0;
+            const float4 probe = visAreas[0].w != 0 ? ProbeLight(Pw, Nw, probeIn) : 0;
+            float3 farLight = 0;
+            float farOcc = 0;
+            if (probeIn < 1)
             {
-                float a = (c + noise) * 1.5707963;
-                float3 dir = normalize(Nw * 0.5 + (T * cos(a) + B * sin(a)) * 0.866);
-                cone = ConeTrace(O, dir, 0.577, start, voxParams.z, false, true, Pw, Nw, noise + c * 0.25);
-                farLight += cone.rgb * 0.5;
-                farOcc += cone.a * 0.5;
+                float4 cone = ConeTrace(O, Nw, 0.577, start, voxParams.z, false, true, Pw, Nw, noise);
+                farLight = cone.rgb;
+                farOcc = cone.a;
+                [unroll] for (int c = 0; c < 4; c++)
+                {
+                    float a = (c + noise) * 1.5707963;
+                    float3 dir = normalize(Nw * 0.5 + (T * cos(a) + B * sin(a)) * 0.866);
+                    cone = ConeTrace(O, dir, 0.577, start, voxParams.z, false, true, Pw, Nw, noise + c * 0.25);
+                    farLight += cone.rgb * 0.5;
+                    farOcc += cone.a * 0.5;
+                }
+                farLight *= voxParams.w / 3;
+                farOcc /= 3;
             }
-            farLight *= voxParams.w / 3;
-            farOcc /= 3;
+            farLight = lerp(farLight, probe.rgb * abs(visAreas[0].w), probeIn); // the probes' own strength (CRYMT_GI_PROBESTRENGTH)
+            farOcc = lerp(farOcc, probe.a, probeIn);
             // Indoors: a VisArea; else the cover above (houses without one): the roof texture half a metre off the
             // surface and, when the two strengths differ, a ray up leaned off the surface and turned per texel.
             float roof = area >= 0 ? 1 : 0;
@@ -2751,6 +3030,9 @@ constexpr UINT kVoxConstants = 60;
 constexpr int kVoxN = 128;
 constexpr UINT kVoxMips = 5; // 128 .. 8
 constexpr int kVoxLevels = 4;  // cells of voxelSize (0.25 m), 2, 4 and 8 times that: 32, 64, 128 and 256 m around the camera
+// The GI root's second table (kGiShader t3..t41): per level the grid, per-axis opacity, L1 and six directions (9), the
+// VisAreas, the roof, the probes' atlases (t41 light and states, t42 distances).
+constexpr UINT kGiVoxTable = 9 * kVoxLevels + 4;
 constexpr UINT kVoxTable = 23; // descriptors per table: t0..t2, u0..u19 (u6/u7 the light direction, u8..u19 the six
                                // directions: CRYMT_GI_DIRLIGHT)
 const char* const kVoxShader = R"(
@@ -4885,6 +5167,7 @@ struct Stats
     uint64_t voxShadowMapDraws[8], voxShadowMapSeen[8]; // per map of a frame: draws, frames
     double voxShadowMapCover[8];                        // their cover summed
     uint64_t giStampTicks[5], giStampRuns; // GI pass timers: trace, filter, upsample, voxel geometry, voxel update
+    uint64_t giProbeRuns;                  // GI v2: the probes' pass runs
     uint64_t sssRuns, sssDispatches, sssNoDepth; // RunSss: frames made, their dispatches, frames without the z-prepass target
     uint64_t engineCubeDraws, engineCubeFaces[6]; // draws into the engine's environment cube (Dx12EngineEnvCube), per face
     uint64_t engineCubeUnbinds;                   // its source let go as a render target (ReleaseOutput)
@@ -7176,7 +7459,13 @@ public:
                                            // and the direction it goes out stronger (L1: a thin wall lit outside stays dark
                                            // inside; the voxels page; default since 2026-11-14, the user), 2 six directions
                                            // (+-X, +-Y, +-Z, ~220 MB more, made when first asked for)
-        float gtaoRadius = 0.5f;           // CRYMT_GI_GTAORADIUS, metres
+        int probes = 0;                    // CRYMT_GI_PROBES=1: GI v2, irradiance probes traced through the voxels in place
+                                           // of the cones near the camera (kGiShader "probes", ProbeLight)
+        bool probeVisibility = true;       // CRYMT_GI_PROBEVIS=0: no visibility test (measures the light it keeps out)
+        float probeStrength = 1.0f;        // CRYMT_GI_PROBESTRENGTH: their bounce light's factor (the cones' is voxelStrength
+                                           // 1.5: coarse mips lose light; the probes' thin rays see the cells' full light,
+                                           // and at 1.5 the loop through the screen's colour lit closed rooms by itself)
+        float gtaoRadius = 0.5f;          // CRYMT_GI_GTAORADIUS, metres
         bool contactShadows = true;        // CRYMT_CONTACTSHADOWS=0: no screen-space contact shadows in the sun's shadow mask
         float contactLength = 0.35f;       // CRYMT_CONTACTLENGTH: the march's length at 10 m (metres; scales with distance)
         bool contactFoliage = true;        // CRYMT_CONTACTFOLIAGE=0: foliage (the z-prepass mask) casts no contact shadows (default on since 2026-11-10, the user)
@@ -7296,6 +7585,10 @@ public:
             v.roomLight = !(GetEnvironmentVariableW(L"CRYMT_GI_ROOMLIGHT", text, 32) && wcscmp(text, L"0") == 0);
             if (GetEnvironmentVariableW(L"CRYMT_GI_DIRLIGHT", text, 32))
                 v.dirLight = std::min(std::max(_wtoi(text), 0), 2);
+            if (GetEnvironmentVariableW(L"CRYMT_GI_PROBES", text, 32))
+                v.probes = std::min(std::max(_wtoi(text), 0), 1);
+            read(L"CRYMT_GI_PROBESTRENGTH", v.probeStrength);
+            v.probeVisibility = !(GetEnvironmentVariableW(L"CRYMT_GI_PROBEVIS", text, 32) && wcscmp(text, L"0") == 0);
             v.replaceSsao = !(GetEnvironmentVariableW(L"CRYMT_GI_SSAO", text, 32) && wcscmp(text, L"0") != 0);
             read(L"CRYMT_GI_GTAO", v.gtao);
             read(L"CRYMT_GI_GTAORADIUS", v.gtaoRadius);
@@ -7410,6 +7703,7 @@ public:
         g.sssWeaponThickness = g_giControl.sssWeapon >= 0 && g_giControl.sssWeapon < 5 ? kSssWeaponThick[g_giControl.sssWeapon] : b.sssWeaponThickness;
         g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
         g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 2) : b.dirLight;
+        g.probes = g_giControl.probes >= 0 ? std::min(g_giControl.probes.load(), 1) : b.probes;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -8326,11 +8620,12 @@ public:
             Log("GI: no shader compiler");
             return false;
         }
-        ID3DBlob* code[13] = {};
+        constexpr int kEntries = 14;
+        ID3DBlob* code[kEntries] = {};
         ID3DBlob* errors = nullptr;
-        const char* entries[13] = {"trace", "filter", "motion", "upsample", "camera", "exposure", "sanitize", "sanitizeOut", "gtao", "gtaoBlur", "gtaoApply",
-                                   "pvolume", "envmap"};
-        for (int i = 0; i < 13; i++)
+        const char* entries[kEntries] = {"trace", "filter", "motion", "upsample", "camera", "exposure", "sanitize", "sanitizeOut", "gtao", "gtaoBlur", "gtaoApply",
+                                         "pvolume", "envmap", "probes"};
+        for (int i = 0; i < kEntries; i++)
             if (FAILED(compile(kGiShader, strlen(kGiShader), "CryMT_GI", nullptr, nullptr, entries[i], "cs_5_0", 1 << 15 /* OPTIMIZATION_LEVEL3 */, 0,
                                &code[i], &errors)))
             {
@@ -8338,7 +8633,7 @@ public:
                 return false;
             }
         D3D12_DESCRIPTOR_RANGE ranges[3] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 3},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 9 * kVoxLevels + 2, 3, 0, 0}};
+                                            {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, kGiVoxTable, 3, 0, 0}};
         D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = kGiConstants;
@@ -8371,9 +8666,9 @@ public:
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = m_giRoot;
         HRESULT hr = S_OK;
-        ID3D12PipelineState** psos[13] = {&m_giPso, &m_giPsoFilter, &m_mvPso, &m_giPsoUpsample, &m_giPsoCamera, &m_expPso, &m_sanPso, &m_sanOutPso,
-                                          &m_aoPso, &m_aoBlurPso, &m_aoApplyPso, &m_pvolPso, &m_envPso};
-        for (int i = 0; i < 13; i++)
+        ID3D12PipelineState** psos[kEntries] = {&m_giPso, &m_giPsoFilter, &m_mvPso, &m_giPsoUpsample, &m_giPsoCamera, &m_expPso, &m_sanPso,
+                                                &m_sanOutPso, &m_aoPso, &m_aoBlurPso, &m_aoApplyPso, &m_pvolPso, &m_envPso, &m_giPsoProbes};
+        for (int i = 0; i < kEntries; i++)
         {
             pd.CS = {code[i]->GetBufferPointer(), code[i]->GetBufferSize()};
             if (SUCCEEDED(hr))
@@ -8400,6 +8695,54 @@ public:
         Log("GI pipeline: %s", SUCCEEDED(hr) ? "ready" : "failed");
         m_giFailed = FAILED(hr);
         return SUCCEEDED(hr);
+    }
+
+    // GI v2's two probe atlases (kGiShader "probes"): made when first asked for, 2 x (9 MB light and states + 16 MB
+    // distances), zeroed (no probe traced yet).
+    bool EnsureProbes()
+    {
+        if (m_probeDepth[1] || m_probeFailed)
+            return m_probeDepth[1] != nullptr;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC d{};
+        d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        d.Width = 1024;
+        d.Height = 1152;
+        d.DepthOrArraySize = 1;
+        d.MipLevels = 1;
+        d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        d.SampleDesc.Count = 1;
+        d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_RESOURCE_DESC dd = d;
+        dd.Width = dd.Height = 2048;
+        dd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        for (int i = 0; i < 2; i++)
+        {
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_probeAtlas[i]))))
+            {
+                m_probeAtlas[i] = nullptr;
+                m_probeFailed = true;
+            }
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_probeDepth[i]))))
+            {
+                m_probeDepth[i] = nullptr;
+                m_probeFailed = true;
+            }
+        }
+        if (m_probeFailed)
+            for (int i = 0; i < 2; i++)
+                for (ID3D12Resource** a : {&m_probeAtlas[i], &m_probeDepth[i]})
+                    if (*a)
+                    {
+                        (*a)->Release();
+                        *a = nullptr;
+                    }
+        m_probeAtlasState[0] = m_probeAtlasState[1] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        Log("GI v2 probes: atlases %s", m_probeFailed ? "failed" : "made");
+        return !m_probeFailed;
     }
 
     // Bend's screen-space shadows (BendSss.h): compiled once with the sample count asked for; root: 16 constants (b0) and
@@ -9184,6 +9527,23 @@ public:
             }
         if (cones)
             m_barriers.push_back(Transition(m_voxRoof, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+        // GI v2: this frame's probe atlases written (u0 light and states, u1 distances), last frame's read (t2, t1).
+        const bool probesOn = cones && Gi().probes > 0 && m_giPsoProbes && EnsureProbes();
+        ID3D12Resource* const probeCur = probesOn ? m_probeAtlas[m_probeCur] : nullptr;
+        ID3D12Resource* const probePrev = probesOn ? m_probeAtlas[m_probeCur ^ 1] : nullptr;
+        ID3D12Resource* const probeDepthCur = probesOn ? m_probeDepth[m_probeCur] : nullptr;
+        ID3D12Resource* const probeDepthPrev = probesOn ? m_probeDepth[m_probeCur ^ 1] : nullptr;
+        if (probesOn)
+            for (int i = 0; i < 2; i++)
+            {
+                const D3D12_RESOURCE_STATES want = i == m_probeCur ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                if (m_probeAtlasState[i] != want)
+                {
+                    m_barriers.push_back(Transition(m_probeAtlas[i], m_probeAtlasState[i], want));
+                    m_barriers.push_back(Transition(m_probeDepth[i], m_probeAtlasState[i], want));
+                }
+                m_probeAtlasState[i] = want;
+            }
         FlushBarriers();
         // The VisAreas near the camera for the trace (t11, VisInside): uploaded before the descriptors and any state.
         constexpr UINT kVisFloat4s = 1 + 16 * 10;
@@ -9195,6 +9555,8 @@ public:
             f[0] = static_cast<float>(m_giVisAreaCount);
             f[1] = Gi().roomLight ? 1.0f : 0.0f; // [0].y: the cones from inside a room take no light from outside its box
             f[2] = static_cast<float>(ConeDirMode()); // [0].z: the cells' light, 0 one colour, 1 L1, 2 six directions
+            // [0].w: GI v2 on, its bounce light's factor; negative without the visibility test (CRYMT_GI_PROBEVIS=0)
+            f[3] = probesOn ? std::max(Gi().probeStrength, 1e-4f) * (Gi().probeVisibility ? 1.0f : -1.0f) : 0.0f;
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
         }
@@ -9202,8 +9564,9 @@ public:
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
         // Three tables of 6: trace (depth, colour, -, raw out, -, -), filter (depth, raw, previous GI, new GI out,
         // distance out, previous distance) and upsample (depth, new GI, -, full-size out, distances, -).
-        const UINT aoTables = 24 + 9 * kVoxLevels + 2; // then three tables of 6 for the GTAO passes
-        while (!m_srvRing.TryAlloc(aoTables + 30, cpu, gpu))
+        const UINT aoTables = 24 + kGiVoxTable; // then three tables of 6 for the GTAO passes, the particles' volume, the
+                                                // environment maps and GI v2's probes (aoTables + 30)
+        while (!m_srvRing.TryAlloc(aoTables + 36, cpu, gpu))
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -9278,6 +9641,26 @@ public:
             ld.Texture3D.MipLevels = cones && m_voxSixReady ? kVoxMips : 1;
             for (int f = 0; f < 6; f++)
                 g.dev->CreateShaderResourceView(cones && m_voxSixReady ? m_voxSix[l][f] : nullptr, &ld, at(24 + 3 * kVoxLevels + 2 + l * 6 + f));
+        }
+        {
+            // t41, t42: GI v2's atlases written this frame (read by the trace); the probes' table: (depth, last frame's
+            // distances, last frame's light, this frame's light out, distances out, -).
+            D3D12_SHADER_RESOURCE_VIEW_DESC pd{};
+            pd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            pd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            pd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            pd.Texture2D.MipLevels = 1;
+            D3D12_SHADER_RESOURCE_VIEW_DESC pdd = pd;
+            pdd.Format = DXGI_FORMAT_R16G16_FLOAT;
+            g.dev->CreateShaderResourceView(probeCur, &pd, at(24 + kGiVoxTable - 2));
+            g.dev->CreateShaderResourceView(probeDepthCur, &pdd, at(24 + kGiVoxTable - 1));
+            const int bp = static_cast<int>(aoTables) + 30;
+            g.dev->CreateShaderResourceView(depth->res, &sd, at(bp));
+            g.dev->CreateShaderResourceView(probeDepthPrev, &pdd, at(bp + 1));
+            g.dev->CreateShaderResourceView(probePrev, &pd, at(bp + 2));
+            g.dev->CreateUnorderedAccessView(probeCur ? probeCur : m_giRaw, nullptr, nullptr, at(bp + 3));
+            g.dev->CreateUnorderedAccessView(probeDepthCur ? probeDepthCur : m_giRaw, nullptr, nullptr, at(bp + 4));
+            g.dev->CreateUnorderedAccessView(m_giDist[prev], nullptr, nullptr, at(bp + 5));
         }
         // GTAO: (depth, foliage mask, -, -, raw out, -), (depth, raw, previous history, current history out, -, -),
         // (depth, current history, -, full-size GI, -, -).
@@ -9406,6 +9789,32 @@ public:
         D3D12_RESOURCE_BARRIER distances{};
         distances.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; // last frame's distance writes before this frame's reads
         m_list->ResourceBarrier(1, &distances);
+        if (probesOn)
+        {
+            // GI v2: a group a probe slot (128 x 128 = kProbeN's 16384), then the atlas for the trace to read (t41).
+            m_list->SetPipelineState(m_giPsoProbes);
+            m_list->SetComputeRootDescriptorTable(1, {gpu.ptr + (aoTables + 30) * g.srvInc});
+            m_list->Dispatch(128, 128, 1);
+            D3D12_RESOURCE_BARRIER toRead[2] = {Transition(probeCur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                                                Transition(probeDepthCur, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+            m_list->ResourceBarrier(2, toRead);
+            if (m_giDumpWanted) // crymt_capture: both atlases as they are (<tag>_probes.raw, <tag>_probedist.raw)
+            {
+                D3D12_RESOURCE_BARRIER toCopy[2] = {Transition(probeCur, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                    Transition(probeDepthCur, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+                m_list->ResourceBarrier(2, toCopy);
+                RecordDump(probeCur, "probes", 11);
+                RecordDump(probeDepthCur, "probedist", 11);
+                for (D3D12_RESOURCE_BARRIER& b : toCopy)
+                    std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+                m_list->ResourceBarrier(2, toCopy);
+            }
+            m_probeAtlasState[m_probeCur] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            m_probeCur ^= 1;
+            m_stats.giProbeRuns++;
+            m_list->SetPipelineState(m_giPso);
+            m_list->SetComputeRootDescriptorTable(1, gpu);
+        }
         m_list->Dispatch(groupsX, groupsY, 1);
         const bool weapon = cones && s.weaponGi && m_giCam && m_giPsoCamera;
         if (weapon)
@@ -11205,6 +11614,7 @@ public:
         static const char* const cubeSize[] = {"64", "128", "256", "512"};
         static const char* const giNear[] = {"30 М (ДО 75)|30 M (TO 75)", "40 М (ДО 100)|40 M (TO 100)", "50 М (ДО 125)|50 M (TO 125)",
                                              "62 М (ДО 155)|62 M (TO 155)"};
+        static const char* const giMethod[] = {"КОНУСЫ|CONES", "ПРОБЫ (GI v2)|PROBES (GI v2)"};
         static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
@@ -11245,6 +11655,10 @@ public:
             {0, "GI в полную силу до|GI at full strength up to", 0, 3, 1, false, giNear, 0, nullptr,
              [] { const int v = g_giControl.giNear; return v >= 0 ? v : GiNearIndex(GiBase().terrainAoNear); },
              [] { return GiNearIndex(GiBase().terrainAoNear); }, [](int v) { g_giControl.giNear = v; }, true, nullptr},
+            // GI v2 (CRYMT_GI_PROBES): probes traced through the voxels near the camera in place of the cones.
+            {0, "Метод GI|GI method", 0, 1, 1, true, giMethod, 0, nullptr,
+             [] { const int v = g_giControl.probes; return v < 0 ? GiBase().probes : std::min(v, 1); },
+             [] { return GiBase().probes; }, [](int v) { g_giControl.probes = v; }, true, nullptr},
             {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
              [] { return GiBase().particlesGi ? 1 : 0; }, [](int v) { g_giControl.particles = v; }, true, nullptr},
@@ -12145,9 +12559,10 @@ public:
         const bool rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
         const bool r16f = rd.Format == DXGI_FORMAT_R16_FLOAT;
         const bool r32f = rd.Format == DXGI_FORMAT_R32_FLOAT;
-        if (r16f)
+        const bool raw = kind == 11; // the texels as they are (GI v2's probe atlases)
+        if (r16f && !raw)
             kind = 9; // one half per texel, raw (the DLSS bias mask)
-        if (r32f)
+        if (r32f && !raw)
             kind = 10; // one float per texel, raw (the GI's distances)
         if (rd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && rd.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS && !rg && !r8 && !rgba8 && !r16f &&
             !r32f)
@@ -12155,9 +12570,9 @@ public:
             Log("capture: %s format %d not dumped", name, static_cast<int>(rd.Format));
             return;
         }
-        if (rg)
+        if (rg && !raw)
             kind = 3; // motion vectors
-        if ((r8 || rgba8) && kind != 6)
+        if ((r8 || rgba8) && kind != 6 && !raw)
             kind = r8 ? 4 : 5; // one channel (the screen-space shadows; the shadow mask's red: the sun)
         PendingDump d{nullptr, {}, name, kind};
         UINT64 total = 0;
@@ -12256,6 +12671,26 @@ public:
                 if (f)
                     fclose(f);
                 Log("capture: %s mean %.4f, over 0.5 %.2f%% (%ux%u)", d.name.c_str(), sum / 255.0 / (double(w) * h), 100.0 * over / (double(w) * h), w, h);
+                d.rb->Unmap(0, nullptr);
+                p = nullptr;
+            }
+            else if (d.kind == 11 && SUCCEEDED(d.rb->Map(0, nullptr, &p)) && p)
+            {
+                // Raw texels: <name>.raw (width, height, bytes a texel, then the rows), e.g. GI v2's probe atlases.
+                const UINT w = d.fp.Footprint.Width, h = d.fp.Footprint.Height;
+                const UINT bpp = d.fp.Footprint.Format == DXGI_FORMAT_R16G16_FLOAT ? 4 : 8;
+                char path[MAX_PATH];
+                snprintf(path, sizeof(path), "%s%s_%s.raw", CryMTCapture("").c_str(), m_dumpTag.c_str(), d.name.c_str());
+                FILE* f = nullptr;
+                if (fopen_s(&f, path, "wb") == 0 && f)
+                {
+                    fwrite(&w, 4, 1, f);
+                    fwrite(&h, 4, 1, f);
+                    fwrite(&bpp, 4, 1, f);
+                    for (UINT y = 0; y < h; y++)
+                        fwrite(static_cast<const uint8_t*>(p) + static_cast<size_t>(y) * d.fp.Footprint.RowPitch, 1, static_cast<size_t>(w) * bpp, f);
+                    fclose(f);
+                }
                 d.rb->Unmap(0, nullptr);
                 p = nullptr;
             }
@@ -13043,6 +13478,12 @@ private:
     ID3D12PipelineState* m_giPsoUpsample = nullptr; // full-size GI by distance
     ID3D12PipelineState* m_giPsoCamera = nullptr;   // the first-person view's GI value
     ID3D12Resource* m_giCam = nullptr;              // its 1x1 texture
+    ID3D12PipelineState* m_giPsoProbes = nullptr;   // GI v2: the probes' rays and atlas (kGiShader "probes")
+    ID3D12Resource* m_probeAtlas[2] = {};           // their atlases, written in turn (1024 x 1152 RGBA16F: tiles, states)
+    ID3D12Resource* m_probeDepth[2] = {};           // their distances (2048 x 2048 RG16F), with the atlas of the same index
+    D3D12_RESOURCE_STATES m_probeAtlasState[2] = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    int m_probeCur = 0;                             // the one written next
+    bool m_probeFailed = false;
     ID3D12Resource* m_vox[kVoxLevels] = {};       // voxel grid levels (kVoxShader), unordered access but in the GI passes
     ID3D12Resource* m_voxDir[kVoxLevels] = {};    // their opacity per axis, RGBA8 at grid mips 1..4 (CRYMT_GI_MIPOPACITY=4)
     ID3D12Resource* m_voxL1[kVoxLevels] = {};     // their light's direction, RGBA8 SNORM with the grid's mips (CRYMT_GI_DIRLIGHT 1)
@@ -16507,6 +16948,8 @@ void Dx12WriteStats(FILE* f, double frames)
         fprintf(f, "  GI passes, GPU ms a run (%llu runs): trace %.3f, filter %.3f, upsample %.3f, voxel geometry %.3f, voxel update %.3f\n",
                 static_cast<unsigned long long>(s.giStampRuns), s.giStampTicks[0] * ms, s.giStampTicks[1] * ms, s.giStampTicks[2] * ms,
                 s.giStampTicks[3] * ms, s.giStampTicks[4] * ms);
+        if (s.giProbeRuns)
+            fprintf(f, "  GI v2 probes: %llu runs (their pass is inside the trace's time)\n", static_cast<unsigned long long>(s.giProbeRuns));
     }
     fprintf(f, "  clears per frame:\n");
     for (const auto& [key, count] : g_device->m_clears)
