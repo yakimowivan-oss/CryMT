@@ -9246,6 +9246,12 @@ public:
                 m_list->ResourceBarrier(1, &b);
                 RecordDump(m_giFull, "gi", 1);
                 m_barriers.push_back(Transition(m_giFull, D3D12_RESOURCE_STATE_COPY_SOURCE, kSrvState));
+                // This frame's distances at the GI's size (<tag>_dist.r32): the GI by distance (tools\prof\gi_by_distance.py).
+                b = Transition(m_giDist[cur], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                m_list->ResourceBarrier(1, &b);
+                RecordDump(m_giDist[cur], "dist", 10);
+                b = Transition(m_giDist[cur], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                m_list->ResourceBarrier(1, &b);
             }
             else
                 m_barriers.push_back(Transition(m_giFull, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kSrvState));
@@ -11743,9 +11749,13 @@ public:
         const bool r8 = rd.Format == DXGI_FORMAT_R8_UNORM;
         const bool rgba8 = rd.Format == DXGI_FORMAT_R8G8B8A8_UNORM || rd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS;
         const bool r16f = rd.Format == DXGI_FORMAT_R16_FLOAT;
+        const bool r32f = rd.Format == DXGI_FORMAT_R32_FLOAT;
         if (r16f)
             kind = 9; // one half per texel, raw (the DLSS bias mask)
-        if (rd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && rd.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS && !rg && !r8 && !rgba8 && !r16f)
+        if (r32f)
+            kind = 10; // one float per texel, raw (the GI's distances)
+        if (rd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT && rd.Format != DXGI_FORMAT_R16G16B16A16_TYPELESS && !rg && !r8 && !rgba8 && !r16f &&
+            !r32f)
         {
             Log("capture: %s format %d not dumped", name, static_cast<int>(rd.Format));
             return;
@@ -11851,6 +11861,24 @@ public:
                 if (f)
                     fclose(f);
                 Log("capture: %s mean %.4f, over 0.5 %.2f%% (%ux%u)", d.name.c_str(), sum / 255.0 / (double(w) * h), 100.0 * over / (double(w) * h), w, h);
+                d.rb->Unmap(0, nullptr);
+                p = nullptr;
+            }
+            else if (d.kind == 10 && SUCCEEDED(d.rb->Map(0, nullptr, &p)) && p)
+            {
+                // One channel of floats: <name>.r32 (width, height, then the rows).
+                const UINT w = d.fp.Footprint.Width, h = d.fp.Footprint.Height;
+                char path[MAX_PATH];
+                snprintf(path, sizeof(path), "%s%s_%s.r32", CryMTCapture("").c_str(), m_dumpTag.c_str(), d.name.c_str());
+                FILE* f = nullptr;
+                if (fopen_s(&f, path, "wb") == 0 && f)
+                {
+                    fwrite(&w, 4, 1, f);
+                    fwrite(&h, 4, 1, f);
+                    for (UINT y = 0; y < h; y++)
+                        fwrite(static_cast<const uint8_t*>(p) + static_cast<size_t>(y) * d.fp.Footprint.RowPitch, 1, static_cast<size_t>(w) * 4, f);
+                    fclose(f);
+                }
                 d.rb->Unmap(0, nullptr);
                 p = nullptr;
             }
