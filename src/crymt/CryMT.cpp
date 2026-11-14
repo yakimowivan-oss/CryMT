@@ -7277,9 +7277,63 @@ float g_tCurr[2], g_tFrame[2], g_tReal, g_tScale, g_tRate;
 int64_t g_tStart[2];
 bool g_timerSnap;
 
+// Frame limiter (CRYMT_FPSLIMIT=<fps> or "auto"; the launcher's "Ограничение FPS"). It holds the main thread at the
+// start of its frame, before the engine's timer reads the time: the frame's input, game update and time step then
+// follow the cap (a limiter at Present would let input age a frame in the queue; the game's own dt here is the capped
+// one, so the simulation stays even). Nothing of the engine's is changed (no cvar the multiplayer server could see or
+// refuse). Absolute deadlines on QPC (no drift): a high-resolution waitable timer for the bulk, a spin for the last
+// 0.3 ms; a frame late by more than a frame re-bases the schedule (no burst to catch up). "auto": for a variable
+// refresh display, a little under its refresh (refresh - refresh^2 / 3600: 60 -> 59, 144 -> 138, 240 -> 224), taken
+// from the monitor the game's window is on at the first paced frame.
+double g_fpsLimit;    // frames a second, 0 off
+bool g_fpsLimitAuto;  // "auto": from the monitor's refresh
+void PaceFrame()
+{
+    static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    static int64_t freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    static int64_t next;
+    if (g_fpsLimitAuto)
+    {
+        g_fpsLimitAuto = false;
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+        const bool known = GetMonitorInfoW(mon, &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1;
+        const double hz = known ? static_cast<double>(dm.dmDisplayFrequency) : 60.0;
+        g_fpsLimit = hz - hz * hz / 3600.0;
+        FocusLog("frame limiter: auto, the display at %.0f Hz -> %.1f FPS", hz, g_fpsLimit);
+    }
+    if (!(g_fpsLimit > 0))
+        return;
+    const int64_t interval = static_cast<int64_t>(static_cast<double>(freq) / g_fpsLimit);
+    int64_t now = Now();
+    if (next > now)
+    {
+        const int64_t spin = freq * 3 / 10000; // 0.3 ms
+        if (timer && next - now > spin)
+        {
+            LARGE_INTEGER due;
+            due.QuadPart = -((next - now - spin) * 10000000 / freq); // relative, 100 ns units
+            if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0))
+                WaitForSingleObject(timer, INFINITE);
+        }
+        while ((now = Now()) < next)
+            YieldProcessor();
+    }
+    next = next == 0 || now - next > interval ? now + interval : next + interval;
+}
+
 extern "C" void __fastcall TimerUpdateOnFrameStart(void* t)
 {
     g_timer = t;
+    if ((g_fpsLimit > 0 || g_fpsLimitAuto) && GetCurrentThreadId() == g_mainThread)
+        PaceFrame();
     reinterpret_cast<void(__fastcall*)(void*)>(g_timerOrig[1])(t);
 }
 extern "C" float __fastcall TimerGetCurrTime(void* t, int which)
@@ -11257,6 +11311,17 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);
         g_qpcToMs = 1000.0 / freq.QuadPart;
+        // The frame limiter (PaceFrame): CRYMT_FPSLIMIT=<fps> (10..1000) or "auto" (a little under the display's refresh).
+        wchar_t fpsLimit[16] = {};
+        if (GetEnvironmentVariableW(L"CRYMT_FPSLIMIT", fpsLimit, 16))
+        {
+            if (_wcsicmp(fpsLimit, L"auto") == 0)
+                g_fpsLimitAuto = true;
+            else if (const double fps = _wtof(fpsLimit); fps >= 10 && fps <= 1000)
+                g_fpsLimit = fps;
+            if (g_fpsLimitAuto || g_fpsLimit > 0)
+                SetupLog(g_fpsLimitAuto ? "frame limiter: auto (the display's refresh, a little under)" : "frame limiter: set");
+        }
         wchar_t mode[8] = {};
         if (GetEnvironmentVariableW(L"CRYMT_MODE", mode, 8))
             g_mode = _wtoi(mode);
