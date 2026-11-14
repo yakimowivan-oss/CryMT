@@ -18,6 +18,9 @@ $all = @{
     v1 = @('village', 1118, 666, 116, 1, 38); v2 = @('village', 1240, 1547, 106, 10, 142)
     v3 = @('village', 1244, 1558, 106, 4, -4); v4 = @('village', 1250, 1548, 111, 13, 43)
     s1 = @('multiplayer/ia/sponza', 116, 121, 15, -3, 114); s2 = @('multiplayer/ia/sponza', 141, 116, 15, 17, 126)
+    # third set (mine's yard: blotches under eaves, the bands near / mid / far)
+    m1 = @('mine', 2401, 2274, 236, 0, -159); m2 = @('mine', 2385, 2292, 236, -1, 2); m3 = @('mine', 2385, 2300, 236, 0, 2)
+    m4 = @('mine', 2385, 2326, 236, -2, -1); m5 = @('mine', 2387, 2343, 236, 1, -5)
 }
 foreach ($name in $Spots) {
     $s = $all[$name]
@@ -32,9 +35,10 @@ foreach ($name in $Spots) {
         $before = @(Get-ChildItem $play -File | ForEach-Object { $_.FullName })
         & .\tools\prof\spot_run.ps1 -Map $s[0] -StartTime $t -Variants $v -Width 2560 -Height 1440 -Tag "out_$name" -Commands $c | Out-Null
         $new = Get-ChildItem $play -File | Where-Object { $before -notcontains $_.FullName }
-        foreach ($pat in @(@('*_w1_c3.ppm', 'frame'), @('*_gi_rgb.ppm', 'girgb'), @('*_raw_occ.ppm', 'rawocc'))) {
+        foreach ($pat in @(@('*_w1_c3.ppm', 'frame', 'ppm'), @('*_gi_rgb.ppm', 'girgb', 'ppm'), @('*_raw_occ.ppm', 'rawocc', 'ppm'),
+                           @('*_gi.f16', 'gi', 'f16'), @('*_dist.r32', 'dist', 'r32'))) {
             $k = $new | Where-Object { $_.Name -like $pat[0] } | Select-Object -First 1
-            if ($k) { Copy-Item $k.FullName "D:\Games\Crysis-RE\logs\spot\out_${name}_${v}_$($pat[1]).ppm" -Force }
+            if ($k) { Copy-Item $k.FullName "D:\Games\Crysis-RE\logs\spot\out_${name}_${v}_$($pat[1]).$($pat[2])" -Force }
         }
         $new | Remove-Item -Force -ErrorAction SilentlyContinue
         "$name $v done"
