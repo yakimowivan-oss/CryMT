@@ -28,6 +28,13 @@ def main():
     light = load(base + '_probes.raw')
     dist = load(base + '_probedist.raw')
     print('atlas', light.shape, 'distances', dist.shape, 'from', base)
+    # Cascades (2026-11-14 ~06:00): 1024 columns each, 0 the near one (0.5 m), 1 the outer one (1 m); CASCADE=1 picks it.
+    cascade = int(os.environ.get('CASCADE', '0')) if light.shape[1] > 1024 else 0
+    spacing = (0.5 if cascade == 0 else 1.0) if light.shape[1] > 1024 else 1.0
+    light = light[:, 1024 * cascade:1024 * (cascade + 1), :]
+    if dist.shape[1] > 1024:
+        dist = dist[:, 1024 * cascade:1024 * (cascade + 1), :]
+    print('cascade %d, %.1f m apart' % (cascade, spacing))
     states = light[1024:1152, :128, :]  # slot = x + 128 y
     n = 32 * 32 * 16
     st = states.reshape(-1, 4)[:n]
@@ -50,9 +57,9 @@ def main():
     if len(sys.argv) >= 5:
         p = np.array([float(x) for x in sys.argv[2:5]])
     else:
-        p = np.median(key[valid], axis=0) + 0.5
-    pos = key + 0.5
-    d2 = ((pos - (p % 1024)) ** 2).sum(axis=1)
+        p = (np.median(key[valid], axis=0) + 0.5) * spacing
+    pos = (key + 0.5) * spacing  # world mod 1024 x spacing
+    d2 = ((pos - (p % (1024 * spacing))) ** 2).sum(axis=1)
     d2[~valid] = 1e9
     count = int(sys.argv[5]) if len(sys.argv) >= 6 else 12
     # 'up': the four centre texels of the 6x6 interior (octahedral +Z), 'down': its four corners (-Z)
