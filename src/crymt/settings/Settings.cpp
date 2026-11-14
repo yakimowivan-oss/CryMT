@@ -1003,11 +1003,12 @@ std::string Crlf(const std::string& s)
 
 // CryMT volumetric fog, stage 1: the GI in the engine's fog (PostProcess.cfx FogPass; 2026-11-14). The engine's fog lights
 // all air alike, so it glowed in dark rooms and in the shade. CryMT's D3D12 back end gives, in place of
-// Textures/CryMT/vfog.dds (a 4x1x2 volume of zeros), a volume over the screen: 16-pixel tiles, 64 slices to 64 m (slice k
-// ending at 64 ((k + 1) / 64)^2 m), per slice 1 minus the light's visibility from the camera to its far end, weighted by
-// where the fog scatters along the ray (the engine's own fog formula): rgb the fog colour's part (the GI's ambient loss
-// and tint), a the sun's part (the Mie and Rayleigh haze; the voxels' sun indoors). The fog keeps its amount (the scene's
-// attenuation is the engine's); only its colour is darkened by that visibility up to 64 m, the rest of the ray as before.
+// Textures/CryMT/vfog.dds (a 4x1x2 volume of zeros), a volume over the screen: 16-pixel tiles, 64 slices to 128 m (slice
+// k ending at 128 ((k + 1) / 64)^2 m), per slice 1 minus the light's visibility from the camera to its far end, weighted
+// by where the fog scatters along the ray (the engine's own fog formula): rgb the fog colour's part (the GI's ambient
+// loss and tint), a the sun's part (the Mie and Rayleigh haze; the sun's shadow maps, else the voxels' sun indoors). The
+// fog keeps its amount (the scene's attenuation is the engine's); only its colour is darkened by that visibility up to
+// 128 m, the rest of the ray as before.
 // The placeholder's zeros give the engine's fog exactly. The pixel shader is renamed so no cached build of the old one
 // (ShaderCache.pak) is used.
 const char* const kVFogDecl = R"(// CryMT: the GI in the fog (see CryMT_VFog)
@@ -1026,10 +1027,10 @@ sampler3D CryMT_VFogSampler = sampler_state
 void CryMT_VFog(float2 tc, float3 cameraToWorldPos, float sceneDepth, inout half4 localFogColor)
 {
   float dist = length(cameraToWorldPos);
-  float reach = min(dist, 64.0);
+  float reach = min(dist, 128.0);
   float tFull = ComputeVolumetricFog(cameraToWorldPos);
   float tNear = ComputeVolumetricFog(cameraToWorldPos * (reach / max(dist, 0.001)));
-  float slice = sqrt(reach / 64.0) * 64.0;
+  float slice = sqrt(reach / 128.0) * 64.0;
   float4 loss = tex3Dlod(CryMT_VFogSampler, float4(tc, (slice - 0.5) / 64.0, 0));
   float4 vis = ((1 - loss) * (1 - tNear) + (tNear - tFull)) / max(1 - tFull, 0.00001);
 #if %_RT_SKYLIGHT_BASED_FOG

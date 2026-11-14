@@ -1184,8 +1184,38 @@ cbuffer C : register(b0)
   float4 fog;  // x atmosphere scale, y density at the viewer, z density, w the artist's offset (VolumetricFog.cfi)
   float4 grid; // x, y tiles across and down, z slices, w reach (m)
   float4 misc; // xy 1 / proj._11, 1 / proj._22; z the GI's strength in the fog; w the mode
-  float4 misc2; // x the fog's own darkening outdoors against indoors (the particles' is apart), y the share's cap
+  float4 misc2; // x the fog's own darkening outdoors against indoors (the particles' is apart), y the share's cap, z the
+                // sun shadows' strength (stage 2)
 };
+// Stage 2: the sun's shadow cascades (NoteSunMap), finest first: light matrices for positions from the camera (row
+// vectors; xy / w the map's NDC, z the depth as the map stores it: linear over the light's far distance, a little bias
+// in), count in x.
+Texture2D<float> sunMaps[4] : register(t1);
+SamplerComparisonState shadowCmp : register(s1);
+cbuffer Cascades : register(b1)
+{
+  row_major float4x4 cascade[4];
+  float4 cascadeInfo;
+};
+
+// The sun's visibility at pos (from the camera) from the finest cascade holding it (2x2 compared, filtered); -1 outside.
+float SunShadow(float3 pos)
+{
+  [unroll] for (int c = 0; c < 4; c++)
+  {
+    if (c < (int)cascadeInfo.x)
+    {
+      float4 clip = mul(float4(pos, 1), cascade[c]);
+      if (clip.w > 0)
+      {
+        float2 uv = float2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
+        if (all(uv > 0.01) && all(uv < 0.99) && clip.z > 0 && clip.z < 1)
+          return sunMaps[c].SampleCmpLevelZero(shadowCmp, uv, clip.z);
+      }
+    }
+  }
+  return -1;
+}
 
 // ComputeVolumetricFog's exponent: the fog seen through the ray c is exp2(-max(x, 0)).
 float FogExponent(float3 c)
@@ -1248,7 +1278,12 @@ float4 Visibility(float3 pos)
   float sun = fs > 0 ? saturate(fv.y) : saturate(cv.y);
   float sunWeight = (fv.y < -0.5 || cv.y < -0.5) ? 0 : max(fs, cs);
   float k = saturate(misc.z);
-  return float4((1 - saturate(share * misc.z)) * lerp(1, tint, k), lerp(1, sun, sunWeight * k));
+  float sunVis = lerp(1, sun, sunWeight * k);
+  // Stage 2: the sun's shadow maps where they reach (outdoors under palms and roofs too, leaves included).
+  float cascadeSun = misc2.z > 0 ? SunShadow(pos) : -1;
+  if (cascadeSun >= 0)
+    sunVis = lerp(1, cascadeSun, misc2.z);
+  return float4((1 - saturate(share * misc.z)) * lerp(1, tint, k), sunVis);
 }
 
 [numthreads(8, 8, 1)]
@@ -5583,6 +5618,7 @@ struct Stats
     // RunVfog: frames whose fog volume was made; fog passes left as the engine's: no GI volumes this frame, the fog's
     // constants not found in its buffers, another target than the scene's (reflections, cube faces)
     uint64_t vfogRuns, vfogNoVolume, vfogNoConstants, vfogOtherTarget;
+    uint64_t vfogCascadeFrames, vfogCascadeSum; // stage 2: frames with the sun's cascades in the fog, their count summed
 };
 
 // GPU busy time: a timestamp at the start and the end of every main list, resolved with the list.
@@ -7950,6 +7986,8 @@ public:
         int vfog = 1;                      // CRYMT_VFOG: the GI in the engine's fog (RunVfog, the patched FogPass): 0 off, 1
                                            // on, 2 the volume made but zero (must give the engine's fog exactly: a check)
         float vfogGi = 1.0f;               // CRYMT_VFOG_GI: its strength (the particles' ambient share lost, times this)
+        float vfogSun = 1.0f;              // CRYMT_VFOG_SUN: the sun's shadow maps in the fog (stage 2: its haze dark where the
+                                           // cascades see shade, outdoors too); 0 off (stage 1: the voxels' sun indoors)
         float vfogOutdoor = 1.0f;          // CRYMT_VFOG_OUT: its darkening outdoors against indoors (the fog's own; the
                                            // particles' 200% made the path under palms too dark, the user 2026-11-14)
         float particleCell = 1.5f;         // CRYMT_GI_PARTICLECELL: their coarse occlusion volume's cell (m; 64 x 64 x 32 cells)
@@ -8087,6 +8125,8 @@ public:
                 v.vfog = std::min(std::max(_wtoi(text), 0), 2);
             read(L"CRYMT_VFOG_GI", v.vfogGi);
             v.vfogGi = std::min(std::max(v.vfogGi, 0.0f), 3.0f);
+            read(L"CRYMT_VFOG_SUN", v.vfogSun);
+            v.vfogSun = std::min(std::max(v.vfogSun, 0.0f), 1.0f);
             read(L"CRYMT_VFOG_OUT", v.vfogOutdoor);
             v.vfogOutdoor = std::min(std::max(v.vfogOutdoor, 0.0f), 3.0f);
             read(L"CRYMT_GI_PARTICLECELL", v.particleCell);
@@ -8192,6 +8232,7 @@ public:
         g.vfog = std::min(g_giControl.vfog.load(), 2);
         g.vfogGi = g_giControl.vfogGi >= 0 ? g_giControl.vfogGi / 100.0f : b.vfogGi;
         g.vfogOutdoor = g_giControl.vfogOut >= 0 ? g_giControl.vfogOut / 100.0f : b.vfogOutdoor;
+        g.vfogSun = g_giControl.vfogSun >= 0 ? std::min(g_giControl.vfogSun / 100.0f, 1.0f) : b.vfogSun;
         if (g_giControl.particleOut < 0)
             g_giControl.particleOut = static_cast<int>(b.particleOutdoor * 100.0f + 0.5f);
         g.particleOutdoor = g_giControl.particleOut / 100.0f;
@@ -8802,8 +8843,12 @@ public:
             UpdateFrameTexture(info);
         if (info->valid && g_fplusPlaceholder)
             UpdateFPlus(info);
-        g_wantPassMatrices.store(Gi().on && Gi().geometry && (Gi().shadowGeometry || Gi().cubeGeometry || Gi().cubeInject),
+        g_wantPassMatrices.store(Gi().on && ((Gi().geometry && (Gi().shadowGeometry || Gi().cubeGeometry || Gi().cubeInject)) ||
+                                             (Gi().vfog && Gi().vfogSun > 0)),
                                  std::memory_order_relaxed);
+        if (info->reset) // the sun's maps of another place or level (the fog's shadows): their textures may be gone
+            for (SunMap& s : m_sunMaps)
+                s = SunMap{};
         GiCamera(info);
         m_giInScene = info->valid != 0;
         // A frame whose GI pass did not run leaves its draws: dropped with the first camera of the next frame. Not at
@@ -9796,22 +9841,30 @@ public:
         }
         if (errors)
             errors->Release();
-        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1}};
-        D3D12_ROOT_PARAMETER params[2]{};
+        // t0 the particles' volumes, t1..t4 the sun's cascades; u0 the volume; b1 the cascades' matrices.
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1 + kVfogCascades, 0, 0, 0},
+                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1 + kVfogCascades}};
+        D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.Num32BitValues = 28;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {2, ranges};
-        D3D12_STATIC_SAMPLER_DESC ss{};
-        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        ss.MaxLOD = D3D12_FLOAT32_MAX;
-        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        params[2].Descriptor.ShaderRegister = 1;
+        D3D12_STATIC_SAMPLER_DESC ss[2]{};
+        ss[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss[0].AddressU = ss[0].AddressV = ss[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss[0].MaxLOD = D3D12_FLOAT32_MAX;
+        ss[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        ss[1] = ss[0];
+        ss[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+        ss[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL; // lit: the point no deeper than the map's nearest caster
+        ss[1].ShaderRegister = 1;
         D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 2;
+        rd.NumParameters = 3;
         rd.pParameters = params;
-        rd.NumStaticSamplers = 1;
-        rd.pStaticSamplers = &ss;
+        rd.NumStaticSamplers = 2;
+        rd.pStaticSamplers = ss;
         ID3DBlob* blob = nullptr;
         ID3DBlob* rootErrors = nullptr;
         HRESULT hr = g_serializeRoot(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rootErrors);
@@ -9926,9 +9979,69 @@ public:
             g.dev->CreateUnorderedAccessView(m_vfog.res, nullptr, nullptr, m_vfogUav);
             Log("volumetric fog volume %ux%ux%u", gx, gy, kVfogSlices);
         }
+        float toWorld[16];
+        RigidInverse(m_giView, toWorld);
+        // Stage 2: the sun's cascades known (drawn within the last 600 frames: the cached ones are redrawn as the camera
+        // moves), finest first (the width they cover at the eye), up to kVfogCascades; their matrices for positions from
+        // the camera (in double: the light's w is ~1e6), the depth column over the light's far distance, 0.25 m bias.
+        struct Pick
+        {
+            int index;
+            double width;
+        };
+        Pick picks[kSunMaps];
+        int picked = 0;
+        const double eye[3] = {toWorld[12], toWorld[13], toWorld[14]};
+        for (int i = 0; i < kSunMaps && s.vfogSun > 0; i++)
+        {
+            const SunMap& sm = m_sunMaps[i];
+            if (!sm.map || !sm.map->res || sm.frame + 600 < m_frame)
+                continue;
+            double w = sm.mv[15], sx = 0;
+            for (int r = 0; r < 3; r++)
+            {
+                w += eye[r] * sm.mv[r * 4 + 3];
+                sx += static_cast<double>(sm.mv[r * 4]) * sm.mv[r * 4];
+            }
+            if (!(w > 0) || !(sx > 0))
+                continue;
+            picks[picked++] = {i, w / std::sqrt(sx)};
+        }
+        std::sort(picks, picks + picked, [](const Pick& a, const Pick& b) { return a.width < b.width; });
+        picked = std::min(picked, kVfogCascades);
+        D3D12_GPU_VIRTUAL_ADDRESS cascadeCb = 0;
+        {
+            const UploadAlloc up = FrameUpload(512, 256);
+            if (up.cpu)
+            {
+                auto* f = reinterpret_cast<float*>(up.cpu);
+                memset(f, 0, 512);
+                for (int c = 0; c < picked; c++)
+                {
+                    const SunMap& sm = m_sunMaps[picks[c].index];
+                    for (int j = 0; j < 4; j++)
+                    {
+                        double t = sm.mv[12 + j];
+                        for (int r = 0; r < 3; r++)
+                            t += eye[r] * sm.mv[r * 4 + j];
+                        if (j == 2)
+                            t -= 0.25; // bias (m)
+                        const double scale = j == 2 ? 1.0 / sm.lightFar : 1.0;
+                        for (int r = 0; r < 3; r++)
+                            f[c * 16 + r * 4 + j] = static_cast<float>(sm.mv[r * 4 + j] * scale);
+                        f[c * 16 + 12 + j] = static_cast<float>(t * scale);
+                    }
+                }
+                f[64] = static_cast<float>(picked);
+                cascadeCb = up.res->GetGPUVirtualAddress() + up.offset;
+            }
+            else
+                picked = 0;
+        }
+        m_vfogCascadesUsed = static_cast<uint32_t>(picked);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-        while (!m_srvRing.TryAlloc(2, cpu, gpu))
+        while (!m_srvRing.TryAlloc(2 + kVfogCascades, cpu, gpu))
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -9936,9 +10049,25 @@ public:
             m_srvRing.Reclaim();
         }
         g.dev->CopyDescriptorsSimple(1, cpu, m_pvolCpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, m_vfogUav, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        float toWorld[16];
-        RigidInverse(m_giView, toWorld);
+        for (int c = 0; c < kVfogCascades; c++)
+        {
+            const D3D12_CPU_DESCRIPTOR_HANDLE at{cpu.ptr + (1 + c) * g.srvInc};
+            if (c < picked)
+            {
+                ResourceInfo* map = m_sunMaps[picks[c].index].map;
+                const auto* t = static_cast<const TextureCore*>(map);
+                D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+                sd.Format = DepthSrvFormat(t->format);
+                sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                sd.Texture2D.MipLevels = 1;
+                g.dev->CreateShaderResourceView(map->res, &sd, at);
+                Require(map, kSrvState);
+            }
+            else
+                g.dev->CopyDescriptorsSimple(1, at, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        g.dev->CopyDescriptorsSimple(1, {cpu.ptr + (1 + kVfogCascades) * g.srvInc}, m_vfogUav, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         float k[28] = {};
         for (int j = 0; j < 3; j++)
             for (int i = 0; i < 4; i++)
@@ -9954,12 +10083,15 @@ public:
         k[23] = static_cast<float>(s.vfog);
         k[24] = s.vfogOutdoor; // the fog's own darkening outdoors (not the particles' particleOutdoor)
         k[25] = s.particleMax;
+        k[26] = picked > 0 ? s.vfogSun : 0.0f;
         Require(&m_vfog, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         FlushBarriers();
         m_list->SetComputeRootSignature(m_vfogRoot);
         m_list->SetPipelineState(m_vfogPso);
         m_list->SetComputeRoot32BitConstants(0, 28, k, 0);
         m_list->SetComputeRootDescriptorTable(1, gpu);
+        if (cascadeCb)
+            m_list->SetComputeRootConstantBufferView(2, cascadeCb);
         m_list->Dispatch((gx + 7) / 8, (gy + 7) / 8, 1);
         Require(&m_vfog, kSrvState); // read by the frame's fog pass draws from here on
         FlushBarriers();
@@ -9967,6 +10099,11 @@ public:
         m_vfogFrame = m_frame;
         m_vfogTarget = m_rtv[0]->info;
         m_stats.vfogRuns++;
+        if (picked > 0)
+        {
+            m_stats.vfogCascadeFrames++;
+            m_stats.vfogCascadeSum += static_cast<uint64_t>(picked);
+        }
         // The fog's constants in the log (the sun's and the fog colour's parts of its light): the first frame, then every
         // 3600th.
         static const UINT kBytes[4] = {16, 12, 12, 12};
@@ -11505,8 +11642,47 @@ public:
     // frames, from the smallest of last frame's maps that covers the level around the eye (else the widest). Cells keep
     // their opacity between jobs (the update lowers it only where the screen sees through), so static geometry stays in
     // the grid while moving objects come from the z-prepass every frame.
+    // The sun's shadows in the fog: at a shadow map's first draw after its matrix came (PassMatrices) the map, its light
+    // matrix and far distance (the shadow vertex shaders' cb5 [1], GS_VS_FrustrumInfo.y: they write the depth as the
+    // light-space z over it) go into m_sunMaps by map. Only single-sample D32 maps (the cascades; the +-2 km map is D24S8);
+    // a map drawn for another light leaves the table.
+    void NoteSunMap()
+    {
+        m_vfogShadowPending = false;
+        if (!m_dsv || !m_dsv->info || m_dsv->info->buffer)
+            return;
+        const auto* t = static_cast<const TextureCore*>(m_dsv->info);
+        int slot = -1, oldest = 0;
+        for (int i = 0; i < kSunMaps; i++)
+        {
+            if (m_sunMaps[i].map == m_dsv->info)
+                slot = i;
+            if (m_sunMaps[i].frame < m_sunMaps[oldest].frame)
+                oldest = i;
+        }
+        float lightFar = 0;
+        const Buffer12* f = m_vs && (m_vs->cbMask >> 5 & 1) ? m_stage[kVS].cb[5] : nullptr;
+        if (f && f->Dynamic() && f->slice.cpu && f->desc.ByteWidth >= 8)
+            lightFar = reinterpret_cast<const float*>(f->slice.cpu)[1];
+        const bool sun = m_vfogPendingSun && t->samples == 1 && (t->format == DXGI_FORMAT_R32_TYPELESS || t->format == DXGI_FORMAT_D32_FLOAT) &&
+                         lightFar > 1.0f && lightFar < 1e9f;
+        if (!sun)
+        {
+            if (slot >= 0)
+                m_sunMaps[slot] = SunMap{};
+            return;
+        }
+        SunMap& s = m_sunMaps[slot >= 0 ? slot : oldest];
+        s.map = m_dsv->info;
+        memcpy(s.mv, m_vfogPendingMv, sizeof(s.mv));
+        s.lightFar = lightFar;
+        s.frame = m_frame;
+    }
+
     bool ShadowRecording()
     {
+        if (m_vfogShadowPending)
+            NoteSunMap();
         if (m_shadowCurrent >= 0 && m_shadowCurrent < 8)
             m_stats.voxShadowMapDraws[m_shadowCurrent]++;
         return m_shadowRecording && m_dsv && m_dsv->info != m_giSceneDepth;
@@ -11535,6 +11711,12 @@ public:
         m_shadowRecording = false;
         m_shadowCurrent = -1;
         const bool shadow = !memcmp(m_passProj, kIdentity, sizeof(kIdentity)) && memcmp(m_passMv, kIdentity, sizeof(kIdentity));
+        // The sun's shadows in the fog: a shadow map's matrix for its next draw (NoteSunMap); the sun's has w ~ 1e6 (the
+        // light ~1000 km out along the sun), a lamp's a few metres.
+        m_vfogShadowPending = shadow;
+        m_vfogPendingSun = shadow && std::fabs(m_passMv[15]) > 1e4f;
+        if (shadow)
+            memcpy(m_vfogPendingMv, m_passMv, sizeof(m_vfogPendingMv));
         if (!shadow || !Gi().on || !Gi().geometry || !Gi().shadowGeometry || !m_giHaveCamera)
             return;
         if (m_shadowFrame != m_giFrame) // the frame's first map (m_giFrame advances in the GI pass)
@@ -12499,6 +12681,7 @@ public:
         static const int outdoorValues[5] = {50, 70, 100, 150, 200};
         static const char* const fogGi[] = {"50%", "100%", "150%", "200%"};
         static const int fogGiValues[4] = {50, 100, 150, 200};
+        static const char* const fogSun[] = {"ВЫКЛ|OFF", "50%", "100%"};
         static const char* const dlssModel[] = {"K (ТРАНСФОРМЕР)|K (TRANSFORMER)", "J", "L (DLSS 4.5)|L (DLSS 4.5)", "M (DLSS 4.5)|M (DLSS 4.5)",
                                                 "F (CNN)|F (CNN)", "E (CNN)|E (CNN)"};
         static const char* const dlssCompare[] = {"ВЫКЛ|OFF", "СПРАВА K|RIGHT: K", "СПРАВА J|RIGHT: J", "СПРАВА L|RIGHT: L", "СПРАВА M|RIGHT: M",
@@ -12585,6 +12768,17 @@ public:
                  return best;
              },
              [](int v) { g_giControl.vfogGi = fogGiValues[v]; }, true, nullptr},
+            // Stage 2: the sun's shadow maps in the fog (its haze dark in the shade outdoors too).
+            {0, "Тени солнца в тумане|Sun shadows in the fog", 0, 2, 1, true, fogSun, 0, nullptr,
+             [] {
+                 const int v = g_giControl.vfogSun >= 0 ? g_giControl.vfogSun.load() : static_cast<int>(GiBase().vfogSun * 100.0f + 0.5f);
+                 return v <= 25 ? 0 : v <= 75 ? 1 : 2;
+             },
+             [] {
+                 const int v = static_cast<int>(GiBase().vfogSun * 100.0f + 0.5f);
+                 return v <= 25 ? 0 : v <= 75 ? 1 : 2;
+             },
+             [](int v) { g_giControl.vfogSun = v * 50; }, true, nullptr},
             // Its own darkening outdoors (the smoke's row above is the particles' only).
             {0, "Туман снаружи темнее|Fog darker outdoors", 0, 4, 1, true, outdoor, 0, nullptr,
              [] {
@@ -14416,7 +14610,8 @@ private:
     // the pipeline, the frames it was tried and made in, the scene target it was made for (only its fog pass reads it:
     // reflections and cube faces keep the engine's fog), the last fog constants read (vfParams, vfFogColor, Mie, Rayleigh).
     static constexpr UINT kVfogSlices = 64;
-    static constexpr float kVfogReach = 64.0f; // metres; the patched FogPass has the same (CryMT_VFog)
+    static constexpr float kVfogReach = 128.0f; // metres; the patched FogPass has the same (CryMT_VFog). 64 m held only
+                                                // ~40% of island's fog (2026-11-14), the sun's cascades reach ~160 m
     TextureCore m_vfog{};
     D3D12_CPU_DESCRIPTOR_HANDLE m_vfogSrv{}, m_vfogUav{};
     ID3D12RootSignature* m_vfogRoot = nullptr;
@@ -14425,6 +14620,22 @@ private:
     uint64_t m_vfogTriedFrame = ~0ull, m_vfogFrame = ~0ull;
     const ResourceInfo* m_vfogTarget = nullptr;
     float m_vfogConstants[4][4] = {};
+    // Stage 2, the sun's shadows in the fog: the sun's shadow maps seen drawn (NoteSunMap), kept by map so the cached
+    // cascades (e_gsm_cache: not redrawn every frame) stay known; cleared with a reset (level load, camera cut). Per map
+    // its light matrix (world positions, row vectors), the light's far distance, the frame it was last drawn in. A map
+    // reused for another light leaves the table.
+    struct SunMap
+    {
+        ResourceInfo* map = nullptr;
+        float mv[16] = {};
+        float lightFar = 0;
+        uint64_t frame = 0;
+    };
+    static constexpr int kSunMaps = 6, kVfogCascades = 4;
+    SunMap m_sunMaps[kSunMaps];
+    bool m_vfogShadowPending = false, m_vfogPendingSun = false; // PassMatrices: a shadow map's matrix, the sun's
+    float m_vfogPendingMv[16] = {};
+    uint32_t m_vfogCascadesUsed = 0; // the last fog pass's cascades (for the log)
     ID3D12PipelineState* m_giPso = nullptr;       // trace
     ID3D12PipelineState* m_giPsoFilter = nullptr; // blur + temporal blend
     ID3D12Resource* m_giRaw = nullptr;            // traced result before the filter (unordered access between passes)
@@ -17922,6 +18133,8 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  volumetric fog (GI in the fog): made in %llu frames; left to the engine: no GI volumes %llu, no fog constants %llu, other target %llu\n",
             static_cast<unsigned long long>(s.vfogRuns), static_cast<unsigned long long>(s.vfogNoVolume), static_cast<unsigned long long>(s.vfogNoConstants),
             static_cast<unsigned long long>(s.vfogOtherTarget));
+    fprintf(f, "  volumetric fog sun shadows: frames with the sun's cascades %llu, %.2f cascades a frame\n", static_cast<unsigned long long>(s.vfogCascadeFrames),
+            s.vfogCascadeFrames ? static_cast<double>(s.vfogCascadeSum) / static_cast<double>(s.vfogCascadeFrames) : 0.0);
     fprintf(f, "  engine cube: the slice each face number of the start mark ends in (0-5): %d %d %d %d %d %d (changed %llu times)\n", g_cubeSliceOfMark[0],
             g_cubeSliceOfMark[1], g_cubeSliceOfMark[2], g_cubeSliceOfMark[3], g_cubeSliceOfMark[4], g_cubeSliceOfMark[5],
             static_cast<unsigned long long>(g_cubeSliceLearned));
