@@ -9632,8 +9632,6 @@ void RunTestCommands()
                 g_giControl.vfogHaze = static_cast<int>(value * 100.0f + 0.5f);
             else if (_stricmp(name, "vfogsamples") == 0) // ... the sun's shadow samples per cell (1, 4, 8)
                 g_giControl.vfogSamples = v;
-            else if (_stricmp(name, "tonemap") == 0) // tone mapping: 0 the engine's, 1 GT7 per-channel, 2 GT7 full
-                g_giControl.tonemap = v;
             else
                 known = false;
             g_giControl.active = true;

@@ -1091,136 +1091,8 @@ void CryMT_VFog(float2 tc, float3 cameraToWorldPos, float sceneDepth, inout half
 const wchar_t* kPostProcess = L"Shaders\\HWScripts\\CryFX\\PostProcess.cfx";
 const wchar_t* kHumanSkin = L"Shaders\\HWScripts\\CryFX\\HumanSkin.cfx";
 const wchar_t* kWaterSurface = L"Shaders\\HWScripts\\CryFX\\WaterSurface.cfx";
-// GT7 tone mapping for comparison (the user, 2026-11-15; the panel's engine page "Тонмаппинг"): Polyphony Digital's
-// operator (their MIT-licensed sample, SIGGRAPH 2025; notice kept in the shader text and GT7ToneMapping.LICENSE.txt),
-// ported to HLSL. It takes the place of the engine's last curve (1 - exp(-k x)) in HDRFinalScenePS only when CryMT's back
-// end fills CryMT_PostParamSampler's slot with its mark (x the mode: 1 the per-channel curve, 2 the full operator with
-// the ICtCp chroma blend; y the exposure scale): the engine's exposure, blue shift, bloom and colour matrix stay. CE2
-// works in gamma space: the exposed value is taken to linear by 2.2 and back, and scaled (y, default 2.6: the median of a
-// frame where the engine's is; the panel's "Экспозиция GT7").
-const char* const kTonemapDecl = R"(// CryMT: GT7 tone mapping, ported from Polyphony Digital's sample:
-// -----
-// MIT License
-//
-// Copyright (c) 2025 Polyphony Digital Inc.
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-// -----
-#if D3D10
-sampler2D CryMT_PostParamSampler = sampler_state
-{
-  Texture = Textures/CryMT/vfogp.dds;
-  MinFilter = POINT;
-  MagFilter = POINT;
-  MipFilter = POINT;
-  AddressU = Clamp;
-  AddressV = Clamp;
-};
-
-float CryMT_GTSmooth(float x, float e0, float e1)
-{
-  float t = saturate((x - e0) / (e1 - e0));
-  return t * t * (3 - 2 * t);
-}
-
-// GTToneMappingCurveV2 for SDR (peak 250 nits = 2.5 in frame-buffer units, 1 = 100 nits): alpha 0.25, mid point 0.538,
-// linear section 0.444, toe 1.28.
-float CryMT_GTCurve(float x)
-{
-  const float P = 2.5, A = 0.25, M = 0.538, L = 0.444, T = 1.28;
-  const float k = (L - 1) / (A - 1);
-  const float kA = P * L + P * k, kB = -P * k * exp(L / k), kC = -1 / (k * P);
-  if (x < 0)
-    return 0;
-  float wLin = CryMT_GTSmooth(x, 0, M);
-  float toe = M * pow(x / M, T);
-  return x < L * P ? (1 - wLin) * toe + wLin * x : kA + kB * exp(x * kC);
-}
-
-// ST 2084 (PQ) in frame-buffer units (1 = 100 nits).
-float CryMT_PQInv(float v)
-{
-  float ym = pow(max(v, 0) * 0.01, 0.1593017578125);
-  return exp2(78.84375 * (log2(0.8359375 + 18.8515625 * ym) - log2(1.0 + 18.6875 * ym)));
-}
-float CryMT_PQ(float n)
-{
-  float np = pow(saturate(n), 1.0 / 78.84375);
-  float l = max(np - 0.8359375, 0) / (18.8515625 - 18.6875 * np);
-  return pow(l, 1.0 / 0.1593017578125) * 100.0;
-}
-
-// ICtCp (ITU-T T.302) from / to linear Rec.2020.
-float3 CryMT_ToICtCp(float3 c)
-{
-  float l = CryMT_PQInv(dot(c, float3(1688, 2146, 262) / 4096));
-  float m = CryMT_PQInv(dot(c, float3(683, 2951, 462) / 4096));
-  float s = CryMT_PQInv(dot(c, float3(99, 309, 3688) / 4096));
-  return float3((2048 * l + 2048 * m) / 4096, (6610 * l - 13613 * m + 7003 * s) / 4096, (17933 * l - 17390 * m - 543 * s) / 4096);
-}
-float3 CryMT_FromICtCp(float3 i)
-{
-  float l = CryMT_PQ(i.x + 0.00860904 * i.y + 0.11103 * i.z);
-  float m = CryMT_PQ(i.x - 0.00860904 * i.y - 0.11103 * i.z);
-  float s = CryMT_PQ(i.x + 0.560031 * i.y - 0.320627 * i.z);
-  return max(float3(3.43661 * l - 2.50645 * m + 0.0698454 * s, -0.79133 * l + 1.9836 * m - 0.192271 * s,
-                    -0.0259499 * l - 0.0989137 * m + 1.12486 * s), 0);
-}
-
-// GT7ToneMapping::applyToneMapping for SDR, on linear Rec.709 in and out (to and from Rec.2020 around it). Mode 1: the
-// per-channel curve only ("skewed" colour); 2: the full operator - luminance from the skewed colour, chroma from the
-// input faded out over 0.98..1.16 of the peak in ICtCp, blended 0.6 with the per-channel result.
-float3 CryMT_GT7(float3 c709, float mode)
-{
-  float3 c = mul(float3x3(0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956), c709);
-  float3 skewed = float3(CryMT_GTCurve(c.r), CryMT_GTCurve(c.g), CryMT_GTCurve(c.b));
-  float3 o = skewed;
-  if (mode > 1.5)
-  {
-    float3 ucs = CryMT_ToICtCp(c);
-    float3 sk = CryMT_ToICtCp(skewed);
-    float target = CryMT_ToICtCp(float3(2.5, 2.5, 2.5)).x;
-    float chroma = 1 - CryMT_GTSmooth(ucs.x / target, 0.98, 1.16);
-    float3 scaled = CryMT_FromICtCp(float3(sk.x, ucs.y * chroma, ucs.z * chroma));
-    o = lerp(skewed, scaled, 0.6);
-  }
-  o = min(o, 2.5) / 2.5;
-  return max(mul(float3x3(1.6605, -0.5876, -0.0728, -0.1246, 1.1329, -0.0083, -0.0182, -0.1006, 1.1187), o), 0);
-}
-
-// The engine's result, or GT7's from the exposed value (k x) when the back end's parameters ask for it.
-half3 CryMT_Tonemap(half3 engine, float3 exposed)
-{
-  float4 p = tex2Dlod(CryMT_PostParamSampler, float4(0.5, 0.5, 0, 0));
-  if (p.w < 4241.5 || p.w > 4242.5 || p.x < 0.5)
-    return engine;
-  float3 lin = pow(max(exposed, 0), 2.2) * p.y;
-  return pow(CryMT_GT7(lin, p.x), 1 / 2.2);
-}
-#else
-half3 CryMT_Tonemap(half3 engine, float3 exposed)
-{
-  return engine;
-}
-#endif
-
-)";
+// (GT7 tone mapping, Polyphony Digital's operator in HDRFinalScenePS, was tried 2026-11-15 and removed the same day:
+// the user did not like it; tag experiments-2026-11-15.)
 // Rivers (WaterSurface.cfx: river_village.mtl, river_harbor.mtl; lakes and pools are WaterVols.cfx) take the water's
 // reflection as the ocean and lakes do (CryMT_WaterReflection: the engine's cube in HDR and SSR), in place of their
 // planar or static cube one - only when the back end gives the engine's cube (CryMT_WaterFrame(7).y > 0.5), not the
@@ -1538,12 +1410,6 @@ std::wstring InstallGi()
                             "\tCryMT_VFog(IN.baseTC.xy, cameraToWorldPos, sceneDepth, localFogColor); // CryMT: the GI in the fog\n"
                             "\t\n\tlocalFogColor.a = 1.0 - localFogColor.a;\n") &&
                     Replace(postProcess, "    PixelShader = compile PROFILE_PS FogPassPS();\n", "    PixelShader = compile PROFILE_PS CryMT_FogPassPS();\n") &&
-                    // GT7 tone mapping to compare (kTonemapDecl): after the engine's curve, from the same exposed value.
-                    Replace(postProcess, "pixout HDRFinalScenePS(vert2frag IN)\n", std::string(kTonemapDecl) + "pixout CryMT_HDRFinalScenePS(vert2frag IN)\n") &&
-                    Replace(postProcess, "\t\tvSample.xyz = 1 - exp( -fAdaptedLumDest * vSample.xyz ); \n",
-                            "\t\thalf3 cryPre = vSample.xyz; // CryMT\n\t\tvSample.xyz = 1 - exp( -fAdaptedLumDest * vSample.xyz ); \n"
-                            "\t\tvSample.xyz = CryMT_Tonemap(vSample.xyz, cryPre * fAdaptedLumDest); // CryMT: GT7 tone mapping (the panel)\n") &&
-                    Replace(postProcess, "    PixelShader = compile PROFILE_PS HDRFinalScenePS();\n", "    PixelShader = compile PROFILE_PS CryMT_HDRFinalScenePS();\n") &&
                     // Rivers: the water's reflection with the engine's cube (kRiverReflection).
                     Replace(waterSurface, "sampler2D screenMapSampler = sampler_state\n", std::string(kWaterEnvDecl) + "sampler2D screenMapSampler = sampler_state\n") &&
                     Replace(waterSurface, "    reflectColor = tex2D(envMapSampler, vReflect.xy).xyz * cSunShading;  \n  #endif\n\n#endif\n",

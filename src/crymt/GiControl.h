@@ -31,8 +31,6 @@ struct GiControl
     std::atomic<int> vfogSun{-1};   // ... the sun's shadow maps in it, percent (0 off); -1 as CRYMT_VFOG_SUN
     std::atomic<int> vfogHaze{-1};  // ... the near air's share of light taken, percent (0 none); -1 as CRYMT_VFOG_HAZE
     std::atomic<int> vfogSamples{-1}; // ... the sun's shadow samples per cell (1, 4, 8); -1 as CRYMT_VFOG_SAMPLES
-    std::atomic<int> tonemap{-1};   // tone mapping: 0 the engine's, 1 GT7 per-channel, 2 GT7 full; -1 as CRYMT_TONEMAP
-    std::atomic<int> tonemapScale{-1}; // ... GT7's exposure, percent; -1 as CRYMT_TONEMAP_SCALE
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> dlssPreset{-1}; // the DLAA model, the panel's list index (K J L M F E); -1 as CRYMT_DLSS_PRESET
     std::atomic<int> dlssCompare{-1}; // a second DLAA model for the right half of the screen (same index), -1 off
@@ -52,7 +50,6 @@ struct GiControl
     std::atomic<int> fplus{-1};        // the Forward+ test 1 / 0 (no panel row: the single-pass mode it needs is broken)
     std::atomic<int> voxOpacity{-1};   // the cells' opacity 1 from the voxelized geometry only (the screen gives their
                                        // colour), 0 also from the screen; -1 as CRYMT_GI_OCCUPANCY says
-    std::atomic<int> geomCache{-1};    // unchanged objects voxelized every 4th frame 1, every frame 0; -1 as CRYMT_GI_GEOMCACHE
     std::atomic<int> env{-1};          // environment maps 1 from the voxel grid, 0 the game's; -1 as CRYMT_ENVMAP says
     std::atomic<bool> envAll{true};    // the reflection on every material (fragLib), not only those with their own map
     std::atomic<int> waterCube{-1};    // the ocean's reflection: 0 planar, 1 the environment cube, 2 SSR + the cube (the
