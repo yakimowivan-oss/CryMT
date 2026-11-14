@@ -678,6 +678,8 @@ uint64_t g_cubeShadowListsKept, g_cubeShadowListsLost; // EnvCubeUpdate: shadow 
 uint64_t g_particleSoundSkipped; // ParticleSoundHook: particle sound updates left to main
 uint64_t g_cubeIdsAllRestored;   // EnvCubeUpdate: light ids (+0) put back after a face beyond its EF_ADDDlight ones
 uint64_t g_renderSysEventSyncs;  // RenderSysEventHook: renderer system events on main with the render thread made idle
+uint64_t g_cubeGsmChanged;       // EnvCubeUpdate: light entities' shadow frustum pointers a face changed
+const volatile uint64_t* g_nullFrustumsSkipped; // PatchNoNullFrustums: the cave's counter of null cascades left out
 uint64_t g_cubeCloudsSkipped; // CloudRecursiveHook: cloud draws left out of the cube's faces
 EngineLightState g_cubeLightsAfter;
 std::atomic<bool> g_cubeLightsAfterSet;
@@ -1360,6 +1362,9 @@ void WriteStats()
         fprintf(f, "particle sound updates skipped on the render thread (left to main) %llu\n", static_cast<unsigned long long>(g_particleSoundSkipped));
         fprintf(f, "engine cube: light ids (+0) put back after a face beyond its own EF_ADDDlight's %llu\n", static_cast<unsigned long long>(g_cubeIdsAllRestored));
         fprintf(f, "renderer system events on main with the render thread made idle first %llu\n", static_cast<unsigned long long>(g_renderSysEventSyncs));
+        fprintf(f, "engine cube: light entities' shadow frustum pointers changed by its faces %llu\n", static_cast<unsigned long long>(g_cubeGsmChanged));
+        fprintf(f, "shadow frustum lists: null cascades left out %llu\n",
+                static_cast<unsigned long long>(g_nullFrustumsSkipped ? *g_nullFrustumsSkipped : 0));
         fprintf(f, "projector lights' frustum tests %llu, with a camera outside the 3D engine's light cameras %llu (taken as inside, the camera-index crash)\n",
                 static_cast<unsigned long long>(g_lightCamTests), static_cast<unsigned long long>(g_lightCamBad));
         if (g_cubeDiffFaces[0] + g_cubeDiffFaces[1] + g_cubeDiffFaces[2] + g_cubeDiffFaces[3] + g_cubeDiffFaces[4] + g_cubeDiffFaces[5])
@@ -6382,6 +6387,38 @@ void EnvCubeUpdate()
     // pass of a face sets +0 = -1 for every light of its list (0x300FDBF3) and the face's EF_ADDDlight renumbers only the
     // lights it draws (put back above by g_cubeLightIds). Every light's +0 is kept here and put back after the face too
     // (CRYMT_ENVCUBE_KEEPIDS=0: not).
+    // fleet's crash, the list [f, 0, 0, 0, f]: GetShadowFrustumsList takes each item from the light's owner (+0x90, the
+    // light entity) +0x2D0 (its shadow map info: the frustum pointers by cascade). Its first 8 pointers of every light
+    // entity are compared after the face (the first changes logged); CRYMT_ENVCUBE_KEEPGSM=1 puts them back.
+    static const int keepGsm = EnvCubeSetting("CRYMT_ENVCUBE_KEEPGSM", 0);
+    struct GsmSave
+    {
+        uint64_t* at;
+        uint64_t value[8];
+        int entity;
+    };
+    static std::vector<GsmSave> gsmSaved;
+    gsmSaved.clear();
+    if (const auto* engine3d = *reinterpret_cast<const uint8_t* const*>(k3DEngineGlobal))
+    {
+        const auto* const* ents = *reinterpret_cast<const uint8_t* const* const*>(engine3d + kEngineLightEntities);
+        const int nents = *reinterpret_cast<const int*>(engine3d + kEngineLightEntities + 8);
+        for (int i = 0; ents && i < nents && i < 4096; i++)
+            if (ents[i])
+                if (auto* info = *reinterpret_cast<uint64_t* const*>(ents[i] + 0x2D0))
+                {
+                    GsmSave s{info, {}, i};
+                    memcpy(s.value, info, sizeof(s.value));
+                    gsmSaved.push_back(s);
+                }
+        if (const auto* sun = *reinterpret_cast<const uint8_t* const*>(engine3d + kEngineSunEntity))
+            if (auto* info = *reinterpret_cast<uint64_t* const*>(sun + 0x2D0))
+            {
+                GsmSave s{info, {}, -1};
+                memcpy(s.value, info, sizeof(s.value));
+                gsmSaved.push_back(s);
+            }
+    }
     static const bool keepIds = EnvCubeSetting("CRYMT_ENVCUBE_KEEPIDS", 1) != 0;
     static std::vector<CamIndex> lightIdsAll;
     lightIdsAll.clear();
@@ -6600,6 +6637,23 @@ void EnvCubeUpdate()
             g_cubeCamIndicesRestored++;
             *it->at = it->value;
         }
+    // ... the light entities' shadow frustum pointers (gsmSaved above): compared, logged, put back if asked.
+    for (const GsmSave& s : gsmSaved)
+        for (int k = 0; k < 8; k++)
+            if (s.at[k] != s.value[k])
+            {
+                g_cubeGsmChanged++;
+                static int logged;
+                if (logged < 24)
+                {
+                    logged++;
+                    FocusLog("frame %llu: engine cube face changed light entity %d's shadow frustum %d: %llx -> %llx%s", static_cast<unsigned long long>(g_frame),
+                             s.entity, k, static_cast<unsigned long long>(s.value[k]), static_cast<unsigned long long>(s.at[k]),
+                             keepGsm ? " (put back)" : "");
+                }
+                if (keepGsm)
+                    s.at[k] = s.value[k];
+            }
     // ... and every light's id (lightIdsAll above).
     for (auto it = lightIdsAll.rbegin(); it != lightIdsAll.rend(); ++it)
         if (*it->at != it->value)
@@ -8596,6 +8650,56 @@ void ParticleSoundHook(void* subEmitter)
         return;
     }
     reinterpret_cast<void (*)(void*)>(kParticleSoundFn)(subEmitter);
+}
+
+// fleet's render-thread crash (2026-11-14, CryRenderD3D10+0x111E37, frame 1272 in five runs, then gone in three runs
+// of a build that only read more: timing): an object's shadow frustum list [f, 0, 0, 0, f] = the sun's cascades 1-3
+// null. GetShadowFrustumsList keeps one list per shadow mask and refills it in place on every call (items: the light
+// -> +0x90 its entity -> +0x2D0 the shadow map info -> [cascade]); in CryMT main refills them for the next frame while
+// the flush still reads the objects of this one, and a cascade can be null then (being made again). The renderer
+// uses an item only for its own fields (FUN_381118F0: +0x368), never its place, so a null one is left out where the
+// list is filled (0x300F0E07: the item load, mov ebp 1, the store, count + 1): a cave does the same with a null
+// check, and counts the nulls (CRYMT_NONULLFRUSTUMS=0: not).
+constexpr uintptr_t kFrustumListAppend = 0x300F0E07, kFrustumListAppendEnd = 0x300F0E18;
+bool PatchNoNullFrustums()
+{
+    static const uint8_t kOriginal[17] = {0x49, 0x8B, 0x04, 0xC4, 0xBD, 0x01, 0x00, 0x00, 0x00, 0x48, 0x89, 0x04, 0xD1, 0x83, 0x43, 0x08, 0x01};
+    auto* site = reinterpret_cast<uint8_t*>(kFrustumListAppend);
+    if (memcmp(site, kOriginal, sizeof(kOriginal)) != 0)
+        return false;
+    uint8_t* cave = nullptr;
+    for (uintptr_t hint = (kFrustumListAppend & ~uintptr_t{0xFFFF}) + 0x4000000; hint < kFrustumListAppend + 0x40000000 && !cave; hint += 0x10000)
+        cave = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (!cave)
+        return false;
+    static const uint8_t kCave[] = {
+        0x49, 0x8B, 0x04, 0xC4,                   // 0: mov rax, [r12 + rax*8]
+        0xBD, 0x01, 0x00, 0x00, 0x00,             // 4: mov ebp, 1
+        0x48, 0x85, 0xC0,                         // 9: test rax, rax
+        0x75, 0x09,                               // 12: jnz 23
+        0x48, 0xFF, 0x05, 0x1B, 0x00, 0x00, 0x00, // 14: inc qword [rip + 0x1B] (the counter at 48)
+        0xEB, 0x08,                               // 21: jmp 31
+        0x48, 0x89, 0x04, 0xD1,                   // 23: mov [rcx + rdx*8], rax
+        0x83, 0x43, 0x08, 0x01,                   // 27: add dword [rbx + 8], 1
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 31: jmp [rip + 0] -> kFrustumListAppendEnd (at 37)
+    };
+    memcpy(cave, kCave, sizeof(kCave));
+    const uint64_t back = kFrustumListAppendEnd;
+    memcpy(cave + 37, &back, 8);
+    memset(cave + 48, 0, 8);
+    g_nullFrustumsSkipped = reinterpret_cast<const volatile uint64_t*>(cave + 48);
+    DWORD old;
+    VirtualProtect(cave, 4096, PAGE_EXECUTE_READWRITE, &old); // the counter is written from the cave
+    uint8_t patch[17];
+    memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xE9;
+    const int32_t rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(cave) - static_cast<intptr_t>(kFrustumListAppend + 5));
+    memcpy(patch + 1, &rel, 4);
+    VirtualProtect(site, sizeof(patch), PAGE_EXECUTE_READWRITE, &old);
+    memcpy(site, patch, sizeof(patch));
+    VirtualProtect(site, sizeof(patch), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(patch));
+    return true;
 }
 
 // A player's reports (RayzenBlack, 2026-11-14, Mode=mt: the stock renderer on D3D11's runtime): at level loading (frame
@@ -10676,6 +10780,9 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
         // dead emitters while the flush builds their vertices (crashed on a null container parameter block in
         // fill mode); clouds and volume objects are only moved there. Particle destruction is deferred.
         PatchParticleDelete();
+        if (EnvCubeSetting("CRYMT_NONULLFRUSTUMS", 1) != 0)
+            SetupLog(PatchNoNullFrustums() ? "shadow frustum lists: null cascades left out"
+                                           : "shadow frustum list append site mismatch, not patched");
         if (EnvCubeSetting("CRYMT_PARTICLESOUND_RT", 0) == 0)
             SetupLog(RedirectCall(kParticleSoundCall1, kParticleSoundFn, reinterpret_cast<const void*>(&ParticleSoundHook)) &&
                              RedirectCall(kParticleSoundCall2, kParticleSoundFn, reinterpret_cast<const void*>(&ParticleSoundHook))
