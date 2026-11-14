@@ -106,6 +106,7 @@ $defs = [ordered]@{
     # The occlusion strength under cover outdoors (CRYMT_GI_CANOPY, 2026-11-14: the forest at 0.45 came out lighter than
     # with no GI), with the probes' light (the Full preset's high GI).
     can0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'}}
+    vfog = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}} # can0 + GPU time per pass (CryMT VFog)
     can0_eq = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_OCCSTRENGTH = '0.45'}} # the cover rays out (both strengths alike)
     can0_nosss = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_CONTACTSHADOWS = '0'}}
     can0_nogtao = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_SSAO = '1'}}

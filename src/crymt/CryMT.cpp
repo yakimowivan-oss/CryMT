@@ -9787,6 +9787,8 @@ void RunTestCommands()
                 g_giControl.vfog = v;
             else if (_stricmp(name, "vfoggi") == 0) // ... its strength (factor)
                 g_giControl.vfogGi = static_cast<int>(value * 100.0f + 0.5f);
+            else if (_stricmp(name, "vfogout") == 0) // ... its darkening outdoors (factor)
+                g_giControl.vfogOut = static_cast<int>(value * 100.0f + 0.5f);
             else
                 known = false;
             g_giControl.active = true;

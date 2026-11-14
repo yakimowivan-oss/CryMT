@@ -1184,6 +1184,7 @@ cbuffer C : register(b0)
   float4 fog;  // x atmosphere scale, y density at the viewer, z density, w the artist's offset (VolumetricFog.cfi)
   float4 grid; // x, y tiles across and down, z slices, w reach (m)
   float4 misc; // xy 1 / proj._11, 1 / proj._22; z the GI's strength in the fog; w the mode
+  float4 misc2; // x the fog's own darkening outdoors against indoors (the particles' is apart), y the share's cap
 };
 
 // ComputeVolumetricFog's exponent: the fog seen through the ray c is exp2(-max(x, 0)).
@@ -1198,9 +1199,9 @@ float FogExponent(float3 c)
   return fogInt * length(c) * fog.y - fog.w;
 }
 
-// One of the particles' volumes (as Particles.cfi's CryMT_PVolOne reads pvolume's atlas): its share, sun and indoor
-// share, its tint, its weight (0 outside, rising over the outer 4 cells).
-void PVolOne(float3 pos, int p, float x0, out float3 v, out float3 tint, out float weight)
+// One of the particles' volumes (as Particles.cfi's CryMT_PVolOne reads pvolume's atlas): its share, sun, indoor share
+// and share before the outdoor part, its tint, its weight (0 outside, rising over the outer 4 cells).
+void PVolOne(float3 pos, int p, float x0, out float4 v, out float3 tint, out float weight)
 {
   v = 0;
   tint = 1;
@@ -1221,20 +1222,27 @@ void PVolOne(float3 pos, int p, float x0, out float3 v, out float3 tint, out flo
   float2 uv0 = (float2(x0, 0) + float2(fmod(z0, 8), floor(z0 / 8)) * dims.xy + xy) / float2(1024, 513);
   float2 uv1 = (float2(x0, 0) + float2(fmod(z1, 8), floor(z1 / 8)) * dims.xy + xy) / float2(1024, 513);
   float2 down = float2(0, 257.0 / 513);
-  v = lerp(pvolTex.SampleLevel(linearClamp, uv0, 0).xyz, pvolTex.SampleLevel(linearClamp, uv1, 0).xyz, fz);
+  v = lerp(pvolTex.SampleLevel(linearClamp, uv0, 0), pvolTex.SampleLevel(linearClamp, uv1, 0), fz);
   tint = lerp(pvolTex.SampleLevel(linearClamp, uv0 + down, 0).xyz, pvolTex.SampleLevel(linearClamp, uv1 + down, 0).xyz, fz);
   weight = saturate(edge / 4);
+}
+
+// The fog's own share of the ambient lost (the particles' x has their outdoor part): w with misc2's outdoor part, capped.
+float FogShare(float4 v)
+{
+  return min(saturate(v.w) * lerp(misc2.x, 1, saturate(v.z)), misc2.y);
 }
 
 // The fog's light at pos (from the camera, metres): rgb what is left of the ambient part (tinted), a of the sun's part
 // (the voxels' sun by the indoor share, as for particles: outdoors their grass and coarse ground cells shaded the air).
 float4 Visibility(float3 pos)
 {
-  float3 fv, ft, cv, ct;
+  float4 fv, cv;
+  float3 ft, ct;
   float fw, cw;
   PVolOne(pos, 0, 0, fv, ft, fw);
   PVolOne(pos, 4, 512, cv, ct, cw);
-  float share = lerp(saturate(cv.x) * cw, saturate(fv.x), fw);
+  float share = lerp(FogShare(cv) * cw, FogShare(fv), fw);
   float3 tint = clamp(lerp(lerp(1, ct, cw), ft, fw), 0, 2);
   float cs = saturate(cv.z) * cw, fs = saturate(fv.z) * fw;
   float sun = fs > 0 ? saturate(fv.y) : saturate(cv.y);
@@ -3340,11 +3348,12 @@ void pvolume(uint3 id : SV_DispatchThreadID)
     if (roof < 1 && occRange.y != motionParams.w)
         roof = max(roof, RoofCover(P, up, 0.5));
     // Outdoors a part of the occlusion (reproj[3].x; light haze and dust vanished against the background), at most
-    // reproj[3].y; z the indoor share (the particles take the voxels' sun indoors, the game's outdoors).
-    float share = Strengthen(saturate(occ / 3 * voxParams2.x), roof);
-    share = min(share * lerp(reproj[3].x, 1, roof), reproj[3].y);
+    // reproj[3].y; z the indoor share (the particles take the voxels' sun indoors, the game's outdoors); w the share
+    // before the outdoor part and the cap (the GI in the fog applies its own: RunVfog).
+    float raw = Strengthen(saturate(occ / 3 * voxParams2.x), roof);
+    float share = min(raw * lerp(reproj[3].x, 1, roof), reproj[3].y);
     float sun = reproj[2].w > 0.5 ? SunVisible(P, normalize(reproj[2].xyz)) : -1;
-    outTex[id.xy] = float4(share, sun, roof, 0);
+    outTex[id.xy] = float4(share, sun, roof, raw);
 }
 
 // Exposure for DLSS (Device::RunExposure, one group): the average log2 luminance of the scene's HDR colour (t1) over a
@@ -7941,6 +7950,8 @@ public:
         int vfog = 1;                      // CRYMT_VFOG: the GI in the engine's fog (RunVfog, the patched FogPass): 0 off, 1
                                            // on, 2 the volume made but zero (must give the engine's fog exactly: a check)
         float vfogGi = 1.0f;               // CRYMT_VFOG_GI: its strength (the particles' ambient share lost, times this)
+        float vfogOutdoor = 1.0f;          // CRYMT_VFOG_OUT: its darkening outdoors against indoors (the fog's own; the
+                                           // particles' 200% made the path under palms too dark, the user 2026-11-14)
         float particleCell = 1.5f;         // CRYMT_GI_PARTICLECELL: their coarse occlusion volume's cell (m; 64 x 64 x 32 cells)
         float particleFineCell = 0.5f;     // CRYMT_GI_PARTICLEFINE: the fine one's (rooms' walls and ceilings)
         float particleOutdoor = 2.0f;      // CRYMT_GI_PARTICLEOUT: the darkening outdoors against indoors (key "=" 50 / 70 / 100 /
@@ -8076,6 +8087,8 @@ public:
                 v.vfog = std::min(std::max(_wtoi(text), 0), 2);
             read(L"CRYMT_VFOG_GI", v.vfogGi);
             v.vfogGi = std::min(std::max(v.vfogGi, 0.0f), 3.0f);
+            read(L"CRYMT_VFOG_OUT", v.vfogOutdoor);
+            v.vfogOutdoor = std::min(std::max(v.vfogOutdoor, 0.0f), 3.0f);
             read(L"CRYMT_GI_PARTICLECELL", v.particleCell);
             v.particleCell = v.particleCell > 0.25f ? v.particleCell : 1.5f;
             read(L"CRYMT_GI_PARTICLEFINE", v.particleFineCell);
@@ -8178,6 +8191,7 @@ public:
             g_giControl.vfog = b.vfog;
         g.vfog = std::min(g_giControl.vfog.load(), 2);
         g.vfogGi = g_giControl.vfogGi >= 0 ? g_giControl.vfogGi / 100.0f : b.vfogGi;
+        g.vfogOutdoor = g_giControl.vfogOut >= 0 ? g_giControl.vfogOut / 100.0f : b.vfogOutdoor;
         if (g_giControl.particleOut < 0)
             g_giControl.particleOut = static_cast<int>(b.particleOutdoor * 100.0f + 0.5f);
         g.particleOutdoor = g_giControl.particleOut / 100.0f;
@@ -9785,7 +9799,7 @@ public:
         D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1}};
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.Num32BitValues = 24;
+        params[0].Constants.Num32BitValues = 28;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {2, ranges};
         D3D12_STATIC_SAMPLER_DESC ss{};
@@ -9925,7 +9939,7 @@ public:
         g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, m_vfogUav, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         float toWorld[16];
         RigidInverse(m_giView, toWorld);
-        float k[24] = {};
+        float k[28] = {};
         for (int j = 0; j < 3; j++)
             for (int i = 0; i < 4; i++)
                 k[j * 4 + i] = toWorld[i * 4 + j];
@@ -9938,11 +9952,13 @@ public:
         k[21] = 1.0f / m_giProj[5];
         k[22] = s.vfogGi;
         k[23] = static_cast<float>(s.vfog);
+        k[24] = s.vfogOutdoor; // the fog's own darkening outdoors (not the particles' particleOutdoor)
+        k[25] = s.particleMax;
         Require(&m_vfog, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         FlushBarriers();
         m_list->SetComputeRootSignature(m_vfogRoot);
         m_list->SetPipelineState(m_vfogPso);
-        m_list->SetComputeRoot32BitConstants(0, 24, k, 0);
+        m_list->SetComputeRoot32BitConstants(0, 28, k, 0);
         m_list->SetComputeRootDescriptorTable(1, gpu);
         m_list->Dispatch((gx + 7) / 8, (gy + 7) / 8, 1);
         Require(&m_vfog, kSrvState); // read by the frame's fog pass draws from here on
@@ -12569,6 +12585,25 @@ public:
                  return best;
              },
              [](int v) { g_giControl.vfogGi = fogGiValues[v]; }, true, nullptr},
+            // Its own darkening outdoors (the smoke's row above is the particles' only).
+            {0, "Туман снаружи темнее|Fog darker outdoors", 0, 4, 1, true, outdoor, 0, nullptr,
+             [] {
+                 const int v = g_giControl.vfogOut >= 0 ? g_giControl.vfogOut.load() : static_cast<int>(GiBase().vfogOutdoor * 100.0f + 0.5f);
+                 int best = 0;
+                 for (int i = 1; i < 5; i++)
+                     if (abs(outdoorValues[i] - v) < abs(outdoorValues[best] - v))
+                         best = i;
+                 return best;
+             },
+             [] {
+                 const int v = static_cast<int>(GiBase().vfogOutdoor * 100.0f + 0.5f);
+                 int best = 0;
+                 for (int i = 1; i < 5; i++)
+                     if (abs(outdoorValues[i] - v) < abs(outdoorValues[best] - v))
+                         best = i;
+                 return best;
+             },
+             [](int v) { g_giControl.vfogOut = outdoorValues[v]; }, true, nullptr},
             {1, "Запечённый AO: объекты|Baked AO: objects (RAM)", 0, 1, 1, true, baked, 0, nullptr, BakedGet<2>, BakedDef<2>,
              BakedSet<2>, true, nullptr},
             {1, "Запечённый AO: небо|Baked AO: objects' sky", 0, 1, 1, true, baked, 0, nullptr, BakedGet<4>, BakedDef<4>,
