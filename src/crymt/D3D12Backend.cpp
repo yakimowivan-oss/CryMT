@@ -2237,7 +2237,9 @@ float4 ProbeLight(float3 P, float3 N, int c, out float inside)
     const float3 Pb = P + (N * 0.2 + V * 0.8) * (0.3 * sp);
     const float3 g = Pb / sp - 0.5 - origin;
     const float3 room = min(g, (kProbeN - 1) - g);
-    inside = saturate(min(room.x, min(room.y, room.z)) / 2);
+    // The outer cascade hands over to the cones over its last 6 probes (2 before 2026-11-14: walking at mine the probes'
+    // edge was a step, a wall x0.89 -> x0.69 against no GI from 15 to 22 m); the near one to the outer over 2.
+    inside = saturate(min(room.x, min(room.y, room.z)) / (c == kProbeCascades - 1 ? 6 : 2));
     if (inside <= 0)
         return 0;
     const int3 base = (int3)floor(g);
@@ -2521,15 +2523,27 @@ void trace(uint3 id : SV_DispatchThreadID)
             if (!probeLightOnly)
                 farOcc = lerp(farOcc, probe.a, probeIn);
             // Indoors: a VisArea; else the cover above (houses without one): the roof texture half a metre off the
-            // surface and, when the two strengths differ, a ray up leaned off the surface and turned per texel.
-            float roof = area >= 0 ? 1 : 0;
+            // surface and, when the two strengths differ, a ray up leaned off the surface and turned per texel. The
+            // VisArea is asked half a metre in front of the surface: its 0.3 m margin took a building's outer walls for
+            // its room (mine's yard: an outer wall kept the indoor strength, x0.16 against no GI).
+            float roof = VisAreaAt(Pw + Nw * 0.5) >= 0 ? 1 : 0;
             if (roof < 1 && ((uint)options & 128) != 0) // CRYMT_GI_ROOFCELLS=1
                 roof = max(roof, RoofAt(Pw + Nw * (voxParams.x * 2)));
             if (roof < 1 && occRange.y != motionParams.w)
             {
                 float ra = noise * 6.2831853;
                 float3 up = normalize(float3(0, 0, 1) + Nw * 0.5 + (T * cos(ra) + B * sin(ra)) * 0.25);
-                roof = max(roof, RoofCover(O, up, frac(noise + 0.5)));
+                const float cover = RoofCover(O, up, frac(noise + 0.5));
+                // A roof alone is no room: an eave over an open yard, a canopy (the user, mine 2026-11-14: a wall under
+                // an eave took the indoor strength and the GI darkened it six times). Four level rays (turned per texel)
+                // tell how closed in the point is; a quarter (the point's own wall) counts as open.
+                float closed = 0;
+                [unroll] for (int k = 0; k < 4; k++)
+                {
+                    const float a = ra + k * 1.5707963;
+                    closed += RoofCover(O, float3(cos(a), sin(a), 0), frac(noise + 0.25 * k));
+                }
+                roof = max(roof, cover * saturate((closed / 4 - 0.25) / 0.5));
             }
             if (debug == 4) // the indoor share (VisArea, roof) as occlusion
             {
@@ -7616,7 +7630,9 @@ public:
         bool lampTest = false;             // CRYMT_GI_LAMPTEST=1: also on cells the screen coloured (to see it in the voxel view)
         int mipOpacity = 4;                // CRYMT_GI_MIPOPACITY: coarse cells' opacity, 0 the mean, 1/2/3 by rays through, 4 per axis (downsample)
         float ambientFloor = 0.1f;         // CRYMT_GI_FLOOR: the share of the flat ambient full occlusion keeps (Strengthen)
-        float outdoorStrength = 1.0f;      // CRYMT_GI_OUTDOOR: the occlusion strength outdoors (Num4 / Num7 set the indoor one)
+        float outdoorStrength = 0.45f;     // CRYMT_GI_OUTDOOR: the occlusion strength outdoors (Num4 / Num7 set the indoor one);
+                                           // 1.0 before 2026-11-14 (with the voxels' occlusion 1.2 the cones darkened open
+                                           // yards x0.15-0.2 against no GI; the indoor strength keeps the rooms dark)
         bool roofCells = false;            // CRYMT_GI_ROOFCELLS=1: the roof texture (kVoxShader "roof") as well as the ray
         bool thinFix = true;               // CRYMT_GI_THIN=0: thin features keep their own (chance) GI
         bool roomLight = true;             // CRYMT_GI_ROOMLIGHT=0: cones from inside a VisArea take light from outside it too
