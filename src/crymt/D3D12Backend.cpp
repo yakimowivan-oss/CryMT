@@ -1164,6 +1164,37 @@ const ResourceInfo* g_waterEnvPlaceholder; // Textures/CryMT/waterenv.dds (Water
 const ResourceInfo* g_hizPlaceholder;      // Textures/CryMT/hiz.dds (Water.cfx's CryMT_HiZSampler), see IsHizPlaceholder
 const ResourceInfo* g_vfogPlaceholder;     // Textures/CryMT/vfog.dds (PostProcess.cfx's CryMT_VFogSampler), see IsVfogPlaceholder
 
+// The 2D environment map from the engine's cube (Device::RunEnv2D; the first-person weapons' Metal reads its own 2D map
+// by reflection.xy, not a cube: in the engine cube mode it kept the game's static map while the voxel mode replaced it,
+// the user 2026-11-15). As the voxel pass's square 6: a texel at f stands for the upward directions (xy, sqrt(1 - xy.xy))
+// with xy = f and f - 1 per axis (the map wraps), the four averaged; from the materials' cube (GGX by level, the panel's
+// strength in) at level `lod`. Constants: the map's size, the level.
+const char* const kEnv2DShader = R"(
+TextureCube<float4> cube : register(t0);
+RWTexture2D<float4> dst : register(u0);
+SamplerState linearClamp : register(s0);
+cbuffer C : register(b0)
+{
+  uint size;
+  float lod;
+};
+
+[numthreads(8, 8, 1)]
+void env2d(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= size || id.y >= size)
+    return;
+  float2 f = (id.xy + 0.5) / size;
+  float3 c = 0;
+  [unroll] for (int k = 0; k < 4; k++)
+  {
+    float2 xy = f - float2(k & 1, k >> 1);
+    c += cube.SampleLevel(linearClamp, float3(xy, sqrt(saturate(1 - dot(xy, xy)))), lod).rgb * 0.25;
+  }
+  dst[id.xy] = float4(c, 1);
+}
+)";
+
 // Volumetric fog, stage 1: the GI in the fog (Device::RunVfog, 2026-11-14). The engine's fog (PostProcess.cfx FogPass)
 // lights all air alike, so it glowed in dark rooms and in the shade. Per screen tile (a thread) the ray from the camera
 // through the tile's centre, slices to `reach` metres (slice k ends at reach ((k + 1) / n)^2): each slice's share of the
@@ -6262,6 +6293,7 @@ public:
     }
 
     uint64_t m_envBinds = 0; // environment cube maps bound (per frame in the heap line)
+    uint64_t m_env2DBinds = 0; // ... of them 2D maps (the weapons' Metal and every other material with $Env)
     Srv12* m_envTestCube = nullptr;
     Srv12* m_envTest2D = nullptr;
     bool m_envTestTried = false;
@@ -6600,7 +6632,9 @@ public:
 
     // What the material's environment map in this slot of the pixel shader is replaced by (null: kept): the CRYMT_ENVTEST
     // colour (stage 0), or the maps from the voxel grid once they have been made.
-    // A material's own environment map replaced: the voxel cube / 2D map (mode 1), the engine's cube (mode 2: cube maps only).
+    // A material's own environment map replaced: the voxel cube / 2D map (mode 1), the engine's cube / the 2D map made from
+    // it (mode 2; until 2026-11-15 the 2D maps kept the game's static one in this mode: the first-person weapons' Metal).
+    // Every material alike (by its samplers' names), but water and glass (IsRefractiveResource) and eyes, hair, skin.
     EnvView EnvSubstitute(int slot)
     {
         EnvView v;
@@ -6612,6 +6646,11 @@ public:
             {
                 v.info = &m_ldrCubeOwn;
                 v.cpu = m_ldrCubeOwnSrv;
+            }
+            else if (EnvEngineOn() && m_ldr2DReady && slot == m_ps->env2DSlot)
+            {
+                v.info = &m_ldr2D;
+                v.cpu = m_ldr2DSrv;
             }
             else if (Srv12* s = EnvOn() && m_envReady ? (slot == m_ps->envCubeSlot ? m_envCube : m_env2D) : nullptr)
             {
@@ -8052,8 +8091,9 @@ public:
                                            // its reach (0 none; the engine's fog near the camera is thin, the sun's shafts
                                            // hardly show without it; the user's panel row "Плотность воздуха вблизи")
         float vfogHazeReach = 60.0f;       // CRYMT_VFOG_HAZEREACH: its reach (m): full density to half of it, none at it
-        int vfogSamples = 4;               // CRYMT_VFOG_SAMPLES: the sun's shadow samples per cell, 1 / 4 / 8 (one drew the
-                                           // shadows' edges in the fog as steps of whole tiles: the user, Sponza 2026-11-15)
+        int vfogSamples = 8;               // CRYMT_VFOG_SAMPLES: the sun's shadow samples per cell, 1 / 4 / 8 (one drew the
+                                           // shadows' edges in the fog as steps of whole tiles: the user, Sponza 2026-11-15;
+                                           // 8 by default, the user)
         float vfogOutdoor = 1.0f;          // CRYMT_VFOG_OUT: its darkening outdoors against indoors (the fog's own; the
                                            // particles' 200% made the path under palms too dark, the user 2026-11-14)
         float particleCell = 1.5f;         // CRYMT_GI_PARTICLECELL: their coarse occlusion volume's cell (m; 64 x 64 x 32 cells)
@@ -10571,6 +10611,129 @@ public:
         Require(&m_ldrCubeOwn, kSrvState);
         FlushBarriers();
         m_ldrCubeReady = true;
+        RunEnv2D(mips);
+    }
+
+    // The weapons' 2D environment map from the materials' cube (kEnv2DShader), after each update of the cube.
+    void RunEnv2D(UINT cubeMips)
+    {
+        if (!m_ldrCubeOwn.res || !m_ldrCubeOwnSrv.ptr)
+            return;
+        if (!m_env2DPso && !m_env2DFailed)
+        {
+            m_env2DFailed = true;
+            using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
+            HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+            auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
+            ID3DBlob* code = nullptr;
+            ID3DBlob* errors = nullptr;
+            if (compile && g_serializeRoot &&
+                SUCCEEDED(compile(kEnv2DShader, strlen(kEnv2DShader), "CryMT_Env2D", nullptr, nullptr, "env2d", "cs_5_0", 1 << 15, 0, &code, &errors)))
+            {
+                D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1}};
+                D3D12_ROOT_PARAMETER params[2]{};
+                params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                params[0].Constants.Num32BitValues = 2;
+                params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                params[1].DescriptorTable = {2, ranges};
+                D3D12_STATIC_SAMPLER_DESC ss{};
+                ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                ss.MaxLOD = D3D12_FLOAT32_MAX;
+                ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                D3D12_ROOT_SIGNATURE_DESC rd{};
+                rd.NumParameters = 2;
+                rd.pParameters = params;
+                rd.NumStaticSamplers = 1;
+                rd.pStaticSamplers = &ss;
+                ID3DBlob* blob = nullptr;
+                HRESULT hr = g_serializeRoot(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr);
+                if (SUCCEEDED(hr))
+                    hr = g.dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                                    reinterpret_cast<void**>(&m_env2DRoot));
+                if (blob)
+                    blob->Release();
+                if (SUCCEEDED(hr))
+                {
+                    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+                    pd.pRootSignature = m_env2DRoot;
+                    pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
+                    hr = g.dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&m_env2DPso));
+                }
+                m_env2DFailed = FAILED(hr);
+                if (m_env2DFailed)
+                {
+                    m_env2DPso = nullptr;
+                    Log("weapons' 2D environment map pipeline: 0x%08x", static_cast<unsigned>(hr));
+                }
+            }
+            else
+                Log("weapons' 2D environment map shader: %s", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
+            if (code)
+                code->Release();
+            if (errors)
+                errors->Release();
+        }
+        if (!m_env2DPso)
+            return;
+        constexpr UINT kSize = 64;
+        if (!m_ldr2D.res)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = kSize;
+            d.Height = kSize;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d.SampleDesc.Count = 1;
+            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_ldr2D.res))))
+            {
+                m_ldr2D.res = nullptr;
+                m_env2DPso = nullptr;
+                m_env2DFailed = true;
+                return;
+            }
+            m_ldr2D.dim = D3D10_RESOURCE_DIMENSION_TEXTURE2D;
+            m_ldr2D.width = m_ldr2D.height = kSize;
+            m_ldr2D.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            m_ldr2D.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            m_ldr2DSrv = g_srvCpu.Alloc();
+            m_ldr2DUav = g_srvCpu.Alloc();
+            g.dev->CreateShaderResourceView(m_ldr2D.res, nullptr, m_ldr2DSrv);
+            g.dev->CreateUnorderedAccessView(m_ldr2D.res, nullptr, nullptr, m_ldr2DUav);
+            Log("weapons' 2D environment map from the engine cube: %ux%u", kSize, kSize);
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+        while (!m_srvRing.TryAlloc(2, cpu, gpu))
+        {
+            Submit();
+            WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
+            PollFence();
+            m_srvRing.Reclaim();
+        }
+        g.dev->CopyDescriptorsSimple(1, cpu, m_ldrCubeOwnSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        g.dev->CopyDescriptorsSimple(1, {cpu.ptr + g.srvInc}, m_ldr2DUav, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        Require(&m_ldrCubeOwn, kSrvState);
+        Require(&m_ldr2D, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        FlushBarriers();
+        // Level 3 of the materials' cube (GGX alpha 0.25): about the voxel 2D map's blur (its cones' half tangent 0.25).
+        const float lod = static_cast<float>(std::min(3u, cubeMips ? cubeMips - 1 : 0u));
+        uint32_t k[2] = {kSize, 0};
+        memcpy(&k[1], &lod, sizeof(float));
+        m_list->SetComputeRootSignature(m_env2DRoot);
+        m_list->SetPipelineState(m_env2DPso);
+        m_list->SetComputeRoot32BitConstants(0, 2, k, 0);
+        m_list->SetComputeRootDescriptorTable(1, gpu);
+        m_list->Dispatch((kSize + 7) / 8, (kSize + 7) / 8, 1);
+        Require(&m_ldr2D, kSrvState);
+        FlushBarriers();
+        m_ldr2DReady = true;
     }
 
     bool PsReads(const ResourceInfo* placeholder) const
@@ -14939,6 +15102,13 @@ private:
     // The materials' copies of it (cubePrefilter: GGX by level, encoded as the voxel cube, 1 - exp(-0.5 x)): every
     // material's (fragLib's CryMT_EnvSampler; the panel's "every material" scale) and their own maps' (its "own map" scale).
     TextureCore m_ldrCube{}, m_ldrCubeOwn{};
+    // The 2D environment map from the engine's cube (RunEnv2D, for the first-person weapons' Metal), 64x64 RGBA16F, its
+    // views, the pipeline; ready once made from the materials' cube.
+    TextureCore m_ldr2D{};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_ldr2DSrv{}, m_ldr2DUav{};
+    ID3D12RootSignature* m_env2DRoot = nullptr;
+    ID3D12PipelineState* m_env2DPso = nullptr;
+    bool m_env2DFailed = false, m_ldr2DReady = false;
     D3D12_CPU_DESCRIPTOR_HANDLE m_ldrCubeSrv{}, m_ldrCubeUav[12]{}, m_ldrCubeOwnSrv{}, m_ldrCubeOwnUav[12]{};
     bool m_ldrCubeReady = false;
     bool m_cubeFailed = false;
@@ -15887,6 +16057,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 {
                     Require(envSub[k].info, kSrvState);
                     m_envBinds++;
+                    if (k == 1)
+                        m_env2DBinds++;
                 }
     // The table always holds all bound views (and the GI slot), so a later shader reading further slots finds them.
     if (srvEnd && st.srvDirty)
@@ -17615,9 +17787,11 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
             a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local);
             a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared);
         }
-        static uint64_t envBindsBefore;
-        Log("environment cube binds per frame: %.1f", (g_device->m_envBinds - envBindsBefore) / 3600.0);
+        static uint64_t envBindsBefore, env2DBefore;
+        Log("environment map binds per frame: %.1f (2D maps %.1f)", (g_device->m_envBinds - envBindsBefore) / 3600.0,
+            (g_device->m_env2DBinds - env2DBefore) / 3600.0);
         envBindsBefore = g_device->m_envBinds;
+        env2DBefore = g_device->m_env2DBinds;
         Log("heaps at frame %llu: video memory %.0f of %.0f MB, shared %.0f MB; upload pages %llu (+%llu dedicated), %.1f MB in free lists; "
             "default pages %llu (+%llu dedicated), %.1f MB in free lists",
             static_cast<unsigned long long>(m_frame), local.CurrentUsage / 1048576.0, local.Budget / 1048576.0, shared.CurrentUsage / 1048576.0,
