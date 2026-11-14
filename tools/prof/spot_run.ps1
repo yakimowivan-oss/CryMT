@@ -96,6 +96,18 @@ $defs = [ordered]@{
     q_lh = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '0'}}
     q_hl = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '2'; CRYMT_ENVMAP = 'voxels'; CRYMT_ENVCUBE = '0'}}
     q_ll = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '0'; CRYMT_ENVMAP = 'voxels'; CRYMT_ENVCUBE = '0'}}
+    # The projector lights' camera test (camera-index crash, 2026-11-14): checked (default) / the engine's own; GI off.
+    lcc_on = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'}}
+    lcc_off = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_LIGHTCAMCHECK = '0'}}
+    lcc_nogi = @{Gi = '0'; Env = @{CRYMT_LIGHTCAMCHECK = '0'}}
+    # A lamp going out every 5th frame (2026-11-14): the engine cube off / its own frame id; the light log on.
+    lamp_cube = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_LIGHTLOG = '1'}}
+    lamp_nocube = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE = '0'; CRYMT_ENVMAP = 'voxels'; CRYMT_LIGHTLOG = '1'}}
+    cube_down = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE_DOWN = '1'}}
+    lamp_k3 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE_KEEPVIS = '3'; CRYMT_LIGHTLOG = '1'}}
+    lamp_k15 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE_KEEPVIS = '15'; CRYMT_LIGHTLOG = '1'}}
+    lamp_diff = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_CUBEDIFF = '1'; CRYMT_LIGHTLOG = '1'}}
+    lamp_ownframe = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE_OWNFRAME = '1'; CRYMT_LIGHTLOG = '1'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}

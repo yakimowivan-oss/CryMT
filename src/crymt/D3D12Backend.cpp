@@ -906,6 +906,10 @@ Device* g_device;
 // The engine-captured environment cube (Dx12EngineEnvCube, the render thread): its texture, referenced; the stream thread
 // makes its view (Device::EngineCube).
 std::mutex g_engineCubeLock;
+// The engine cube: the D3D slice a render ended in, for each face number its start mark gave (EngineCubeCullFor), and how
+// often that changed (the stream thread).
+int g_cubeSliceOfMark[6] = {-1, -1, -1, -1, -1, -1};
+uint64_t g_cubeSliceLearned;
 ID3D10Resource* g_engineCubePending;
 std::atomic<bool> g_cubeDumpWanted; // Dx12DumpEngineCube (Num0 with the in-game keys): the cube as one picture at the next present
 std::atomic<bool> g_voxSnapWanted;  // Dx12VoxSnap (crymt_voxsnap <name>): the voxel grid's geometry levels to a file
@@ -6064,15 +6068,24 @@ public:
         const int panel = g_giControl.envCubeCull;
         return panel < 0 ? EngineCubeCullBase() : std::min(panel, 3);
     }
-    // 3 (the default since 2026-11-13 night): per face. Village, each face drawn with every mode and compared with no
-    // culling (closed meshes look the same with the right one): faces 0 1 2 4 5 the inverted one (11-15% of pixels off,
-    // the noise of the faces' blending; the engine's 50-88%), face 3 the engine's (5% against 27%: its image is not
-    // mirrored; the walls had holes in it - the user).
-    static int EngineCubeCullFor(int face)
+    // 3 (the default since 2026-11-13 night): per face of the cube (its D3D slice, +X -X +Y -Y +Z -Z). Village, each
+    // slice drawn with every mode and compared with no culling (closed meshes look the same with the right one):
+    // slices 0 1 2 4 5 the inverted one, slice 3 (-Y) the engine's (its image is not mirrored; the walls had holes in
+    // it - the user). Island 2026-11-14 (tools\prof\cube_modes.ps1 + cube_faces_vs.py, against no culling): slice 3
+    // inverted 22% of pixels off, the engine's 6%; the others inverted 1-3%, the engine's 4-10%. The table was indexed
+    // by the face number of the start mark (the engine's entry +8), which is not the slice the render ends in: slice 3
+    // got the inverted culling (the user: the defaults showed the cube wrong). Now by the slice that number was last
+    // seen to end in (g_cubeSliceOfMark, learned at each render's end; until then the number itself).
+    static int EngineCubeSlice(int markFace)
     {
-        static constexpr int kPerFace[6] = {2, 2, 2, 0, 2, 2};
+        return markFace >= 0 && markFace < 6 && g_cubeSliceOfMark[markFace] >= 0 ? g_cubeSliceOfMark[markFace] : markFace;
+    }
+    static int EngineCubeCullFor(int markFace)
+    {
+        static constexpr int kPerSlice[6] = {2, 2, 2, 0, 2, 2};
         const int mode = EngineCubeCull();
-        return mode < 3 ? mode : face >= 0 && face < 6 ? kPerFace[face] : 2;
+        const int slice = EngineCubeSlice(markFace);
+        return mode < 3 ? mode : slice >= 0 && slice < 6 ? kPerSlice[slice] : 2;
     }
     // A new face mixed into the HDR copy (CRYMT_ENVCUBE_BLEND, the reflections page): 1 replaces, 0.5 half (default), 0.25.
     static float EngineCubeBlend()
@@ -6108,6 +6121,15 @@ public:
         static const int env = [] {
             wchar_t v[8] = {};
             return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_ENTITIES", v, 8) ? (_wtoi(v) != 0 ? 1 : 0) : 1;
+        }();
+        return env;
+    }
+    // The clouds in it: CRYMT_ENVCUBE_CLOUDS, default 0 (CryMT.cpp leaves them out).
+    static int EngineCubeCloudsBase()
+    {
+        static const int env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_ENVCUBE_CLOUDS", v, 8) ? (_wtoi(v) != 0 ? 1 : 0) : 0;
         }();
         return env;
     }
@@ -11964,9 +11986,14 @@ public:
              true, nullptr},
             {3, "Смешивание граней|Face blending", 0, 2, 1, true, cubeBlend, 0, nullptr, [] { return EngineCubeBlendIndex(EngineCubeBlend()); },
              [] { return EngineCubeBlendIndex(EngineCubeBlendBase()); }, [](int v) { g_giControl.envCubeBlend = v; }, true, nullptr},
-            {3, "Сущности и облака в кубкарте|Entities and clouds in the cube", 0, 1, 1, true, onOff, 0, nullptr,
+            {3, "Сущности в кубкарте|Entities in the cube", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.envCubeEntities; return v < 0 ? EngineCubeEntitiesBase() : v; }, [] { return EngineCubeEntitiesBase(); },
              [](int v) { g_giControl.envCubeEntities = v; }, true, nullptr},
+            // The clouds apart from the other entities (the user, 2026-11-14): off by default (cut at the faces' seams,
+            // drawn inside rooms).
+            {3, "Облака в кубкарте|Clouds in the cube", 0, 1, 1, true, onOff, 0, nullptr,
+             [] { const int v = g_giControl.envCubeClouds; return v < 0 ? EngineCubeCloudsBase() : v; }, [] { return EngineCubeCloudsBase(); },
+             [](int v) { g_giControl.envCubeClouds = v; }, true, nullptr},
             {3, "Нижняя грань кубкарты|Cube map down face", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.envCubeDown; return v < 0 ? EngineCubeDownBase() : v; }, [] { return EngineCubeDownBase(); },
              [](int v) { g_giControl.envCubeDown = v; }, true, nullptr},
@@ -14170,6 +14197,14 @@ void Device::PassName(const char* text)
         }
         m_engineCubePass = !end;
         m_psoDirty = true; // its culling (EngineCubeCull)
+        // The cube's slice the render ended in, for the face number its start mark gave: the culling per face goes by the
+        // slice (EngineCubeSlice).
+        if (end && m_engineCubeFace >= 0 && m_engineCubeLastFace >= 0)
+        {
+            if (g_cubeSliceOfMark[m_engineCubeFace] != m_engineCubeLastFace)
+                g_cubeSliceLearned++;
+            g_cubeSliceOfMark[m_engineCubeFace] = m_engineCubeLastFace;
+        }
         if (end && m_engineCubeLastFace >= 0 && (EngineCubeOn() || EnvEngineOn()))
         {
             PassName("CryMT cube HDR");
@@ -17140,6 +17175,9 @@ void Dx12WriteStats(FILE* f, double frames)
     fprintf(f, "  foliage mask: written in %llu frames; R32F draws with depth %.1f per frame, with SV_Target1 %.1f\n", static_cast<unsigned long long>(s.foliageFrames),
             s.zpassDraws / frames, s.zpassTarget1 / frames);
     fprintf(f, "  water SSR: depth pyramid built in %llu frames\n", static_cast<unsigned long long>(s.hizRuns));
+    fprintf(f, "  engine cube: the slice each face number of the start mark ends in (0-5): %d %d %d %d %d %d (changed %llu times)\n", g_cubeSliceOfMark[0],
+            g_cubeSliceOfMark[1], g_cubeSliceOfMark[2], g_cubeSliceOfMark[3], g_cubeSliceOfMark[4], g_cubeSliceOfMark[5],
+            static_cast<unsigned long long>(g_cubeSliceLearned));
     fprintf(f, "  engine environment cube: %llu draws into it (faces %llu %llu %llu %llu %llu %llu), its source let go as a target %llu times; HDR copy updates %llu\n",
             static_cast<unsigned long long>(s.engineCubeDraws), static_cast<unsigned long long>(s.engineCubeFaces[0]),
             static_cast<unsigned long long>(s.engineCubeFaces[1]), static_cast<unsigned long long>(s.engineCubeFaces[2]),

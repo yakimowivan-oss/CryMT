@@ -654,6 +654,27 @@ uint64_t g_mbGateForced; // frames the pass was let run below r_MotionBlur 3
 bool g_cubeRendering; // render thread, inside the cube's render call
 uint64_t g_cubeIdsRestored, g_cubeIdsOutside, g_cubeIdsOverflow;
 uint64_t g_cubeCamIndicesRestored, g_cubeProjectorsSeen; // EnvCubeUpdate: lights' camera indices (+0x200) the cube changed, put back; projector lights around its faces
+// LightCamTestHook: projector frustum tests whose camera was outside the 3D engine's light cameras (the camera-index
+// crash), all tests, and the first lights that had one.
+struct BadLightCam
+{
+    const uint8_t* light;
+    int index, listIndex, listRem, listCount, entity, camCount;
+    uint32_t flags, rndFlags;
+    float x, y, z, radius;
+    uint64_t frame;
+    bool render, cube;
+};
+uint64_t g_lightCamBad, g_lightCamTests;
+BadLightCam g_badLightCams[8];
+int g_badLightCamN;
+// CRYMT_CUBEDIFF: faces drawn per face index, and per 4-byte word of the 3D engine / the VisArea manager how many of
+// them changed it.
+uint32_t g_cubeDiffFaces[6], g_cubeDiffEngine[0x400][6], g_cubeDiffVam[0x100][6];
+uint32_t g_cubeDiffEngineVal[0x400][6][2], g_cubeDiffVamVal[0x100][6][2]; // the last change per face: before, after
+uint64_t g_cubeVisKept; // EnvCubeUpdate: the VisArea manager's words put back after a face
+bool g_cubeCloudsOff;       // EnvCubeUpdate: no clouds in this face (CloudRecursiveHook)
+uint64_t g_cubeCloudsSkipped; // CloudRecursiveHook: cloud draws left out of the cube's faces
 EngineLightState g_cubeLightsAfter;
 std::atomic<bool> g_cubeLightsAfterSet;
 uint64_t g_lateCallbacks;
@@ -1328,6 +1349,33 @@ void WriteStats()
                 static_cast<unsigned long long>(g_cubeIdsOverflow));
         fprintf(f, "engine cube: lights' camera indices (+0x200) put back %llu (projector lights in the level at its faces %llu)\n",
                 static_cast<unsigned long long>(g_cubeCamIndicesRestored), static_cast<unsigned long long>(g_cubeProjectorsSeen));
+        fprintf(f, "engine cube: the VisArea manager's words put back after a face %llu times; recursive cloud draws left out of its faces %llu\n",
+                static_cast<unsigned long long>(g_cubeVisKept), static_cast<unsigned long long>(g_cubeCloudsSkipped));
+        fprintf(f, "projector lights' frustum tests %llu, with a camera outside the 3D engine's light cameras %llu (taken as inside, the camera-index crash)\n",
+                static_cast<unsigned long long>(g_lightCamTests), static_cast<unsigned long long>(g_lightCamBad));
+        if (g_cubeDiffFaces[0] + g_cubeDiffFaces[1] + g_cubeDiffFaces[2] + g_cubeDiffFaces[3] + g_cubeDiffFaces[4] + g_cubeDiffFaces[5])
+        {
+            fprintf(f, "engine cube faces drawn per face 0-5: %u %u %u %u %u %u; words changed by a face (offset: per face):\n", g_cubeDiffFaces[0],
+                    g_cubeDiffFaces[1], g_cubeDiffFaces[2], g_cubeDiffFaces[3], g_cubeDiffFaces[4], g_cubeDiffFaces[5]);
+            for (int pass = 0; pass < 2; pass++)
+                for (int i = 0; i < (pass ? 0x100 : 0x400); i++)
+                {
+                    const uint32_t* c = pass ? g_cubeDiffVam[i] : g_cubeDiffEngine[i];
+                    const uint32_t(*v)[2] = pass ? g_cubeDiffVamVal[i] : g_cubeDiffEngineVal[i];
+                    if (c[0] + c[1] + c[2] + c[3] + c[4] + c[5])
+                        fprintf(f, "  %s+0x%03x: %u %u %u %u %u %u  last %x>%x %x>%x %x>%x %x>%x %x>%x %x>%x\n", pass ? "visareas" : "3d engine", i * 4, c[0],
+                                c[1], c[2], c[3], c[4], c[5], v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1], v[3][0], v[3][1], v[4][0], v[4][1],
+                                v[5][0], v[5][1]);
+                }
+        }
+        for (int i = 0; i < g_badLightCamN && i < 8; i++)
+        {
+            const BadLightCam& b = g_badLightCams[i];
+            fprintf(f, "  light %p: camera index %d (cameras %d), in the frame's list at %d (+%d bytes, count %d), light entity %d (render node flags %x), "
+                       "flags %x, at %.1f %.1f %.1f radius %.1f, frame %llu, %s thread, cube rendering %d\n",
+                    static_cast<const void*>(b.light), b.index, b.camCount, b.listIndex, b.listRem, b.listCount, b.entity, b.rndFlags, b.flags,
+                    b.x, b.y, b.z, b.radius, static_cast<unsigned long long>(b.frame), b.render ? "render" : "main", b.cube ? 1 : 0);
+        }
         fprintf(f, "engine cube and the 3D engine's lights: list moved %llu, counts changed %llu, light cameras moved %llu; main's scene found them changed since %llu\n",
                 static_cast<unsigned long long>(g_cubeLightsMoved), static_cast<unsigned long long>(g_cubeLightsCounted),
                 static_cast<unsigned long long>(g_cubeCamsMoved), static_cast<unsigned long long>(g_sceneAfterCubeDiff));
@@ -6328,8 +6376,12 @@ void EnvCubeUpdate()
         *nearPlane = !entities ? 0.25f : hiddenCount > 0 ? nearPlayerHidden : nearWithEntities;
     // No clouds in the cube (the user, 2026-11-14; they were drawn inside rooms too): the 3D engine's e_Clouds (its CVars
     // object k3DCVarsGlobal + 0x23C, an int registered at 0x3012F795, tools\prof\cvarfield.py) is 0 for the face's
-    // render, as the engine itself zeroes its cvars around a pass. CRYMT_ENVCUBE_CLOUDS=1 keeps them.
-    static const bool cloudsKept = EnvCubeSetting("CRYMT_ENVCUBE_CLOUDS", 0) != 0;
+    // render, as the engine itself zeroes its cvars around a pass. CRYMT_ENVCUBE_CLOUDS=1 / the panel's "Облака в
+    // кубкарте" keeps them. The user (2026-11-14) still saw clouds with the entities on: the renderer draws them in a
+    // recursive pass by CloudRecursiveHook's call, now left out for the cube's faces too (g_cubeCloudsOff).
+    static const int cloudsBase = EnvCubeSetting("CRYMT_ENVCUBE_CLOUDS", 0) != 0 ? 1 : 0;
+    const bool cloudsKept = (g_giControl.envCubeClouds >= 0 ? g_giControl.envCubeClouds.load() : cloudsBase) != 0;
+    g_cubeCloudsOff = !cloudsKept;
     const uintptr_t cvars3d = *reinterpret_cast<const uintptr_t*>(k3DCVarsGlobal);
     int* const clouds = cvars3d && !cloudsKept ? reinterpret_cast<int*>(cvars3d + 0x23C) : nullptr;
     const int cloudsWas = clouds ? *clouds : 0;
@@ -6341,9 +6393,76 @@ void EnvCubeUpdate()
         cloudsLogged = true;
         FocusLog("engine cube: clouds left out of the faces (e_Clouds %d outside them)", cloudsWas);
     }
+    // CRYMT_CUBEDIFF=1 (diagnostics, a lamp going out every 5th frame indoors, 2026-11-14): which words of the 3D engine
+    // (0x1000 bytes) and the VisArea manager (0x400) a face's render changes, counted per face (CubeDiffStats).
+    static const bool cubeDiff = EnvCubeSetting("CRYMT_CUBEDIFF", 0) != 0;
+    const int faceNow = *reinterpret_cast<const int*>(entry + 8);
+    static uint32_t engineBefore[0x400], vamBefore[0x100];
+    auto* const engineObj = *reinterpret_cast<uint32_t* const*>(k3DEngineGlobal);
+    auto* const vamObj = *reinterpret_cast<uint32_t* const*>(kVisAreaManagerGlobal);
+    if (cubeDiff && engineObj && vamObj)
+    {
+        memcpy(engineBefore, engineObj, sizeof(engineBefore));
+        memcpy(vamBefore, vamObj, sizeof(vamBefore));
+    }
+    // A lamp going out every 5th frame indoors (the user, 2026-11-14, village 1241 1551 106; with GI off too, not with
+    // the cube off): the cube draws 5 faces in turn (the down one rarely) and the faces that look out of a window change
+    // the VisArea manager's state (CRYMT_CUBEDIFF: +0x60 0 -> 1 on face 0 only, the count at +0x80 1 -> 2 / 4 and
+    // the flags at +0x88 on faces 0, 2, 4, +0x20 and +0x98 now and then). Main's next frame started from them: the sun
+    // came into its lights for that frame and the lamp went out. These words are put back as main left them after
+    // each face (CRYMT_ENVCUBE_KEEPVIS, a mask: 1 +0x60, 2 the others; 3 = both, the default): the lamp then holds
+    // (frame-to-frame spread on the wall 104 -> 0.09 of 255), the sun stays out. +0x60 alone did not help. Mask 4 / 8
+    // (the 3D engine's pointers at +0xC90 / +0xFE8 the faces change as well) crashed the game: not for use.
+    static const int keepVis = EnvCubeSetting("CRYMT_ENVCUBE_KEEPVIS", 3);
+    struct KeptWord
+    {
+        uint32_t* at;
+        uint32_t value;
+    };
+    KeptWord kept[16];
+    int keptCount = 0;
+    const auto keep = [&](uint32_t* base, int offset) {
+        if (base && keptCount < 16)
+            kept[keptCount++] = {base + offset / 4, base[offset / 4]};
+    };
+    if (keepVis & 1)
+        keep(vamObj, 0x60);
+    if (keepVis & 2)
+        for (int o : {0x20, 0x80, 0x88, 0x98})
+            keep(vamObj, o);
+    if (keepVis & 4)
+        for (int o : {0xC90, 0xC94, 0xC98, 0xC9C})
+            keep(engineObj, o);
+    if (keepVis & 8)
+        for (int o : {0xFE8, 0xFEC})
+            keep(engineObj, o);
     g_cubeRendering = true;
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, drawFlags, ~0ull, 0);
     g_cubeRendering = false;
+    for (int i = 0; i < keptCount; i++)
+        if (*kept[i].at != kept[i].value)
+        {
+            g_cubeVisKept++;
+            *kept[i].at = kept[i].value;
+        }
+    if (cubeDiff && engineObj && vamObj && faceNow >= 0 && faceNow < 6)
+    {
+        g_cubeDiffFaces[faceNow]++;
+        for (int i = 0; i < 0x400; i++)
+            if (engineObj[i] != engineBefore[i])
+            {
+                g_cubeDiffEngine[i][faceNow]++;
+                g_cubeDiffEngineVal[i][faceNow][0] = engineBefore[i];
+                g_cubeDiffEngineVal[i][faceNow][1] = engineObj[i];
+            }
+        for (int i = 0; i < 0x100; i++)
+            if (vamObj[i] != vamBefore[i])
+            {
+                g_cubeDiffVam[i][faceNow]++;
+                g_cubeDiffVamVal[i][faceNow][0] = vamBefore[i];
+                g_cubeDiffVamVal[i][faceNow][1] = vamObj[i];
+            }
+    }
     if (clouds)
         *clouds = cloudsWas;
     EnvCubeShowPlayer(hidden, hiddenCount);
@@ -8266,6 +8385,86 @@ bool RedirectCall(uintptr_t site, uintptr_t expectedTarget, const void* hook)
     return true;
 }
 
+// The camera-index crash (Cry3DEngine+0x19FF9 / +0x1A00C, main, 2026-11-13 .. 14): FUN_301020B0 builds an object's
+// light mask from a list of CDLight pointers; for a projector (DLF_PROJECT 0x40, a projected texture with flag bit 9)
+// it tests the object's box against the light's camera, the 3D engine's +0x7A8 array + 0x218 x the light's +0x200
+// (0x30102440), with FUN_300B4260 (0 outside, 1 partly, 2 inside). The user's fault 2026-11-14 17:04: the index was
+// -1 (cameras 2/3, the frame's list 2 lights, no cube face): a light the frame's light setup never numbered (0x300FDC01
+// writes +0x200 = the light's place in the list; the CDLight constructor -1). The read before the array is garbage
+// memory: a random answer (a lamp flickering frame to frame) or an access violation. The call at 0x30102466 now comes
+// here (rbx = the light, passed in r9 by the thunk): a camera outside the array counts as "inside" (the light's
+// sphere test still decides), and the first such lights are kept for the stats.
+constexpr uintptr_t kLightCamTestCall = 0x30102466, kLightCamTestFn = 0x300B4260;
+extern "C" uint8_t LightCamTestHook(const uint8_t* camera, const void* box, int arg, const uint8_t* light)
+{
+    g_lightCamTests++;
+    const auto* e = *reinterpret_cast<const uint8_t* const*>(k3DEngineGlobal);
+    const uint64_t cams = e ? *reinterpret_cast<const uint64_t*>(e + 0x7A8) : 0;
+    const int camCount = e ? *reinterpret_cast<const int*>(e + 0x7B0) : 0;
+    const int64_t off = static_cast<int64_t>(reinterpret_cast<uint64_t>(camera) - cams);
+    if (cams && off >= 0 && off % 0x218 == 0 && off / 0x218 < camCount)
+        return reinterpret_cast<uint8_t (*)(const uint8_t*, const void*, int)>(kLightCamTestFn)(camera, box, arg);
+    g_lightCamBad++;
+    bool known = false;
+    for (int i = 0; i < g_badLightCamN; i++)
+        known |= g_badLightCams[i].light == light;
+    if (!known && g_badLightCamN < 8 && light)
+    {
+        BadLightCam b = {};
+        b.light = light;
+        b.index = *reinterpret_cast<const int*>(light + 0x200);
+        b.camCount = camCount;
+        const uint64_t list = *reinterpret_cast<const uint64_t*>(e + 0x760);
+        b.listCount = *reinterpret_cast<const int*>(e + 0x768);
+        const int64_t inList = static_cast<int64_t>(reinterpret_cast<uint64_t>(light) - list);
+        b.listIndex = list && inList >= 0 && inList < 0x258 * 256 ? static_cast<int>(inList / 0x258) : -1;
+        b.listRem = b.listIndex >= 0 ? static_cast<int>(inList % 0x258) : 0;
+        b.entity = -1;
+        const auto* const* ents = *reinterpret_cast<const uint8_t* const* const*>(e + kEngineLightEntities);
+        const int nents = *reinterpret_cast<const int*>(e + kEngineLightEntities + 8);
+        for (int i = 0; ents && i < nents && i < 4096; i++)
+            if (ents[i] && ents[i] + kLightEntityLight == light)
+            {
+                b.entity = i;
+                b.rndFlags = *reinterpret_cast<const uint32_t*>(ents[i] + kRenderNodeFlags);
+            }
+        b.flags = *reinterpret_cast<const uint32_t*>(light + kLightFlags);
+        b.x = *reinterpret_cast<const float*>(light + 4);
+        b.y = *reinterpret_cast<const float*>(light + 8);
+        b.z = *reinterpret_cast<const float*>(light + 0xC);
+        b.radius = *reinterpret_cast<const float*>(light + 0x50);
+        b.frame = g_frame;
+        b.render = GetCurrentThreadId() == g_rtTid;
+        b.cube = g_cubeRendering;
+        g_badLightCams[g_badLightCamN++] = b;
+    }
+    return 2;
+}
+// Clouds in a recursive pass (the planar water reflection, the engine cube): CRECloud's draw (FUN_3807E4E0) calls
+// FUN_3807BEE0 ("Cloud_Recursive", per face camera) at 0x3807E5D3 when the recursion level is above 1; the return is
+// not used there. Left out while a cube face renders without clouds (EnvCubeUpdate, the render thread).
+constexpr uintptr_t kCloudRecursiveCall = 0x3807E5D3, kCloudRecursiveFn = 0x3807BEE0;
+uint64_t CloudRecursiveHook(void* a, void* b, void* c, void* d)
+{
+    if (g_cubeRendering && g_cubeCloudsOff && GetCurrentThreadId() == g_rtTid)
+    {
+        g_cubeCloudsSkipped++;
+        return 0;
+    }
+    return reinterpret_cast<uint64_t (*)(void*, void*, void*, void*)>(kCloudRecursiveFn)(a, b, c, d);
+}
+
+extern "C" void LightCamTestThunk();
+asm(R"(
+.intel_syntax noprefix
+.text
+.globl LightCamTestThunk
+LightCamTestThunk:
+    mov r9, rbx
+    jmp LightCamTestHook
+.att_syntax prefix
+)");
+
 void PatchRenderSceneVtable(uintptr_t base)
 {
     const bool gc1 = RedirectCall(kTerrainUnloadCall, kTerrainUnloadFn, reinterpret_cast<const void*>(&DeferTerrainUnload));
@@ -9057,6 +9256,13 @@ void RunTestCommands()
         g_giControl.waterSky = static_cast<float>(atof(command + 15));
         g_giControl.active = true;
         FocusLog("frame %llu: water sky %.2f", static_cast<unsigned long long>(g_frame), g_giControl.waterSky.load());
+        return;
+    }
+    if (_strnicmp(command, "crymt_envcubeclouds ", 20) == 0) // clouds in the engine cube 1 / 0
+    {
+        g_giControl.envCubeClouds = atoi(command + 20) != 0 ? 1 : 0;
+        g_giControl.active = true;
+        FocusLog("frame %llu: engine cube clouds %d", static_cast<unsigned long long>(g_frame), g_giControl.envCubeClouds.load());
         return;
     }
     if (_strnicmp(command, "crymt_sssweapon ", 16) == 0) // the panel's list index: 0.5% 2% 5% 10% 20%
@@ -10299,6 +10505,13 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
         // dead emitters while the flush builds their vertices (crashed on a null container parameter block in
         // fill mode); clouds and volume objects are only moved there. Particle destruction is deferred.
         PatchParticleDelete();
+        SetupLog(RedirectCall(kCloudRecursiveCall, kCloudRecursiveFn, reinterpret_cast<const void*>(&CloudRecursiveHook))
+                     ? "recursive cloud draw checked (no clouds in the engine cube)"
+                     : "recursive cloud draw site mismatch, clouds may show in the engine cube");
+        if (EnvCubeSetting("CRYMT_LIGHTCAMCHECK", 1) != 0) // 0: the engine's own test (A/B)
+            SetupLog(RedirectCall(kLightCamTestCall, kLightCamTestFn, reinterpret_cast<const void*>(&LightCamTestThunk))
+                         ? "projector lights' camera test checked (camera-index crash)"
+                         : "projector lights' camera test site mismatch, not checked");
         if (g_fillOn && !RedirectCall(kRenderInnerCall, kRenderInnerFn, reinterpret_cast<const void*>(&RenderInnerHook)))
             SetupLog("fill window: render inner call not hooked");
         SetupLog(PatchMaterialRefCount() ? "material reference counts made atomic" : "material reference count code differs, not patched");
