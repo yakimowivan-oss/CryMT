@@ -653,6 +653,7 @@ bool g_mbGateOn;
 uint64_t g_mbGateForced; // frames the pass was let run below r_MotionBlur 3
 bool g_cubeRendering; // render thread, inside the cube's render call
 uint64_t g_cubeIdsRestored, g_cubeIdsOutside, g_cubeIdsOverflow;
+uint64_t g_cubeCamIndicesRestored, g_cubeProjectorsSeen; // EnvCubeUpdate: lights' camera indices (+0x200) the cube changed, put back; projector lights around its faces
 EngineLightState g_cubeLightsAfter;
 std::atomic<bool> g_cubeLightsAfterSet;
 uint64_t g_lateCallbacks;
@@ -1325,6 +1326,8 @@ void WriteStats()
         fprintf(f, "engine cube: light ids put back after its EF_ADDDlight %llu (lights outside the 3D engine's list %llu, overflow %llu)\n",
                 static_cast<unsigned long long>(g_cubeIdsRestored), static_cast<unsigned long long>(g_cubeIdsOutside),
                 static_cast<unsigned long long>(g_cubeIdsOverflow));
+        fprintf(f, "engine cube: lights' camera indices (+0x200) put back %llu (projector lights in the level at its faces %llu)\n",
+                static_cast<unsigned long long>(g_cubeCamIndicesRestored), static_cast<unsigned long long>(g_cubeProjectorsSeen));
         fprintf(f, "engine cube and the 3D engine's lights: list moved %llu, counts changed %llu, light cameras moved %llu; main's scene found them changed since %llu\n",
                 static_cast<unsigned long long>(g_cubeLightsMoved), static_cast<unsigned long long>(g_cubeLightsCounted),
                 static_cast<unsigned long long>(g_cubeCamsMoved), static_cast<unsigned long long>(g_sceneAfterCubeDiff));
@@ -6283,6 +6286,40 @@ void EnvCubeUpdate()
     D3DLayerPassName(cubeMark);
     const EngineLightState lightsIn = ReadEngineLights();
     g_cubeLightIdCount = 0;
+    // ROOT CAUSE of the camera-index crashes (Cry3DEngine+0x19FF9 / +0x1A00C, the user's game 2026-11-14 05:59 and four
+    // more since 2026-11-13): main's per-object light test (0x30102440) indexes the 3D engine's light cameras (+0x7A8, 0x218
+    // bytes each) by a CDLight's +0x200, which the light camera setup (0x30102F3E) writes for the lights a pass handles.
+    // The cube's RenderWorld on the render thread runs that setup too and leaves its indices in lights main's octree
+    // still lists but does not set up again (out of view), so main read a camera past its own array. The same shape as
+    // the 0x1B ids above: each light's +0x200 (every light entity's CDLight, entity +0x38, and the frame's list) is kept
+    // before the face and put back after it.
+    struct CamIndex
+    {
+        int* at;
+        int value;
+    };
+    static std::vector<CamIndex> camIndices;
+    camIndices.clear();
+    if (const auto* engine3d = *reinterpret_cast<const uint8_t* const*>(k3DEngineGlobal))
+    {
+        const auto* const* ents = *reinterpret_cast<const uint8_t* const* const*>(engine3d + kEngineLightEntities);
+        const int nents = *reinterpret_cast<const int*>(engine3d + kEngineLightEntities + 8);
+        for (int i = 0; ents && i < nents && i < 4096; i++)
+            if (ents[i])
+            {
+                auto* at = const_cast<int*>(reinterpret_cast<const int*>(ents[i] + kLightEntityLight + 0x200));
+                camIndices.push_back({at, *at});
+                // Projectors (DLF_PROJECT 0x40: the only lights with a camera there; a flashlight, headlights, a lamp
+                // with a texture): counted, so the stats tell whether a run had any for this to matter.
+                if (*reinterpret_cast<const uint32_t*>(ents[i] + kLightEntityLight + kLightFlags) & 0x40)
+                    g_cubeProjectorsSeen++;
+            }
+        for (int i = 0; lightsIn.list && i < lightsIn.count && i < 256; i++)
+        {
+            auto* at = reinterpret_cast<int*>(lightsIn.list + static_cast<uint64_t>(i) * 0x258 + 0x200);
+            camIndices.push_back({at, *at});
+        }
+    }
     if (EnvCubeOwnFrame())
         ++*reinterpret_cast<volatile int*>(renderer + kFrameIdAllOffset); // the cube's own frame id (EnvCubeOwnFrame)
     CubeHiddenNode hidden[3];
@@ -6335,6 +6372,13 @@ void EnvCubeUpdate()
         }
         *r.light = r.id;
     }
+    // The lights' camera indices as main left them (see camIndices above).
+    for (auto it = camIndices.rbegin(); it != camIndices.rend(); ++it)
+        if (*it->at != it->value)
+        {
+            g_cubeCamIndicesRestored++;
+            *it->at = it->value;
+        }
     const EngineLightState lightsOut = ReadEngineLights();
     {
         const bool moved = lightsOut.list != lightsIn.list, counted = lightsOut.count != lightsIn.count || lightsOut.total != lightsIn.total,
@@ -8092,6 +8136,20 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     const CONTEXT& c = *info->ContextRecord;
     fprintf(f, "  rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx\n  r8=%llx r9=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
             c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.R8, c.R9, c.R12, c.R13, c.R14, c.R15);
+    // The camera-index crash (the frustum test at 0x30019FF0 given a light's camera, rcx = the 3D engine's light cameras
+    // + 0x218 x the light's +0x200, 0x30102440): the cameras' and lights' arrays now, the camera's index, the cube's state.
+    if (c.Rip >= 0x30019FF0 && c.Rip < 0x3001A100)
+    {
+        const EngineLightState s = ReadEngineLights();
+        const int64_t off = s.cams ? static_cast<int64_t>(c.Rcx - s.cams) : 0;
+        fprintf(f, "  light camera test: cameras %llx %d/%d, this camera's index %lld (offset %% 0x218 = %lld), lights %llx %d/%d (+%d, %d), "
+                   "cube rendering %d, cube faces %llu, cube changed lights %llu / cameras %llu, camera indices put back %llu, projectors %llu\n",
+                static_cast<unsigned long long>(s.cams), s.camCount, s.camCapacity, static_cast<long long>(off / 0x218),
+                static_cast<long long>(off % 0x218), static_cast<unsigned long long>(s.list), s.count, s.capacity, s.added, s.total,
+                g_cubeRendering ? 1 : 0, static_cast<unsigned long long>(g_envCubeFaces), static_cast<unsigned long long>(g_cubeLightsCounted),
+                static_cast<unsigned long long>(g_cubeCamsMoved), static_cast<unsigned long long>(g_cubeCamIndicesRestored),
+                static_cast<unsigned long long>(g_cubeProjectorsSeen));
+    }
     PrintUnwound(f, *info->ContextRecord);
     if (tid == g_rtTid && g_mainThread)
     {
