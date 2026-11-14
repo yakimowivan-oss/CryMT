@@ -410,6 +410,7 @@ uint64_t g_cubeShadowListsKept, g_cubeShadowListsLost; // EnvCubeUpdate: shadow 
 uint64_t g_particleSoundSkipped; // ParticleSoundHook: particle sound updates left to main
 uint64_t g_cubeIdsAllRestored;   // EnvCubeUpdate: light ids (+0) put back after a face beyond its EF_ADDDlight ones
 uint64_t g_renderSysEventSyncs;  // RenderSysEventHook: renderer system events on main with the render thread made idle
+uint64_t g_renderSysEvents[32];  // ... all of them on main, by event (31: 31 and above)
 uint64_t g_cubeGsmChanged;       // EnvCubeUpdate: light entities' shadow frustum pointers a face changed
 const volatile uint64_t* g_nullFrustumsSkipped; // PatchNoNullFrustums: the cave's counter of null cascades left out
 const volatile uint64_t* g_nullShadowLights;    // PatchNullShadowLights: lights past the frame's list left out of masks
@@ -1082,7 +1083,12 @@ void WriteStats()
                 static_cast<unsigned long long>(g_cubeShadowListsKept), static_cast<unsigned long long>(g_cubeShadowListsLost));
         fprintf(f, "particle sound updates skipped on the render thread (left to main) %llu\n", static_cast<unsigned long long>(g_particleSoundSkipped));
         fprintf(f, "engine cube: light ids (+0) put back after a face beyond its own EF_ADDDlight's %llu\n", static_cast<unsigned long long>(g_cubeIdsAllRestored));
-        fprintf(f, "renderer system events on main with the render thread made idle first %llu\n", static_cast<unsigned long long>(g_renderSysEventSyncs));
+        fprintf(f, "renderer system events on main with the render thread made idle first %llu; all on main by event:",
+                static_cast<unsigned long long>(g_renderSysEventSyncs));
+        for (int k = 0; k < 32; k++)
+            if (g_renderSysEvents[k])
+                fprintf(f, " %d%s %llu", k, k == 31 ? "+" : "", static_cast<unsigned long long>(g_renderSysEvents[k]));
+        fprintf(f, "\n");
         fprintf(f, "engine cube: light entities' shadow frustum pointers changed by its faces %llu\n", static_cast<unsigned long long>(g_cubeGsmChanged));
         fprintf(f, "shadow frustum lists: lights past the frame's list left out %llu\n",
                 static_cast<unsigned long long>(g_nullShadowLights ? *g_nullShadowLights : 0));
@@ -8139,25 +8145,29 @@ bool PatchNullShadowLights()
         cave = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
     if (!cave)
         return false;
+    // The entity's shadow info (+0x2D0, the cascades the frustum list reads next) is checked too: null there crashed
+    // main in PatchNoNullFrustums's cave (harbor 2026-11-15 frame 511, with CRYMT_SYSEVENTSYNC=2).
     static const uint8_t kCave[] = {
         0x48, 0x85, 0xC0,                         // 0: test rax, rax
-        0x74, 0x1D,                               // 3: jz 34
+        0x74, 0x27,                               // 3: jz 44
         0x48, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, // 5: mov rcx, [rax + 0x90]
         0x48, 0x85, 0xC9,                         // 12: test rcx, rcx
-        0x74, 0x11,                               // 15: jz 34
-        0x8B, 0x43, 0x08,                         // 17: mov eax, [rbx + 8]
-        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 20: jmp [rip] -> kShadowLightUseEnd (at 26)
-        0, 0, 0, 0, 0, 0, 0, 0,                   // 26
-        0x48, 0xFF, 0x05, 0x17, 0x00, 0x00, 0x00, // 34: inc qword [rip + 0x17] (the counter at 64)
-        0xBD, 0x01, 0x00, 0x00, 0x00,             // 41: mov ebp, 1
-        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 46: jmp [rip] -> kShadowLightNextBit (at 52)
+        0x74, 0x1B,                               // 15: jz 44
+        0x48, 0x83, 0xB9, 0xD0, 0x02, 0x00, 0x00, 0x00, // 17: cmp qword [rcx + 0x2D0], 0
+        0x74, 0x11,                               // 25: jz 44
+        0x8B, 0x43, 0x08,                         // 27: mov eax, [rbx + 8]
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 30: jmp [rip] -> kShadowLightUseEnd (at 36)
+        0, 0, 0, 0, 0, 0, 0, 0,                   // 36
+        0x48, 0xFF, 0x05, 0x15, 0x00, 0x00, 0x00, // 44: inc qword [rip + 0x15] (the counter at 72)
+        0xBD, 0x01, 0x00, 0x00, 0x00,             // 51: mov ebp, 1
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 56: jmp [rip] -> kShadowLightNextBit (at 62)
     };
     memcpy(cave, kCave, sizeof(kCave));
     const uint64_t back = kShadowLightUseEnd, next = kShadowLightNextBit;
-    memcpy(cave + 26, &back, 8);
-    memcpy(cave + 52, &next, 8);
-    memset(cave + 64, 0, 8);
-    g_nullShadowLights = reinterpret_cast<const volatile uint64_t*>(cave + 64);
+    memcpy(cave + 36, &back, 8);
+    memcpy(cave + 62, &next, 8);
+    memset(cave + 72, 0, 8);
+    g_nullShadowLights = reinterpret_cast<const volatile uint64_t*>(cave + 72);
     uint8_t patch[10];
     memset(patch, 0x90, sizeof(patch));
     patch[0] = 0xE9;
@@ -8192,21 +8202,23 @@ bool PatchNoNullFrustums()
     if (!cave)
         return false;
     static const uint8_t kCave[] = {
-        0x49, 0x8B, 0x04, 0xC4,                   // 0: mov rax, [r12 + rax*8]
-        0xBD, 0x01, 0x00, 0x00, 0x00,             // 4: mov ebp, 1
-        0x48, 0x85, 0xC0,                         // 9: test rax, rax
-        0x75, 0x09,                               // 12: jnz 23
-        0x48, 0xFF, 0x05, 0x1B, 0x00, 0x00, 0x00, // 14: inc qword [rip + 0x1B] (the counter at 48)
-        0xEB, 0x08,                               // 21: jmp 31
-        0x48, 0x89, 0x04, 0xD1,                   // 23: mov [rcx + rdx*8], rax
-        0x83, 0x43, 0x08, 0x01,                   // 27: add dword [rbx + 8], 1
-        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 31: jmp [rip + 0] -> kFrustumListAppendEnd (at 37)
+        0xBD, 0x01, 0x00, 0x00, 0x00,             // 0: mov ebp, 1 (rax, the index, was taken from it before)
+        0x4D, 0x85, 0xE4,                         // 5: test r12, r12 (the entity's cascades: null crashed, 2026-11-15)
+        0x74, 0x09,                               // 8: jz 19
+        0x49, 0x8B, 0x04, 0xC4,                   // 10: mov rax, [r12 + rax*8]
+        0x48, 0x85, 0xC0,                         // 14: test rax, rax
+        0x75, 0x09,                               // 17: jnz 28
+        0x48, 0xFF, 0x05, 0x1E, 0x00, 0x00, 0x00, // 19: inc qword [rip + 0x1E] (the counter at 56)
+        0xEB, 0x08,                               // 26: jmp 36
+        0x48, 0x89, 0x04, 0xD1,                   // 28: mov [rcx + rdx*8], rax
+        0x83, 0x43, 0x08, 0x01,                   // 32: add dword [rbx + 8], 1
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 36: jmp [rip + 0] -> kFrustumListAppendEnd (at 42)
     };
     memcpy(cave, kCave, sizeof(kCave));
     const uint64_t back = kFrustumListAppendEnd;
-    memcpy(cave + 37, &back, 8);
-    memset(cave + 48, 0, 8);
-    g_nullFrustumsSkipped = reinterpret_cast<const volatile uint64_t*>(cave + 48);
+    memcpy(cave + 42, &back, 8);
+    memset(cave + 56, 0, 8);
+    g_nullFrustumsSkipped = reinterpret_cast<const volatile uint64_t*>(cave + 56);
     DWORD old;
     VirtualProtect(cave, 4096, PAGE_EXECUTE_READWRITE, &old); // the counter is written from the cave
     uint8_t patch[17];
@@ -8226,12 +8238,22 @@ bool PatchNoNullFrustums()
 // waiting in the NVIDIA driver. Main's path: CryNetwork -> CryAction -> CrySystem's event dispatch (+0x40F62) -> the
 // renderer's CSystemEventListner_Render::OnSystemEvent (vtable 0x38256B40 slot 0, 0x380E7FA0) -> texture loading
 // (FUN_3813A440 .. FUN_380D08C0): D3D calls on main, beside CryMT's queue. The render thread is now idle first (as for
-// the other direct calls; CRYMT_SYSEVENTSYNC=0: not).
+// the other direct calls; CRYMT_SYSEVENTSYNC=0: not). The listener handles only events 10, 12, 13, 14 (the texture
+// loading above) and 15, any other returns at once (0x380E7FB1..0x380E7FDB); but event 1 comes on main every frame and
+// the wait for it cost harbor ~6 ms a frame (2026-11-15: 55 FPS, main waiting at 296 in 1254 of 1500 frames). So only
+// the handled events wait (CRYMT_SYSEVENTSYNC=2, the default; 1 all of them as before): harbor 66 FPS. That wait had
+// hidden a race: without it main crashed once in harbor (frame 511) in PatchNoNullFrustums's cave, a light entity's
+// shadow info (+0x2D0) null; both caves leave such a light out now (harbor, fleet, village: no crash, 3-4 left out).
 constexpr uintptr_t kRenderSysEventVtable = 0x38256B40;
 void (*g_origRenderSysEvent)(void*, int, uintptr_t, uintptr_t);
+bool g_sysEventSyncAll = false; // CRYMT_SYSEVENTSYNC 1 (all events) / 2 (the handled ones only, the default)
 void RenderSysEventHook(void* self, int event, uintptr_t wparam, uintptr_t lparam)
 {
-    const bool sync = g_async && GetCurrentThreadId() == g_mainThread;
+    const bool main = GetCurrentThreadId() == g_mainThread;
+    if (main)
+        g_renderSysEvents[event >= 0 && event < 31 ? event : 31]++;
+    const bool handled = g_sysEventSyncAll || event == 10 || (event >= 12 && event <= 15);
+    const bool sync = handled && g_async && main;
     if (sync)
     {
         WaitIdlePublic(296);
@@ -10214,7 +10236,8 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
     {
         PatchDxgi(reinterpret_cast<uintptr_t>(GetModuleHandleW(L"dxgi.dll")));
         TryPatchRenderer(reinterpret_cast<uintptr_t>(data->base));
-        if (g_mode == 2 && EnvCubeSetting("CRYMT_SYSEVENTSYNC", 1) != 0)
+        g_sysEventSyncAll = EnvCubeSetting("CRYMT_SYSEVENTSYNC", 2) == 1;
+        if (g_mode == 2 && EnvCubeSetting("CRYMT_SYSEVENTSYNC", 2) != 0)
             PatchVtableSlot(kRenderSysEventVtable, 0, reinterpret_cast<uintptr_t*>(&g_origRenderSysEvent), reinterpret_cast<const void*>(&RenderSysEventHook));
         if (g_censusOn)
             InstallCensus();
