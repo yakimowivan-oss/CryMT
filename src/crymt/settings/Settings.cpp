@@ -1001,6 +1001,64 @@ std::string Crlf(const std::string& s)
     return out;
 }
 
+// CryMT volumetric fog, stage 1: the GI in the engine's fog (PostProcess.cfx FogPass; 2026-11-14). The engine's fog lights
+// all air alike, so it glowed in dark rooms and in the shade. CryMT's D3D12 back end gives, in place of
+// Textures/CryMT/vfog.dds (a 4x1x2 volume of zeros), a volume over the screen: 16-pixel tiles, 64 slices to 64 m (slice k
+// ending at 64 ((k + 1) / 64)^2 m), per slice 1 minus the light's visibility from the camera to its far end, weighted by
+// where the fog scatters along the ray (the engine's own fog formula): rgb the fog colour's part (the GI's ambient loss
+// and tint), a the sun's part (the Mie and Rayleigh haze; the voxels' sun indoors). The fog keeps its amount (the scene's
+// attenuation is the engine's); only its colour is darkened by that visibility up to 64 m, the rest of the ray as before.
+// The placeholder's zeros give the engine's fog exactly. The pixel shader is renamed so no cached build of the old one
+// (ShaderCache.pak) is used.
+const char* const kVFogDecl = R"(// CryMT: the GI in the fog (see CryMT_VFog)
+#if D3D10
+sampler3D CryMT_VFogSampler = sampler_state
+{
+  Texture = Textures/CryMT/vfog.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+  AddressW = Clamp;
+};
+
+void CryMT_VFog(float2 tc, float3 cameraToWorldPos, float sceneDepth, inout half4 localFogColor)
+{
+  float dist = length(cameraToWorldPos);
+  float reach = min(dist, 64.0);
+  float tFull = ComputeVolumetricFog(cameraToWorldPos);
+  float tNear = ComputeVolumetricFog(cameraToWorldPos * (reach / max(dist, 0.001)));
+  float slice = sqrt(reach / 64.0) * 64.0;
+  float4 loss = tex3Dlod(CryMT_VFogSampler, float4(tc, (slice - 0.5) / 64.0, 0));
+  float4 vis = ((1 - loss) * (1 - tNear) + (tNear - tFull)) / max(1 - tFull, 0.00001);
+#if %_RT_SKYLIGHT_BASED_FOG
+  float3 skyDir = normalize(cameraToWorldPos);
+  float cosine = -dot(slSunDirection, skyDir);
+  float cosine2 = cosine * cosine;
+  float miePhase = (1.0 + cosine2) * pow(slPhaseFunctionConstants.y + slPhaseFunctionConstants.x * cosine, -1.5);
+  float rayleighPhase = 0.75 * (1.0 + cosine2);
+  float3 sunPart = slHazeColPartialMieInScatter * miePhase * saturate((sceneDepth - 1) * tFull) + slHazeColPartialRayleighInScatter * rayleighPhase;
+  float3 fogColor = sunPart * vis.a + vfFogColor.xyz * vis.rgb;
+  #if %_RT_HDR_MODE
+  fogColor = min(fogColor, (float3)16384.0);
+  #else
+  fogColor = 1 - exp(-1 * fogColor);
+  #endif
+#else
+  float3 fogColor = vfFogColor.xyz * vis.rgb;
+#endif
+  localFogColor.xyz = fogColor;
+}
+#else
+void CryMT_VFog(float2 tc, float3 cameraToWorldPos, float sceneDepth, inout half4 localFogColor)
+{
+}
+#endif
+
+)";
+
+const wchar_t* kPostProcess = L"Shaders\\HWScripts\\CryFX\\PostProcess.cfx";
 const wchar_t* kFragLib = L"Shaders\\HWScripts\\CryFX\\fragLib.cfi";
 const wchar_t* kTerrain = L"Shaders\\HWScripts\\CryFX\\Terrain.cfx";
 const wchar_t* kShadowMask = L"Shaders\\HWScripts\\CryFX\\ShadowMaskGen.cfx";
@@ -1151,14 +1209,14 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi Shaders/HWScripts/CryFX/PostProcess.cfx"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
                 particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal)),
                 vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater)),
                 waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols)), modificator = Lf(ReadAll(tmp + L"\\" + kModificator)),
-                motionBlur = Lf(ReadAll(tmp + L"\\" + kMotionBlurPass));
+                motionBlur = Lf(ReadAll(tmp + L"\\" + kMotionBlurPass)), postProcess = Lf(ReadAll(tmp + L"\\" + kPostProcess));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
@@ -1266,6 +1324,15 @@ std::wstring InstallGi()
                             "    VertexShader = compile vs_Auto CryMT_MotionBlurPassVS() MotionBlurVS;\n") &&
                     Replace(motionBlur, "    PixelShader = compile ps_Auto Common_MotionBlurPassPS() MotionBlurPS;\n",
                             "    PixelShader = compile ps_Auto CryMT_MotionBlurPassPS() MotionBlurPS;\n") &&
+                    // The GI in the fog (kVFogDecl): the fog pass's colour darkened by the back end's volume.
+                    Replace(postProcess, "void FogPassCommon (in vert2fragFog IN, out half sceneDepth, out half4 localFogColor, out half3 worldPos, out half3 cameraToWorldPos)\n",
+                            std::string(kVFogDecl) + "void FogPassCommon (in vert2fragFog IN, out half sceneDepth, out half4 localFogColor, out half3 worldPos, out half3 cameraToWorldPos)\n") &&
+                    Replace(postProcess, "pixout FogPassPS(vert2fragFog IN)\n", "pixout CryMT_FogPassPS(vert2fragFog IN)\n") &&
+                    Replace(postProcess, "\tFogPassCommon(IN, sceneDepth, localFogColor, worldPos, cameraToWorldPos);\n\t\n\tlocalFogColor.a = 1.0 - localFogColor.a;\n",
+                            "\tFogPassCommon(IN, sceneDepth, localFogColor, worldPos, cameraToWorldPos);\n"
+                            "\tCryMT_VFog(IN.baseTC.xy, cameraToWorldPos, sceneDepth, localFogColor); // CryMT: the GI in the fog\n"
+                            "\t\n\tlocalFogColor.a = 1.0 - localFogColor.a;\n") &&
+                    Replace(postProcess, "    PixelShader = compile PROFILE_PS FogPassPS();\n", "    PixelShader = compile PROFILE_PS CryMT_FogPassPS();\n") &&
                     // The bending can be asked for an earlier time (default 0: every other caller as before).
                     Replace(modificator, "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams)",
                             "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams, float fTimeShift = 0)") &&
@@ -1338,6 +1405,13 @@ std::wstring InstallGi()
     memset(&sss[132], 0, 4);
     sss[133] = sss[135] = 0x5C;
     // The environment reflection's placeholder: a 4x4 cube (A8R8G8B8, 6 faces), black; face 0's second texel E7000000.
+    // The GI in the fog's placeholder: a 4x1x2 volume (A8R8G8B8), all zero (the engine's fog as it is).
+    std::string vfog(128 + 32, '\0');
+    const unsigned int vheader[] = {0x20534444, 124, 0x80100F, 1, 4, 16, 2, 1}; // + DDSD_DEPTH; depth 2
+    memcpy(&vfog[0], vheader, sizeof(vheader));
+    memcpy(&vfog[76], pf, sizeof(pf));
+    const unsigned int vcaps[] = {0x1008, 0x200000}; // complex texture; volume
+    memcpy(&vfog[108], vcaps, sizeof(vcaps));
     std::string env(128 + 6 * 64, '\0');
     const unsigned int eheader[] = {0x20534444, 124, 0x100F, 4, 4, 16, 0, 1};
     memcpy(&env[0], eheader, sizeof(eheader));
@@ -1356,6 +1430,8 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/WaterVols.cfx", Crlf(waterVols)},
                               {"Shaders/HWScripts/CryFX/ModificatorVT.cfi", Crlf(modificator)},
                               {"Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi", Crlf(motionBlur)},
+                              {"Shaders/HWScripts/CryFX/PostProcess.cfx", Crlf(postProcess)},
+                              {"Textures/CryMT/vfog.dds", vfog},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/hiz.dds", hiz},
                               {"Textures/CryMT/env.dds", env},

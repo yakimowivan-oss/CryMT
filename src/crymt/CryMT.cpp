@@ -9753,7 +9753,8 @@ void RunTestCommands()
         return;
     }
     // crymt_gictl <name> <value> (tests that switch the GI's parts within one run, as the panel does): gi 0/1, gtao 0/1,
-    // contact 0/1/2, probes 0/1/2, geometry 0/1/2, env 0/1, envall 0/1, dirlight 0/1/2, occlusion / bounce (factors).
+    // contact 0/1/2, probes 0/1/2, geometry 0/1/2, env 0/1, envall 0/1, dirlight 0/1/2, occlusion / bounce (factors),
+    // vfog 0/1/2, vfoggi (factor).
     if (_strnicmp(command, "crymt_gictl ", 12) == 0)
     {
         char name[32] = {};
@@ -9782,6 +9783,10 @@ void RunTestCommands()
                 g_giControl.occlusionScale = value;
             else if (_stricmp(name, "bounce") == 0)
                 g_giControl.bounceScale = value;
+            else if (_stricmp(name, "vfog") == 0) // the GI in the fog: 0 off, 1 on, 2 a zero volume (the engine's fog)
+                g_giControl.vfog = v;
+            else if (_stricmp(name, "vfoggi") == 0) // ... its strength (factor)
+                g_giControl.vfogGi = static_cast<int>(value * 100.0f + 0.5f);
             else
                 known = false;
             g_giControl.active = true;

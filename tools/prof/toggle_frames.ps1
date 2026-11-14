@@ -3,7 +3,9 @@
 # logs\spot\<Tag>_<step>_c<k>.ppm. Steps "name=cmd1,cmd2|name2=...". -Pre runs once the level is up.
 #   powershell -File tools\prof\toggle_frames.ps1 -Steps 'on=crymt_contact 2|off=crymt_contact 0|on2=crymt_contact 2'
 #     -Pre 'e_wind 0;e_vegetation_bending 0;e_vegetation_wind 0' -Tag tg
-param([string]$Map = 'village', [string]$Pos = '1146 592 123', [string]$Angles = '-18 38', [int]$Time = 10, [string]$Tag = 'tg',
+# -Time in hours, fractions too ('9.5' = 9:30): CryMT sets it (CRYMT_GI_STARTTIME) at frame 300, over an e_time_of_day
+# in -Pre (2026-11-14: a Pre of 9.5 under -Time 9 ended at 9:00).
+param([string]$Map = 'village', [string]$Pos = '1146 592 123', [string]$Angles = '-18 38', [string]$Time = '10', [string]$Tag = 'tg',
       [string[]]$Steps = @('on=crymt_contact 2|off=crymt_contact 0'), [string]$Pre = '', [int]$Frames = 10, [int]$Wait = 3,
       [string]$Variant = 'can0', [int]$Width = 2560, [int]$Height = 1440)
 Set-Location D:\Games\Crysis-RE

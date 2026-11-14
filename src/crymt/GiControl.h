@@ -26,6 +26,8 @@ struct GiControl
                                     // the cones' occlusion; -1 as CRYMT_GI_PROBES
     std::atomic<int> probePrecise{-1}; // the probes' rays: 0 fast, 1 precise (as before the speed-ups); -1 as CRYMT_GI_PROBEPRECISE
     std::atomic<int> particles{-1}; // blended particles (smoke, dust) take the GI 1 / 0
+    std::atomic<int> vfog{-1};      // the GI in the engine's fog 1 / 0 (2: a zero volume, the engine's fog); -1 as CRYMT_VFOG
+    std::atomic<int> vfogGi{-1};    // ... its strength, percent; -1 as CRYMT_VFOG_GI
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> dlssPreset{-1}; // the DLAA model, the panel's list index (K J L M F E); -1 as CRYMT_DLSS_PRESET
     std::atomic<int> dlssCompare{-1}; // a second DLAA model for the right half of the screen (same index), -1 off
