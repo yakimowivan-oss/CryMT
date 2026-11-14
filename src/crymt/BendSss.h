@@ -485,6 +485,12 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
   [branch] if (WeaponThickness != SurfaceThickness && CryHwDepth.Load(int3((int2)write_xy, 0)) < 0.1)
     result = min(result, Visibility(start_depth, min(sample_distance[0] + direction, 1.0 / WeaponThickness) * scale_base, sample_index));
 
+  // CryMT: skin (HumanSkin's z-prepass marks it 0.3 in the foliage mask) receives none for now (the user, 2026-11-15:
+  // to be reworked later); it still casts.
+  float cryMark = CryFoliage.Load(int3((int2)write_xy, 0));
+  if (cryMark > 0.2 && cryMark < 0.4)
+    result = 1;
+
   // CryMT: written as the occlusion, faded out over the reach's last quarter
   CryOut[(int2)write_xy] = (1 - result) * saturate((ReachMeters - start_meters) / (0.25 * ReachMeters));
 }

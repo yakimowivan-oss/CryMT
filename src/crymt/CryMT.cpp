@@ -9793,6 +9793,8 @@ void RunTestCommands()
                 g_giControl.vfogSun = static_cast<int>(value * 100.0f + 0.5f);
             else if (_stricmp(name, "vfoghaze") == 0) // ... the near air's share of light taken (0..0.9)
                 g_giControl.vfogHaze = static_cast<int>(value * 100.0f + 0.5f);
+            else if (_stricmp(name, "vfogsamples") == 0) // ... the sun's shadow samples per cell (1, 4, 8)
+                g_giControl.vfogSamples = v;
             else
                 known = false;
             g_giControl.active = true;

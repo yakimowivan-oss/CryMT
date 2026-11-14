@@ -1289,12 +1289,20 @@ float4 Visibility(float3 pos)
   float sun = fs > 0 ? saturate(fv.y) : saturate(cv.y);
   float sunWeight = (fv.y < -0.5 || cv.y < -0.5) ? 0 : max(fs, cs);
   float k = saturate(misc.z);
-  float sunVis = lerp(1, sun, sunWeight * k);
-  // Stage 2: the sun's shadow maps where they reach (outdoors under palms and roofs too, leaves included).
-  float cascadeSun = misc2.z > 0 ? SunShadow(pos) : -1;
-  if (cascadeSun >= 0)
-    sunVis = lerp(1, cascadeSun, misc2.z);
-  return float4((1 - saturate(share * misc.z)) * lerp(1, tint, k), sunVis);
+  return float4((1 - saturate(share * misc.z)) * lerp(1, tint, k), lerp(1, sun, sunWeight * k));
+}
+
+// Stage 2's sub-samples of the sun's shadow per cell (misc3.z: 1, 4 or 8): offsets in the tile (xy, tiles) and in the
+// slice (z, slices), the rotated grids of 4x and 8x MSAA. One sample a cell drew the shadows' edges as steps of whole
+// tiles and slices (the user, Sponza 2026-11-15); a cell's share of samples in the shadow makes them a ramp.
+static const float3 kSub4[4] = {float3(-0.125, -0.375, -0.375), float3(0.375, -0.125, 0.125), float3(-0.375, 0.125, -0.125),
+                                float3(0.125, 0.375, 0.375)};
+static const float3 kSub8[8] = {float3(0.0625, -0.1875, -0.4375), float3(-0.0625, 0.1875, 0.0625), float3(0.3125, 0.0625, -0.1875),
+                                float3(-0.1875, -0.3125, 0.3125), float3(-0.3125, 0.3125, -0.3125), float3(-0.4375, -0.0625, 0.1875),
+                                float3(0.1875, 0.4375, 0.4375), float3(0.4375, -0.4375, -0.0625)};
+float3 SubOffset(int s, int count)
+{
+  return count >= 8 ? kSub8[s] : count >= 4 ? kSub4[s & 3] : float3(0, 0, 0);
 }
 
 [numthreads(8, 8, 1)]
@@ -1314,6 +1322,15 @@ void vfog(uint3 id : SV_DispatchThreadID)
   float2 uv = (id.xy + 0.5) / grid.xy;
   float3 dirV = normalize(float3((uv.x * 2 - 1) * misc.x, (1 - uv.y * 2) * misc.y, -1));
   float3 dir = normalize(float3(dot(dirV, toWorldX.xyz), dot(dirV, toWorldY.xyz), dot(dirV, toWorldZ.xyz)));
+  // The sun's sub-samples' rays (stage 2).
+  int ns = misc2.z > 0 ? clamp((int)misc3.z, 1, 8) : 0;
+  float3 subDir[8];
+  [unroll] for (int s = 0; s < 8; s++)
+  {
+    float2 su = (id.xy + 0.5 + SubOffset(s, ns).xy) / grid.xy;
+    float3 sv = normalize(float3((su.x * 2 - 1) * misc.x, (1 - su.y * 2) * misc.y, -1));
+    subDir[s] = normalize(float3(dot(sv, toWorldX.xyz), dot(sv, toWorldY.xyz), dot(sv, toWorldZ.xyz)));
+  }
   // The fog's exponent along the ray: the engine's (its T = exp2(-max(x, 0)), non-decreasing) plus the near air's.
   float xPrev = 0; // at the camera no fog yet (a negative artist offset's fog at once falls into the first slice)
   float xEngine = 0;
@@ -1329,6 +1346,23 @@ void vfog(uint3 id : SV_DispatchThreadID)
     // What the slice adds to the fog seen through it, T(start) - T(end), written so tiny steps keep their precision.
     float w = exp2(-xPrev) * (d < 0.001 ? d * 0.6931472 * (1 - d * 0.3465736) : 1 - exp2(-d));
     float4 v = Visibility(dir * (grid.w * m * m));
+    // Stage 2: the sun's part from the shadow maps, its sub-samples averaged (one outside the cascades takes the
+    // stage 1 rule's value).
+    if (ns > 0)
+    {
+      float sum = 0;
+      [unroll] for (int s = 0; s < 8; s++)
+      {
+        if (s < ns)
+        {
+          float3 o = SubOffset(s, ns);
+          float ms = (k + 0.5 + o.z) / n;
+          float sh = SunShadow(subDir[s] * (grid.w * ms * ms));
+          sum += sh >= 0 ? lerp(1, sh, misc2.z) : v.a;
+        }
+      }
+      v.a = sum / ns;
+    }
     acc += w * v;
     wsum += w;
     xPrev = x1;
@@ -8018,6 +8052,8 @@ public:
                                            // its reach (0 none; the engine's fog near the camera is thin, the sun's shafts
                                            // hardly show without it; the user's panel row "Плотность воздуха вблизи")
         float vfogHazeReach = 60.0f;       // CRYMT_VFOG_HAZEREACH: its reach (m): full density to half of it, none at it
+        int vfogSamples = 4;               // CRYMT_VFOG_SAMPLES: the sun's shadow samples per cell, 1 / 4 / 8 (one drew the
+                                           // shadows' edges in the fog as steps of whole tiles: the user, Sponza 2026-11-15)
         float vfogOutdoor = 1.0f;          // CRYMT_VFOG_OUT: its darkening outdoors against indoors (the fog's own; the
                                            // particles' 200% made the path under palms too dark, the user 2026-11-14)
         float particleCell = 1.5f;         // CRYMT_GI_PARTICLECELL: their coarse occlusion volume's cell (m; 64 x 64 x 32 cells)
@@ -8159,6 +8195,8 @@ public:
             v.vfogSun = std::min(std::max(v.vfogSun, 0.0f), 1.0f);
             read(L"CRYMT_VFOG_HAZE", v.vfogHaze);
             v.vfogHaze = std::min(std::max(v.vfogHaze, 0.0f), 0.9f);
+            if (GetEnvironmentVariableW(L"CRYMT_VFOG_SAMPLES", text, 32))
+                v.vfogSamples = _wtoi(text) >= 8 ? 8 : _wtoi(text) >= 4 ? 4 : 1;
             read(L"CRYMT_VFOG_HAZEREACH", v.vfogHazeReach);
             v.vfogHazeReach = std::min(std::max(v.vfogHazeReach, 5.0f), 128.0f);
             read(L"CRYMT_VFOG_OUT", v.vfogOutdoor);
@@ -8268,6 +8306,7 @@ public:
         g.vfogOutdoor = g_giControl.vfogOut >= 0 ? g_giControl.vfogOut / 100.0f : b.vfogOutdoor;
         g.vfogSun = g_giControl.vfogSun >= 0 ? std::min(g_giControl.vfogSun / 100.0f, 1.0f) : b.vfogSun;
         g.vfogHaze = g_giControl.vfogHaze >= 0 ? std::min(g_giControl.vfogHaze / 100.0f, 0.9f) : b.vfogHaze;
+        g.vfogSamples = g_giControl.vfogSamples >= 0 ? (g_giControl.vfogSamples >= 8 ? 8 : g_giControl.vfogSamples >= 4 ? 4 : 1) : b.vfogSamples;
         if (g_giControl.particleOut < 0)
             g_giControl.particleOut = static_cast<int>(b.particleOutdoor * 100.0f + 0.5f);
         g.particleOutdoor = g_giControl.particleOut / 100.0f;
@@ -9578,8 +9617,9 @@ public:
         TextureCore* hw = m_dsv ? static_cast<TextureCore*>(m_dsv->info) : nullptr;
         if (hw && (hw->width != w || hw->height != h || hw->samples != 1 || !hw->res))
             hw = nullptr;
-        // The foliage mask: whether grass and leaves cast (CRYMT_CONTACTFOLIAGE=0: they do not).
-        Srv12* foliage = !s.contactFoliage && m_foliageSrv && m_foliageFrame == m_frame ? m_foliageSrv : nullptr;
+        // The foliage mask: whether grass and leaves cast (CRYMT_CONTACTFOLIAGE=0: they do not); skin (HumanSkin's
+        // z-prepass marks it 0.3) receives none (the user, 2026-11-15: for now) - so bound whenever it was written.
+        Srv12* foliage = m_foliageSrv && m_foliageFrame == m_frame ? m_foliageSrv : nullptr;
         Require(z, kSrvState);
         if (foliage)
             Require(foliage->info, kSrvState);
@@ -10169,6 +10209,7 @@ public:
         const float haze = s.vfog == 1 ? std::min(std::max(s.vfogHaze, 0.0f), 0.9f) : 0.0f;
         k[28] = haze > 0 ? -std::log2(1.0f - haze) / (0.75f * s.vfogHazeReach) : 0.0f;
         k[29] = s.vfogHazeReach;
+        k[30] = static_cast<float>(s.vfogSamples); // the sun's shadow sub-samples per cell
         Require(&m_vfog, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         Require(&m_vfogParam, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         FlushBarriers();
@@ -12771,6 +12812,7 @@ public:
         static const char* const fogSun[] = {"ВЫКЛ|OFF", "50%", "100%"};
         static const char* const fogHaze[] = {"ВЫКЛ|OFF", "10%", "20%", "35%", "50%"};
         static const int fogHazeValues[5] = {0, 10, 20, 35, 50};
+        static const char* const fogSamples[] = {"1", "4", "8"};
         static const char* const dlssModel[] = {"K (ТРАНСФОРМЕР)|K (TRANSFORMER)", "J", "L (DLSS 4.5)|L (DLSS 4.5)", "M (DLSS 4.5)|M (DLSS 4.5)",
                                                 "F (CNN)|F (CNN)", "E (CNN)|E (CNN)"};
         static const char* const dlssCompare[] = {"ВЫКЛ|OFF", "СПРАВА K|RIGHT: K", "СПРАВА J|RIGHT: J", "СПРАВА L|RIGHT: L", "СПРАВА M|RIGHT: M",
@@ -12868,6 +12910,14 @@ public:
                  return v <= 25 ? 0 : v <= 75 ? 1 : 2;
              },
              [](int v) { g_giControl.vfogSun = v * 50; }, true, nullptr},
+            // The sun's shadow samples per cell (smoother shadow edges in the fog, a little more time).
+            {0, "Выборки теней в тумане|Fog shadow samples", 0, 2, 1, true, fogSamples, 0, nullptr,
+             [] {
+                 const int v = g_giControl.vfogSamples >= 0 ? g_giControl.vfogSamples.load() : GiBase().vfogSamples;
+                 return v >= 8 ? 2 : v >= 4 ? 1 : 0;
+             },
+             [] { return GiBase().vfogSamples >= 8 ? 2 : GiBase().vfogSamples >= 4 ? 1 : 0; },
+             [](int v) { g_giControl.vfogSamples = v == 2 ? 8 : v == 1 ? 4 : 1; }, true, nullptr},
             // The near air: a haze of its own near the camera (the sun's shafts in a thin fog).
             {0, "Плотность воздуха вблизи|Near air density", 0, 4, 1, false, fogHaze, 0, nullptr,
              [] {

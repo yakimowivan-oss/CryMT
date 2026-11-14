@@ -1089,6 +1089,37 @@ void CryMT_VFog(float2 tc, float3 cameraToWorldPos, float sceneDepth, inout half
 )";
 
 const wchar_t* kPostProcess = L"Shaders\\HWScripts\\CryFX\\PostProcess.cfx";
+const wchar_t* kHumanSkin = L"Shaders\\HWScripts\\CryFX\\HumanSkin.cfx";
+// Skin marks itself in the z-prepass's foliage mask (0.3: under every foliage test's 0.5): CryMT's screen-space shadows
+// leave it (the user, 2026-11-15: no SSS on skin for now, to be reworked later); it still casts. Its own z technique,
+// the common one's with a pixel shader that writes the mark.
+const char* const kSkinZPass = R"(
+// CryMT: skin's z-prepass marks it in the foliage mask (0.3): the screen-space shadows leave it (see BendSss.h).
+#if D3D10
+pixout_cryzpass CryMT_SkinZPassPS(vert2fragZ_cry IN)
+{
+  pixout_cryzpass OUT = CryMT_ZPassPS(IN);
+  OUT.Foliage = 0.3;
+  return OUT;
+}
+#endif
+
+technique CryMT_SkinZPass
+{
+  pass p0
+  {
+    VertexShader = compile vs_Auto CryMT_ZPassVS() ZVS;
+#if D3D10
+    PixelShader = compile ps_Auto CryMT_SkinZPassPS() ZPS;
+#else
+    PixelShader = compile ps_Auto CryMT_ZPassPS() ZPS;
+#endif
+    ZEnable = true;
+    ZWriteEnable = true;
+    CullMode = Back;
+  }
+}
+)";
 const wchar_t* kFragLib = L"Shaders\\HWScripts\\CryFX\\fragLib.cfi";
 const wchar_t* kTerrain = L"Shaders\\HWScripts\\CryFX\\Terrain.cfx";
 const wchar_t* kShadowMask = L"Shaders\\HWScripts\\CryFX\\ShadowMaskGen.cfx";
@@ -1239,14 +1270,15 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi Shaders/HWScripts/CryFX/PostProcess.cfx"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi Shaders/HWScripts/CryFX/PostProcess.cfx Shaders/HWScripts/CryFX/HumanSkin.cfx"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
                 particles = Lf(ReadAll(tmp + L"\\" + kParticles)), metal = Lf(ReadAll(tmp + L"\\" + kMetal)),
                 vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater)),
                 waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols)), modificator = Lf(ReadAll(tmp + L"\\" + kModificator)),
-                motionBlur = Lf(ReadAll(tmp + L"\\" + kMotionBlurPass)), postProcess = Lf(ReadAll(tmp + L"\\" + kPostProcess));
+                motionBlur = Lf(ReadAll(tmp + L"\\" + kMotionBlurPass)), postProcess = Lf(ReadAll(tmp + L"\\" + kPostProcess)),
+                skin = Lf(ReadAll(tmp + L"\\" + kHumanSkin));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
@@ -1363,6 +1395,9 @@ std::wstring InstallGi()
                             "\tCryMT_VFog(IN.baseTC.xy, cameraToWorldPos, sceneDepth, localFogColor); // CryMT: the GI in the fog\n"
                             "\t\n\tlocalFogColor.a = 1.0 - localFogColor.a;\n") &&
                     Replace(postProcess, "    PixelShader = compile PROFILE_PS FogPassPS();\n", "    PixelShader = compile PROFILE_PS CryMT_FogPassPS();\n") &&
+                    // Skin: no screen-space shadows for now (kSkinZPass).
+                    Replace(skin, "        \"TechniqueZ=ZPass;\"\n", "        \"TechniqueZ=CryMT_SkinZPass;\"\n") &&
+                    Replace(skin, "#include \"CommonZPass.cfi\"\n", std::string("#include \"CommonZPass.cfi\"\n") + kSkinZPass) &&
                     // The bending can be asked for an earlier time (default 0: every other caller as before).
                     Replace(modificator, "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams)",
                             "float _DetailBending(float3 worldPos, inout float4 vPos, float3 vNormal, float4 vVertexInfo, float4 vBendParams, float4 vBendDetailParams, float fTimeShift = 0)") &&
@@ -1464,6 +1499,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/ModificatorVT.cfi", Crlf(modificator)},
                               {"Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi", Crlf(motionBlur)},
                               {"Shaders/HWScripts/CryFX/PostProcess.cfx", Crlf(postProcess)},
+                              {"Shaders/HWScripts/CryFX/HumanSkin.cfx", Crlf(skin)},
                               {"Textures/CryMT/vfog.dds", vfog},
                               {"Textures/CryMT/vfogp.dds", vfogParams},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
