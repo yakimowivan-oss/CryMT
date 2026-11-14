@@ -40,7 +40,9 @@
     function valid(o, v) {
         if (v === undefined || v === null) return false;
         if (o.type === 'toggle') return typeof v === 'boolean';
-        if (o.type === 'select') return o.choices.some(c => c.v === v);
+        if (o.type === 'select')
+            return o.choices.some(c => c.v === v) ||
+                   (!!o.custom && typeof v === 'string' && /^\d+(\.\d+)?$/.test(v) && +v >= o.custom.min && +v <= o.custom.max);
         return typeof v === 'number' && isFinite(v);
     }
     function readOption(o, get) {

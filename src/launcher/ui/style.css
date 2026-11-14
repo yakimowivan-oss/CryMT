@@ -306,19 +306,40 @@ kbd {
 .card-q-row .ctl { flex: none; }
 .card-q-row .seg button { padding: 3px 8px; font-size: 11px; }
 .card-badge { min-height: 18px; font: 500 11px var(--font-head); text-transform: var(--caps); letter-spacing: 0.08em; color: var(--accent); }
-.home-low { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: var(--gap); margin-top: var(--gap); }
+/* The current set's costs beside the personal switches in two columns: about the same height, no half-empty panel. */
+.home-low { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: var(--gap); margin-top: var(--gap); align-items: stretch; }
 .detail, .quick { padding: 14px 18px; }
 .detail h3, .quick h3 { font-size: calc(16px * var(--head-size)); margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
-.cost-list { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 28px; }
-.cost-list div { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); border-bottom: 1px dashed var(--line); padding: 3px 0; }
-.cost-list b { color: var(--text); font: 600 12.5px var(--mono); }
+.cost-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 2px 28px; }
+.cost-list div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 13px; color: var(--muted); border-bottom: 1px dashed var(--line); padding: 3px 0; }
+.cost-list b { color: var(--text); font: 600 12.5px var(--mono); white-space: nowrap; }
 .cost-list .total { border-bottom: 0; color: var(--text); padding-top: 6px; grid-column: 1 / -1; max-width: calc(50% - 14px); }
 .cost-list .total b { color: var(--accent); }
 .notes { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; display: grid; gap: 4px; }
 .quick { display: flex; flex-direction: column; gap: 4px; }
 .quick .btn { margin-top: auto; align-self: flex-start; }
-.quick .quick-btns { margin-top: auto; display: flex; gap: 8px; flex-wrap: wrap; padding-top: 8px; }
+.quick .quick-btns { margin-top: auto; display: flex; gap: 8px; flex-wrap: wrap; padding-top: 12px; border-top: 1px solid var(--line); }
 .quick .quick-btns .btn { margin-top: 0; }
+.quick-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 26px; align-items: start; }
+.quick-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.quick-group { display: flex; flex-direction: column; min-width: 0; }
+.quick-sub { font: 500 11px var(--font-head); color: var(--dim); text-transform: uppercase; letter-spacing: 0.12em;
+             padding-bottom: 5px; border-bottom: 1px solid var(--line-strong); }
+.quick .opt.compact { padding: 6px 0; gap: 10px; }
+.quick .opt-label { font-size: 13px; }
+.quick .opt.lead { border-bottom: 1px solid var(--line); }
+.quick .ctl-select { min-width: 0; width: 180px; max-width: 100%; }
+.ctl { display: flex; align-items: center; gap: 6px; }
+.ctl-num {
+    width: 72px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel2);
+    color: var(--text);
+    padding: 7px 8px;
+    font: 500 13px/1.2 var(--font-body, inherit);
+}
+.ctl-num[hidden] { display: none; }
 .opt.lead { border-bottom: 1px solid var(--line-strong); }
 .ctl-select {
     min-width: 170px;
@@ -465,6 +486,7 @@ kbd {
 /* ---------------------------------------------------------------- narrow windows */
 @media (max-width: 1180px) {
     .presets { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .home-low { grid-template-columns: minmax(0, 1fr); }
     .adv { grid-template-columns: 200px minmax(0, 1fr); height: auto; }
     .adv .side { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; }
     .adv.simple .side { grid-template-columns: minmax(0, 1fr); }
@@ -473,7 +495,7 @@ kbd {
 }
 @media (max-width: 760px) {
     .app { padding: 12px 16px; }
-    .presets, .home-low, .news, .adv, .adv .side { grid-template-columns: minmax(0, 1fr); }
+    .presets, .home-low, .news, .adv, .adv .side, .quick-cols { grid-template-columns: minmax(0, 1fr); }
     .nav { display: none; }
     .opt { flex-wrap: wrap; }
     .sl-track { width: 170px; }

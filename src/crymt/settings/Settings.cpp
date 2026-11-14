@@ -1090,6 +1090,19 @@ void CryMT_VFog(float2 tc, float3 cameraToWorldPos, float sceneDepth, inout half
 
 const wchar_t* kPostProcess = L"Shaders\\HWScripts\\CryFX\\PostProcess.cfx";
 const wchar_t* kHumanSkin = L"Shaders\\HWScripts\\CryFX\\HumanSkin.cfx";
+const wchar_t* kWaterSurface = L"Shaders\\HWScripts\\CryFX\\WaterSurface.cfx";
+// Rivers (WaterSurface.cfx: river_village.mtl, river_harbor.mtl; lakes and pools are WaterVols.cfx) take the water's
+// reflection as the ocean and lakes do (CryMT_WaterReflection: the engine's cube in HDR and SSR), in place of their
+// planar or static cube one - only when the back end gives the engine's cube (CryMT_WaterFrame(7).y > 0.5), not the
+// voxel grid's (the user, 2026-11-15: "для вокселей не делай пока"). Their own cube was the material's (shaded by the
+// sun and sky colour on top: the voxel cube in its place came out overbright, 2026-11-11), so it stays out of
+// EnvSubstitute (IsRefractiveResource) and is replaced here instead.
+const char* const kRiverReflection = R"(  // CryMT: the water's reflection (the engine's cube, SSR) on rivers too, not with the voxel grid's cube
+#if D3D10
+  if (CryMT_WaterFrame(7).y > 0.5)
+    reflectColor = CryMT_WaterReflection(half4(reflectColor, 1), viewVec, bumpNormal.xyz, IN.projTC, screenMapSampler).rgb;
+#endif
+)";
 // Skin marks itself in the z-prepass's foliage mask (0.3: under every foliage test's 0.5): CryMT's screen-space shadows
 // leave it (the user, 2026-11-15: no SSS on skin for now, to be reworked later); it still casts. Its own z technique,
 // the common one's with a pixel shader that writes the mark.
@@ -1270,7 +1283,7 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi Shaders/HWScripts/CryFX/PostProcess.cfx Shaders/HWScripts/CryFX/HumanSkin.cfx"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi Shaders/HWScripts/CryFX/PostProcess.cfx Shaders/HWScripts/CryFX/HumanSkin.cfx Shaders/HWScripts/CryFX/WaterSurface.cfx"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
@@ -1278,7 +1291,7 @@ std::wstring InstallGi()
                 vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater)),
                 waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols)), modificator = Lf(ReadAll(tmp + L"\\" + kModificator)),
                 motionBlur = Lf(ReadAll(tmp + L"\\" + kMotionBlurPass)), postProcess = Lf(ReadAll(tmp + L"\\" + kPostProcess)),
-                skin = Lf(ReadAll(tmp + L"\\" + kHumanSkin));
+                skin = Lf(ReadAll(tmp + L"\\" + kHumanSkin)), waterSurface = Lf(ReadAll(tmp + L"\\" + kWaterSurface));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
@@ -1395,6 +1408,12 @@ std::wstring InstallGi()
                             "\tCryMT_VFog(IN.baseTC.xy, cameraToWorldPos, sceneDepth, localFogColor); // CryMT: the GI in the fog\n"
                             "\t\n\tlocalFogColor.a = 1.0 - localFogColor.a;\n") &&
                     Replace(postProcess, "    PixelShader = compile PROFILE_PS FogPassPS();\n", "    PixelShader = compile PROFILE_PS CryMT_FogPassPS();\n") &&
+                    // Rivers: the water's reflection with the engine's cube (kRiverReflection).
+                    Replace(waterSurface, "sampler2D screenMapSampler = sampler_state\n", std::string(kWaterEnvDecl) + "sampler2D screenMapSampler = sampler_state\n") &&
+                    Replace(waterSurface, "    reflectColor = tex2D(envMapSampler, vReflect.xy).xyz * cSunShading;  \n  #endif\n\n#endif\n",
+                            std::string("    reflectColor = tex2D(envMapSampler, vReflect.xy).xyz * cSunShading;  \n  #endif\n\n#endif\n") + kRiverReflection) &&
+                    Replace(waterSurface, "pixout WaterSurfacePS(v2fReflect IN)\n", "pixout CryMT_WaterSurfacePS(v2fReflect IN)\n") &&
+                    Replace(waterSurface, "    PixelShader = compile ps_Auto WaterSurfacePS();\n", "    PixelShader = compile ps_Auto CryMT_WaterSurfacePS();\n") &&
                     // Skin: no screen-space shadows for now (kSkinZPass).
                     Replace(skin, "        \"TechniqueZ=ZPass;\"\n", "        \"TechniqueZ=CryMT_SkinZPass;\"\n") &&
                     Replace(skin, "#include \"CommonZPass.cfi\"\n", std::string("#include \"CommonZPass.cfi\"\n") + kSkinZPass) &&
@@ -1500,6 +1519,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi", Crlf(motionBlur)},
                               {"Shaders/HWScripts/CryFX/PostProcess.cfx", Crlf(postProcess)},
                               {"Shaders/HWScripts/CryFX/HumanSkin.cfx", Crlf(skin)},
+                              {"Shaders/HWScripts/CryFX/WaterSurface.cfx", Crlf(waterSurface)},
                               {"Textures/CryMT/vfog.dds", vfog},
                               {"Textures/CryMT/vfogp.dds", vfogParams},
                               {"Textures/CryMT/waterenv.dds", waterEnv},

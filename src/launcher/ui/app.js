@@ -25,6 +25,7 @@
         return x;
     }
     let C, byId, secById, PERSONAL;
+    const CUSTOM = '__custom'; // a dropdown's "Custom…" entry (options with `custom`: a typed number)
     function setLang(l) {
         lang = l === 'en' ? 'en' : 'ru';
         C = localize(window.CRYMT);
@@ -134,7 +135,7 @@
     const msaaOff = vals => !!C.STATUS.msaa && MODES.mtMode(vals);
     function valueLabel(o, v) {
         if (o.type === 'toggle') return v ? tt('вкл', 'on') : tt('выкл', 'off');
-        if (o.type === 'select') return (o.choices.find(c => c.v === v) || {label: v}).label;
+        if (o.type === 'select') return (o.choices.find(c => c.v === v) || {label: o.custom && o.custom.unit ? v + ' ' + o.custom.unit : v}).label;
         return fmt(v) + (o.unit ? ' ' + o.unit : '');
     }
     function needChain(o) {
@@ -408,8 +409,37 @@
         } else if (o.type === 'select' && o.dropdown) {
             const box = el('select', 'ctl-select');
             box.setAttribute('aria-label', o.label);
-            box.addEventListener('change', () => set(o.id, box.value));
             wrap.append(box);
+            if (o.custom) {
+                // "Custom…" opens a number box next to the list; the list goes back to a preset when one is picked.
+                const num = el('input', 'ctl-num');
+                num.type = 'number';
+                num.min = o.custom.min;
+                num.max = o.custom.max;
+                num.step = 1;
+                num.hidden = true;
+                num.setAttribute('aria-label', o.label);
+                num.addEventListener('change', () => {
+                    const n = Math.round(Math.min(o.custom.max, Math.max(o.custom.min, parseFloat(num.value) || o.custom.min)));
+                    num.value = n;
+                    set(o.id, String(n));
+                });
+                wrap.append(num);
+                box.addEventListener('change', () => {
+                    if (box.value === CUSTOM) {
+                        wrap.dataset.custom = '1';
+                        const cur = S.values[o.id];
+                        num.value = /^\d/.test(cur) ? cur : '100';
+                        num.hidden = false;
+                        num.focus();
+                        set(o.id, num.value);
+                    } else {
+                        delete wrap.dataset.custom;
+                        set(o.id, box.value);
+                    }
+                });
+            } else
+                box.addEventListener('change', () => set(o.id, box.value));
         } else if (o.type === 'select') {
             wrap.append(seg(o.choices.map(c => [c.v, c.label, c.desc]), S.values[o.id], v => set(o.id, v)));
         } else {
@@ -439,13 +469,21 @@
         if (o.type === 'toggle') $('.tg', wrap).setAttribute('aria-pressed', v ? 'true' : 'false');
         else if (o.type === 'select' && o.dropdown) {
             const box = $('select', wrap);
+            const list = o.choices.concat(o.custom ? [{v: CUSTOM, label: tt('Своё значение…', 'Custom…')}] : []);
             // The choices can change (the window rescans Mods): the list is made again when they differ.
-            if (Array.from(box.options).map(x => x.value).join('\n') !== o.choices.map(x => x.v).join('\n') ||
-                Array.from(box.options).map(x => x.textContent).join('\n') !== o.choices.map(x => x.label).join('\n')) {
+            if (Array.from(box.options).map(x => x.value).join('\n') !== list.map(x => x.v).join('\n') ||
+                Array.from(box.options).map(x => x.textContent).join('\n') !== list.map(x => x.label).join('\n')) {
                 box.textContent = '';
-                o.choices.forEach(x => { const opt = el('option'); opt.value = x.v; opt.textContent = x.label; box.append(opt); });
+                list.forEach(x => { const opt = el('option'); opt.value = x.v; opt.textContent = x.label; box.append(opt); });
             }
-            box.value = v;
+            const custom = !!o.custom && (!o.choices.some(c => c.v === v) || wrap.dataset.custom === '1');
+            box.value = custom ? CUSTOM : v;
+            const num = $('.ctl-num', wrap);
+            if (num) {
+                num.hidden = !custom;
+                if (custom && document.activeElement !== num)
+                    num.value = /^\d/.test(v) ? v : '';
+            }
         } else if (o.type === 'select') $$('.seg button', wrap).forEach(b => b.classList.toggle('on', b.dataset.v === v));
         else {
             const r = $('input', wrap);
@@ -591,15 +629,35 @@
         const low = el('div', 'home-low');
         low.append(el('div', 'panel cut detail'));
         const quick = el('div', 'panel cut quick');
-        quick.append(el('h3', null, tt('Запуск и окно', 'Launch and window')));
+        quick.append(el('h3', null, tt('Игра и окно', 'Game and window')));
         const dlaa = el('div', 'opt compact lead dlaa-row');
         dlaa.innerHTML = tt('<div class="opt-main"><div class="opt-label">Сглаживание DLAA</div><div class="opt-why"></div></div>',
                             '<div class="opt-main"><div class="opt-label">DLAA anti-aliasing</div><div class="opt-why"></div></div>');
         const dlaaCtl = el('div', 'ctl');
         dlaaCtl.append(toggleButton(false, () => { if (!dlaaWhyNot(S.values)) set('mode', S.values.mode === 'dlaa' ? 'dx12' : 'dlaa'); }));
         dlaa.append(dlaaCtl);
-        quick.append(dlaa, optRow(byId.mod, true));
-        PERSONAL.filter(id => id !== 'mod' && !byId[id].expert).forEach(id => quick.append(optRow(byId[id], true)));
+        // The personal switches in groups, two columns (the user, 2026-11-15: one long column pushed the page down and left
+        // the panel beside it half empty). GI quality and reflections are on the Full card, not here again; a personal
+        // option no group names goes under "Launch".
+        const groups = [
+            [tt('Изображение', 'Picture'), ['fpsLimit']],
+            [tt('Окно и управление', 'Window and controls'), ['borderless', 'pause', 'keys', 'overlay']],
+            [tt('Запуск', 'Launch'), ['mod', 'modShaders', 'editorCryMT', 'afterStart']],
+        ];
+        const placed = new Set(['giQuality', 'reflQuality'].concat(...groups.map(g => g[1])));
+        PERSONAL.filter(id => !placed.has(id)).forEach(id => groups[2][1].push(id));
+        const cols = el('div', 'quick-cols');
+        const colA = el('div', 'quick-col'), colB = el('div', 'quick-col');
+        groups.forEach(([title, ids], gi) => {
+            const box = el('div', 'quick-group');
+            box.append(el('div', 'quick-sub', esc(title)));
+            if (gi === 0)
+                box.append(dlaa);
+            ids.filter(id => byId[id] && !byId[id].expert).forEach(id => box.append(optRow(byId[id], true)));
+            (gi < 2 ? colA : colB).append(box);
+        });
+        cols.append(colA, colB);
+        quick.append(cols);
         const btns = el('div', 'quick-btns');
         const adv = el('button', 'btn ghost', tt('Тонкая настройка', 'Fine-tuning'));
         adv.addEventListener('click', () => showTab('adv'));
