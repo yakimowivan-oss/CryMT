@@ -1009,8 +1009,13 @@ std::string Crlf(const std::string& s)
 // loss and tint), a the sun's part (the Mie and Rayleigh haze; the sun's shadow maps, else the voxels' sun indoors). The
 // fog keeps its amount (the scene's attenuation is the engine's); only its colour is darkened by that visibility up to
 // 128 m, the rest of the ray as before.
-// The placeholder's zeros give the engine's fog exactly. The pixel shader is renamed so no cached build of the old one
-// (ShaderCache.pak) is used.
+// The near air (CRYMT_VFOG_HAZE, the panel's "Плотность воздуха вблизи"): a haze of its own density up to half its reach,
+// fading to none at its reach, added to the engine's fog in both the scene's attenuation and the fog's light (lit and
+// shaded alike), so the sun's shafts show in a thin fog too.
+// The back end writes its parameters each frame into CryMT_VFogParamSampler's slot (x the haze's density, log2 units a
+// metre; y its reach, m; w 4242, the mark): without the mark (no CryMT back end, the editor's other viewports, a pass the
+// volume was not made for) the engine's fog exactly, whatever the engine left bound there (2026-11-15: the editor). The
+// pixel shader is renamed so no cached build of the old one (ShaderCache.pak) is used.
 const char* const kVFogDecl = R"(// CryMT: the GI in the fog (see CryMT_VFog)
 #if D3D10
 sampler3D CryMT_VFogSampler = sampler_state
@@ -1024,22 +1029,46 @@ sampler3D CryMT_VFogSampler = sampler_state
   AddressW = Clamp;
 };
 
+sampler2D CryMT_VFogParamSampler = sampler_state
+{
+  Texture = Textures/CryMT/vfogp.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
+// The near air's depth along a ray to t: full density to reach / 2, then fading linearly to none at reach.
+float CryMT_HazeDepth(float t, float reach)
+{
+  float b = clamp(t - 0.5 * reach, 0, 0.5 * reach);
+  return min(t, 0.5 * reach) + b - b * b / max(reach, 0.001);
+}
+
 void CryMT_VFog(float2 tc, float3 cameraToWorldPos, float sceneDepth, inout half4 localFogColor)
 {
+  float4 params = tex2Dlod(CryMT_VFogParamSampler, float4(0.5, 0.5, 0, 0));
+  if (params.w < 4241.5 || params.w > 4242.5)
+    return;
   float dist = length(cameraToWorldPos);
   float reach = min(dist, 128.0);
-  float tFull = ComputeVolumetricFog(cameraToWorldPos);
-  float tNear = ComputeVolumetricFog(cameraToWorldPos * (reach / max(dist, 0.001)));
+  float tEngine = ComputeVolumetricFog(cameraToWorldPos);
+  float tFull = tEngine * exp2(-params.x * CryMT_HazeDepth(dist, params.y));
+  float tNear = ComputeVolumetricFog(cameraToWorldPos * (reach / max(dist, 0.001))) * exp2(-params.x * CryMT_HazeDepth(reach, params.y));
   float slice = sqrt(reach / 128.0) * 64.0;
   float4 loss = tex3Dlod(CryMT_VFogSampler, float4(tc, (slice - 0.5) / 64.0, 0));
   float4 vis = ((1 - loss) * (1 - tNear) + (tNear - tFull)) / max(1 - tFull, 0.00001);
+#if !%_RT_FSAA
+  localFogColor.a = tFull;
+#endif
 #if %_RT_SKYLIGHT_BASED_FOG
   float3 skyDir = normalize(cameraToWorldPos);
   float cosine = -dot(slSunDirection, skyDir);
   float cosine2 = cosine * cosine;
   float miePhase = (1.0 + cosine2) * pow(slPhaseFunctionConstants.y + slPhaseFunctionConstants.x * cosine, -1.5);
   float rayleighPhase = 0.75 * (1.0 + cosine2);
-  float3 sunPart = slHazeColPartialMieInScatter * miePhase * saturate((sceneDepth - 1) * tFull) + slHazeColPartialRayleighInScatter * rayleighPhase;
+  float3 sunPart = slHazeColPartialMieInScatter * miePhase * saturate((sceneDepth - 1) * tEngine) + slHazeColPartialRayleighInScatter * rayleighPhase;
   float3 fogColor = sunPart * vis.a + vfFogColor.xyz * vis.rgb;
   #if %_RT_HDR_MODE
   fogColor = min(fogColor, (float3)16384.0);
@@ -1413,6 +1442,9 @@ std::wstring InstallGi()
     memcpy(&vfog[76], pf, sizeof(pf));
     const unsigned int vcaps[] = {0x1008, 0x200000}; // complex texture; volume
     memcpy(&vfog[108], vcaps, sizeof(vcaps));
+    // Its parameters' placeholder: 2x1, all zero (no mark: the engine's fog). The back end fills the slot by name.
+    std::string vfogParams = foliage;
+    memset(&vfogParams[132], 0, 4);
     std::string env(128 + 6 * 64, '\0');
     const unsigned int eheader[] = {0x20534444, 124, 0x100F, 4, 4, 16, 0, 1};
     memcpy(&env[0], eheader, sizeof(eheader));
@@ -1433,6 +1465,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi", Crlf(motionBlur)},
                               {"Shaders/HWScripts/CryFX/PostProcess.cfx", Crlf(postProcess)},
                               {"Textures/CryMT/vfog.dds", vfog},
+                              {"Textures/CryMT/vfogp.dds", vfogParams},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/hiz.dds", hiz},
                               {"Textures/CryMT/env.dds", env},

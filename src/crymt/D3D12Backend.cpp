@@ -1186,7 +1186,18 @@ cbuffer C : register(b0)
   float4 misc; // xy 1 / proj._11, 1 / proj._22; z the GI's strength in the fog; w the mode
   float4 misc2; // x the fog's own darkening outdoors against indoors (the particles' is apart), y the share's cap, z the
                 // sun shadows' strength (stage 2)
+  float4 misc3; // the near air: x its density (log2 units a metre), y its reach (m)
 };
+// The fog pass's parameters (its CryMT_VFogParamSampler slot): x, y the near air, w 4242 (the mark: CryMT's volume this
+// frame; without it the patched fog pass keeps the engine's fog).
+RWTexture2D<float4> paramOut : register(u1);
+
+// The near air's depth along a ray to t (as the patched fog pass's CryMT_HazeDepth): full to reach / 2, then fading.
+float HazeDepth(float t, float reach)
+{
+  float b = clamp(t - 0.5 * reach, 0, 0.5 * reach);
+  return min(t, 0.5 * reach) + b - b * b / max(reach, 0.001);
+}
 // Stage 2: the sun's shadow cascades (NoteSunMap), finest first: light matrices for positions from the camera (row
 // vectors; xy / w the map's NDC, z the depth as the map stores it: linear over the light's far distance, a little bias
 // in), count in x.
@@ -1291,6 +1302,8 @@ void vfog(uint3 id : SV_DispatchThreadID)
 {
   if (id.x >= (uint)grid.x || id.y >= (uint)grid.y)
     return;
+  if (id.x == 0 && id.y == 0)
+    paramOut[int2(0, 0)] = float4(misc3.x, misc3.y, 0, 4242);
   int n = (int)grid.z;
   if (misc.w > 1.5)
   {
@@ -1301,13 +1314,17 @@ void vfog(uint3 id : SV_DispatchThreadID)
   float2 uv = (id.xy + 0.5) / grid.xy;
   float3 dirV = normalize(float3((uv.x * 2 - 1) * misc.x, (1 - uv.y * 2) * misc.y, -1));
   float3 dir = normalize(float3(dot(dirV, toWorldX.xyz), dot(dirV, toWorldY.xyz), dot(dirV, toWorldZ.xyz)));
+  // The fog's exponent along the ray: the engine's (its T = exp2(-max(x, 0)), non-decreasing) plus the near air's.
   float xPrev = 0; // at the camera no fog yet (a negative artist offset's fog at once falls into the first slice)
+  float xEngine = 0;
   float4 acc = 0;
   float wsum = 0;
   [loop] for (int k = 0; k < n; k++)
   {
     float e = (k + 1.0) / n, m = (k + 0.5) / n;
-    float x1 = max(FogExponent(dir * (grid.w * e * e)), xPrev);
+    float t1 = grid.w * e * e;
+    xEngine = max(FogExponent(dir * t1), xEngine);
+    float x1 = max(xEngine + misc3.x * HazeDepth(t1, misc3.y), xPrev);
     float d = x1 - xPrev;
     // What the slice adds to the fog seen through it, T(start) - T(end), written so tiny steps keep their precision.
     float w = exp2(-xPrev) * (d < 0.001 ? d * 0.6931472 * (1 - d * 0.3465736) : 1 - exp2(-d));
@@ -5118,7 +5135,8 @@ public:
     // vfFogColor, slHazeColPartialMieInScatter, slHazeColPartialRayleighInScatter (RunVfog reads them in the fog pass).
     int fogSlot[4] = {-1, -1, -1, -1};
     UINT fogOffset[4] = {};
-    int vfogSlot = -1; // the patched fog pass's CryMT_VFogSampler texture slot (RunVfog's volume goes there)
+    int vfogSlot = -1;      // the patched fog pass's CryMT_VFogSampler texture slot (RunVfog's volume goes there)
+    int vfogParamSlot = -1; // ... its CryMT_VFogParamSampler slot (the parameters, with the mark)
 
     // SM4 token stream (the SHDR chunk): opcode in bits 0-10, length in 24-30 (custom data: the next token).
     static bool HasDiscard(const std::vector<uint8_t>& dxbc)
@@ -5217,6 +5235,8 @@ public:
                 waterEnvSamplerSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "CryMT_VFogSampler") == 0)
                 vfogSlot = static_cast<int>(b.BindPoint);
+            if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "CryMT_VFogParamSampler") == 0)
+                vfogParamSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_CBUFFER)
                 cbMask |= ((1u << b.BindCount) - 1) << b.BindPoint;
             else if (b.Type == D3D10_SIT_SAMPLER)
@@ -5258,6 +5278,12 @@ public:
             static int logged;
             if (logged++ < 4)
                 Log("ocean vertex shader recognized (WaterLevel), %u bytes", static_cast<unsigned>(code.size()));
+        }
+        if (vfogSlot >= 0 || vfogParamSlot >= 0)
+        {
+            static int logged;
+            if (logged++ < 6)
+                Log("fog pass shader with the GI in the fog: volume t%d, parameters t%d", vfogSlot, vfogParamSlot);
         }
         if (envCubeSlot >= 0 || env2DSlot >= 0)
         {
@@ -7988,6 +8014,10 @@ public:
         float vfogGi = 1.0f;               // CRYMT_VFOG_GI: its strength (the particles' ambient share lost, times this)
         float vfogSun = 1.0f;              // CRYMT_VFOG_SUN: the sun's shadow maps in the fog (stage 2: its haze dark where the
                                            // cascades see shade, outdoors too); 0 off (stage 1: the voxels' sun indoors)
+        float vfogHaze = 0.0f;             // CRYMT_VFOG_HAZE: the near air - the share of light a haze of its own takes over
+                                           // its reach (0 none; the engine's fog near the camera is thin, the sun's shafts
+                                           // hardly show without it; the user's panel row "Плотность воздуха вблизи")
+        float vfogHazeReach = 60.0f;       // CRYMT_VFOG_HAZEREACH: its reach (m): full density to half of it, none at it
         float vfogOutdoor = 1.0f;          // CRYMT_VFOG_OUT: its darkening outdoors against indoors (the fog's own; the
                                            // particles' 200% made the path under palms too dark, the user 2026-11-14)
         float particleCell = 1.5f;         // CRYMT_GI_PARTICLECELL: their coarse occlusion volume's cell (m; 64 x 64 x 32 cells)
@@ -8127,6 +8157,10 @@ public:
             v.vfogGi = std::min(std::max(v.vfogGi, 0.0f), 3.0f);
             read(L"CRYMT_VFOG_SUN", v.vfogSun);
             v.vfogSun = std::min(std::max(v.vfogSun, 0.0f), 1.0f);
+            read(L"CRYMT_VFOG_HAZE", v.vfogHaze);
+            v.vfogHaze = std::min(std::max(v.vfogHaze, 0.0f), 0.9f);
+            read(L"CRYMT_VFOG_HAZEREACH", v.vfogHazeReach);
+            v.vfogHazeReach = std::min(std::max(v.vfogHazeReach, 5.0f), 128.0f);
             read(L"CRYMT_VFOG_OUT", v.vfogOutdoor);
             v.vfogOutdoor = std::min(std::max(v.vfogOutdoor, 0.0f), 3.0f);
             read(L"CRYMT_GI_PARTICLECELL", v.particleCell);
@@ -8233,6 +8267,7 @@ public:
         g.vfogGi = g_giControl.vfogGi >= 0 ? g_giControl.vfogGi / 100.0f : b.vfogGi;
         g.vfogOutdoor = g_giControl.vfogOut >= 0 ? g_giControl.vfogOut / 100.0f : b.vfogOutdoor;
         g.vfogSun = g_giControl.vfogSun >= 0 ? std::min(g_giControl.vfogSun / 100.0f, 1.0f) : b.vfogSun;
+        g.vfogHaze = g_giControl.vfogHaze >= 0 ? std::min(g_giControl.vfogHaze / 100.0f, 0.9f) : b.vfogHaze;
         if (g_giControl.particleOut < 0)
             g_giControl.particleOut = static_cast<int>(b.particleOutdoor * 100.0f + 0.5f);
         g.particleOutdoor = g_giControl.particleOut / 100.0f;
@@ -9841,12 +9876,13 @@ public:
         }
         if (errors)
             errors->Release();
-        // t0 the particles' volumes, t1..t4 the sun's cascades; u0 the volume; b1 the cascades' matrices.
+        // t0 the particles' volumes, t1..t4 the sun's cascades; u0 the volume, u1 the fog pass's parameters; b1 the
+        // cascades' matrices.
         D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1 + kVfogCascades, 0, 0, 0},
-                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1 + kVfogCascades}};
+                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 1 + kVfogCascades}};
         D3D12_ROOT_PARAMETER params[3]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.Num32BitValues = 28;
+        params[0].Constants.Num32BitValues = 32;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable = {2, ranges};
         params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -9891,6 +9927,22 @@ public:
         }
         m_vfogFailed = false;
         return true;
+    }
+
+    // A null 3D view (the fog volume's slot without a volume: reads zero), made on first use.
+    D3D12_CPU_DESCRIPTOR_HANDLE VfogNull3d()
+    {
+        if (!m_vfogNull3d.ptr)
+        {
+            m_vfogNull3d = g_srvCpu.Alloc();
+            D3D12_SHADER_RESOURCE_VIEW_DESC d{};
+            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+            d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            d.Texture3D.MipLevels = 1;
+            g.dev->CreateShaderResourceView(nullptr, &d, m_vfogNull3d);
+        }
+        return m_vfogNull3d;
     }
 
     // An engine constant the bound pixel shader declares (Shader12::fogSlot), from its dynamic constant buffer; null when
@@ -9977,7 +10029,35 @@ public:
                 m_vfogUav = g_srvCpu.Alloc();
             g.dev->CreateShaderResourceView(m_vfog.res, nullptr, m_vfogSrv);
             g.dev->CreateUnorderedAccessView(m_vfog.res, nullptr, nullptr, m_vfogUav);
-            Log("volumetric fog volume %ux%ux%u", gx, gy, kVfogSlices);
+        }
+        if (!m_vfogParam.res)
+        {
+            // The fog pass's parameters (the pass writes them): 1x1 RGBA32F.
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = 1;
+            d.Height = 1;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            d.SampleDesc.Count = 1;
+            d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                      __uuidof(ID3D12Resource), reinterpret_cast<void**>(&m_vfogParam.res))))
+            {
+                m_vfogParam.res = nullptr;
+                return;
+            }
+            m_vfogParam.dim = D3D10_RESOURCE_DIMENSION_TEXTURE2D;
+            m_vfogParam.format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            m_vfogParam.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            m_vfogParamSrv = g_srvCpu.Alloc();
+            m_vfogParamUav = g_srvCpu.Alloc();
+            g.dev->CreateShaderResourceView(m_vfogParam.res, nullptr, m_vfogParamSrv);
+            g.dev->CreateUnorderedAccessView(m_vfogParam.res, nullptr, nullptr, m_vfogParamUav);
+            Log("volumetric fog volume %ux%ux%u and its parameters", gx, gy, kVfogSlices);
         }
         float toWorld[16];
         RigidInverse(m_giView, toWorld);
@@ -10041,7 +10121,7 @@ public:
         m_vfogCascadesUsed = static_cast<uint32_t>(picked);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-        while (!m_srvRing.TryAlloc(2 + kVfogCascades, cpu, gpu))
+        while (!m_srvRing.TryAlloc(3 + kVfogCascades, cpu, gpu))
         {
             Submit();
             WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
@@ -10068,7 +10148,8 @@ public:
                 g.dev->CopyDescriptorsSimple(1, at, g_nullSrv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         }
         g.dev->CopyDescriptorsSimple(1, {cpu.ptr + (1 + kVfogCascades) * g.srvInc}, m_vfogUav, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        float k[28] = {};
+        g.dev->CopyDescriptorsSimple(1, {cpu.ptr + (2 + kVfogCascades) * g.srvInc}, m_vfogParamUav, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        float k[32] = {};
         for (int j = 0; j < 3; j++)
             for (int i = 0; i < 4; i++)
                 k[j * 4 + i] = toWorld[i * 4 + j];
@@ -10084,15 +10165,21 @@ public:
         k[24] = s.vfogOutdoor; // the fog's own darkening outdoors (not the particles' particleOutdoor)
         k[25] = s.particleMax;
         k[26] = picked > 0 ? s.vfogSun : 0.0f;
+        // The near air: s.vfogHaze of the light taken over its reach (its depth there is 0.75 x reach at full density).
+        const float haze = s.vfog == 1 ? std::min(std::max(s.vfogHaze, 0.0f), 0.9f) : 0.0f;
+        k[28] = haze > 0 ? -std::log2(1.0f - haze) / (0.75f * s.vfogHazeReach) : 0.0f;
+        k[29] = s.vfogHazeReach;
         Require(&m_vfog, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Require(&m_vfogParam, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         FlushBarriers();
         m_list->SetComputeRootSignature(m_vfogRoot);
         m_list->SetPipelineState(m_vfogPso);
-        m_list->SetComputeRoot32BitConstants(0, 28, k, 0);
+        m_list->SetComputeRoot32BitConstants(0, 32, k, 0);
         m_list->SetComputeRootDescriptorTable(1, gpu);
         if (cascadeCb)
             m_list->SetComputeRootConstantBufferView(2, cascadeCb);
         m_list->Dispatch((gx + 7) / 8, (gy + 7) / 8, 1);
+        Require(&m_vfogParam, kSrvState);
         Require(&m_vfog, kSrvState); // read by the frame's fog pass draws from here on
         FlushBarriers();
         RestoreListState();
@@ -12682,6 +12769,8 @@ public:
         static const char* const fogGi[] = {"50%", "100%", "150%", "200%"};
         static const int fogGiValues[4] = {50, 100, 150, 200};
         static const char* const fogSun[] = {"ВЫКЛ|OFF", "50%", "100%"};
+        static const char* const fogHaze[] = {"ВЫКЛ|OFF", "10%", "20%", "35%", "50%"};
+        static const int fogHazeValues[5] = {0, 10, 20, 35, 50};
         static const char* const dlssModel[] = {"K (ТРАНСФОРМЕР)|K (TRANSFORMER)", "J", "L (DLSS 4.5)|L (DLSS 4.5)", "M (DLSS 4.5)|M (DLSS 4.5)",
                                                 "F (CNN)|F (CNN)", "E (CNN)|E (CNN)"};
         static const char* const dlssCompare[] = {"ВЫКЛ|OFF", "СПРАВА K|RIGHT: K", "СПРАВА J|RIGHT: J", "СПРАВА L|RIGHT: L", "СПРАВА M|RIGHT: M",
@@ -12779,6 +12868,25 @@ public:
                  return v <= 25 ? 0 : v <= 75 ? 1 : 2;
              },
              [](int v) { g_giControl.vfogSun = v * 50; }, true, nullptr},
+            // The near air: a haze of its own near the camera (the sun's shafts in a thin fog).
+            {0, "Плотность воздуха вблизи|Near air density", 0, 4, 1, false, fogHaze, 0, nullptr,
+             [] {
+                 const int v = g_giControl.vfogHaze >= 0 ? g_giControl.vfogHaze.load() : static_cast<int>(GiBase().vfogHaze * 100.0f + 0.5f);
+                 int best = 0;
+                 for (int i = 1; i < 5; i++)
+                     if (abs(fogHazeValues[i] - v) < abs(fogHazeValues[best] - v))
+                         best = i;
+                 return best;
+             },
+             [] {
+                 const int v = static_cast<int>(GiBase().vfogHaze * 100.0f + 0.5f);
+                 int best = 0;
+                 for (int i = 1; i < 5; i++)
+                     if (abs(fogHazeValues[i] - v) < abs(fogHazeValues[best] - v))
+                         best = i;
+                 return best;
+             },
+             [](int v) { g_giControl.vfogHaze = fogHazeValues[v]; }, true, nullptr},
             // Its own darkening outdoors (the smoke's row above is the particles' only).
             {0, "Туман снаружи темнее|Fog darker outdoors", 0, 4, 1, true, outdoor, 0, nullptr,
              [] {
@@ -14614,6 +14722,9 @@ private:
                                                 // ~40% of island's fog (2026-11-14), the sun's cascades reach ~160 m
     TextureCore m_vfog{};
     D3D12_CPU_DESCRIPTOR_HANDLE m_vfogSrv{}, m_vfogUav{};
+    TextureCore m_vfogParam{}; // the fog pass's parameters (1x1 RGBA32F: the near air, the mark 4242), written by the pass
+    D3D12_CPU_DESCRIPTOR_HANDLE m_vfogParamSrv{}, m_vfogParamUav{};
+    D3D12_CPU_DESCRIPTOR_HANDLE m_vfogNull3d{}; // a null 3D view: the volume's slot when there is none (reads zero)
     ID3D12RootSignature* m_vfogRoot = nullptr;
     ID3D12PipelineState* m_vfogPso = nullptr;
     bool m_vfogFailed = false;
@@ -15766,10 +15877,17 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = m_sssSrv;
             if (v && s == kPS && v->info == g_hizPlaceholder && m_hizFrame == m_frame)
                 src[i] = m_hizSrv;
-            // The GI in the fog: by the patched fog pass's slot (the engine's post-process code binds its own textures
-            // there, not the sampler's placeholder file).
-            if (s == kPS && m_ps && static_cast<int>(i) == m_ps->vfogSlot && m_vfogFrame == m_frame && m_rtv[0] && m_rtv[0]->info == m_vfogTarget)
-                src[i] = m_vfogSrv;
+            // The GI in the fog: the patched fog pass's two slots always filled (the engine's post-process code binds only
+            // its own textures; whatever another pass left in these stays: the editor, 2026-11-15): this frame's volume
+            // and parameters for the scene's fog pass, else typed null views (no mark: the pass keeps the engine's fog).
+            if (s == kPS && m_ps && m_ps->vfogSlot >= 0 && (static_cast<int>(i) == m_ps->vfogSlot || static_cast<int>(i) == m_ps->vfogParamSlot))
+            {
+                const bool valid = m_vfogFrame == m_frame && m_rtv[0] && m_rtv[0]->info == m_vfogTarget && m_vfogParamSrv.ptr;
+                if (static_cast<int>(i) == m_ps->vfogSlot)
+                    src[i] = valid ? m_vfogSrv : VfogNull3d();
+                else
+                    src[i] = valid ? m_vfogParamSrv : g_nullSrv;
+            }
             if (v && s == kPS && m_pvolBuilt && m_pvolCpu.ptr && v->info == g_pvolPlaceholder && Gi().on && Gi().particlesGi)
                 src[i] = m_pvolCpu;
         }
