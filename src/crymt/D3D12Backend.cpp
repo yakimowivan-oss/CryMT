@@ -7995,9 +7995,13 @@ public:
         g.bakedOff = g_giControl.bakedOff & 30;
     }
 
+    // A null state is D3D10's default rasterizer: solid. The editor's wireframe views share the main renderer and the
+    // scene's targets; they must not become the GI's source nor run its pass (GetMainViewport.patch, 2026-11-14).
+    bool GiSolidFill() const { return !m_raster || m_raster->desc.FillMode == D3D10_FILL_SOLID; }
+
     void GiSceneDone(const DlssSceneInfo* info)
     {
-        if (!Gi().on || !info || !info->valid || !m_rtv[0] || !m_dsv)
+        if (!Gi().on || !GiSolidFill() || !info || !info->valid || !m_rtv[0] || !m_dsv)
             return;
         auto* color = static_cast<TextureCore*>(m_rtv[0]->info);
         auto* depth = static_cast<TextureCore*>(m_dsv->info);
@@ -14707,7 +14711,7 @@ bool Device::ApplyOnce(bool indexed)
     // Also only with the scene's depth buffer (the one bound when the last scene was handed over): passes before the
     // scene that read it too (the water reflection renders the scene from a mirrored camera, not every frame) would
     // run it with their own depth, and the scene would get that GI (zero or garbage: GI flickering from frame to frame).
-    if (Gi().on && m_giHist[0] && m_giLastRun != m_giFrame && m_ps && PsUsesGiPlaceholder())
+    if (Gi().on && GiSolidFill() && m_giHist[0] && m_giLastRun != m_giFrame && m_ps && PsUsesGiPlaceholder())
     {
         if (!m_giInScene)
             m_stats.giLateReads++;

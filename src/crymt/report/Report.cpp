@@ -132,8 +132,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     const std::wstring folder = reports + stamp + L"\\";
     CreateDirectoryW(reports.c_str(), nullptr);
     CreateDirectoryW(folder.c_str(), nullptr);
+    // crymt_dump.txt: whether the crash minidump (logs\mt\crymt_crash.dmp, left there: large) was written.
     for (const wchar_t* name : {L"crymt_fault.txt", L"crymt_hang.txt", L"crymt_stats.txt", L"crymt_off.txt", L"crymt_focus.txt", L"d3d12.txt",
-                                L"d3dlayer.txt", L"d3d10_census.txt", L"sl.log"})
+                                L"d3dlayer.txt", L"d3d10_census.txt", L"sl.log", L"crymt_dump.txt"})
         if (NewerThanStart(logs + name))
             CopyFileW((logs + name).c_str(), (folder + name).c_str(), FALSE);
     CopyFileW((game + L"Game.log").c_str(), (folder + L"Game.log").c_str(), FALSE);

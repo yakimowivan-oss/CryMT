@@ -6,6 +6,7 @@
 #include <d3d10.h>
 #include <d3d11.h>
 #include <tlhelp32.h>
+#include <dbghelp.h>
 #include <winternl.h>
 #include <xmmintrin.h>
 
@@ -115,6 +116,15 @@ constexpr size_t kStubSize = 32;
 constexpr int kStackArgs = 24;
 // Paths of the fault and hang reports, made before anything can fault (no allocation in the handlers).
 std::string g_faultPath, g_hangPath;
+// A minidump of an unhandled crash (a contributor's patch, GetMainViewport.patch, 2026-11-14): logs\mt\crymt_crash.dmp and
+// how its writing went (crymt_dump.txt); the filter is set again every second, as the engine sets its own.
+std::wstring g_dumpPath, g_dumpStatusPath;
+std::atomic<LPTOP_LEVEL_EXCEPTION_FILTER> g_previousUnhandledFilter{};
+volatile LONG g_dumpWriting;
+void EnsureUnhandledExceptionFilter();
+// The Sandbox Editor (Editor.exe / EditorLauncher.exe, or CRYMT_EDITOR=1): its previews and wireframe views share the
+// device and the renderer with the level's viewport (DlssCamera takes only the main one there).
+bool g_editor;
 
 
 // Renderer fields read by the shadowed getters.
@@ -217,6 +227,20 @@ size_t g_arenaUsed;
 const void* g_dynPtr;
 uint32_t g_dynVerts;
 uintptr_t g_renderer;
+// The editor's main viewport (GetMainViewport.patch): gRenDev and its viewport rectangle as the root EndEf3D found them;
+// a camera on another renderer or viewport (a preview) is not the scene's.
+std::atomic<uintptr_t> g_mainRenderer{};
+std::atomic<uint64_t> g_mainViewport{};
+bool ValidViewportRect(const int* vp)
+{
+    return vp[0] >= -32768 && vp[0] <= 32767 && vp[1] >= -32768 && vp[1] <= 32767 && vp[2] > 0 && vp[2] <= 65535 && vp[3] > 0 &&
+           vp[3] <= 65535;
+}
+uint64_t PackViewportRect(const int* vp)
+{
+    return static_cast<uint64_t>(static_cast<uint16_t>(vp[0])) | static_cast<uint64_t>(static_cast<uint16_t>(vp[1])) << 16 |
+           static_cast<uint64_t>(static_cast<uint16_t>(vp[2])) << 32 | static_cast<uint64_t>(static_cast<uint16_t>(vp[3])) << 48;
+}
 uint8_t g_shadowFog;
 int g_shadowFrameId;
 int g_shadowFrameIdAll;
@@ -1248,6 +1272,8 @@ DWORD WINAPI TitleMain(void*)
     StartReporter();
     for (int tick = 0;; tick++)
     {
+        if ((tick & 3) == 0)
+            EnsureUnhandledExceptionFilter();
         Sleep(250);
         BorderlessApply();
         if (tick % 4)
@@ -2718,6 +2744,7 @@ float g_jitterSign = 1.0f;
 uint64_t g_jitteredCameras[2], g_suspendedCameras; // main / weapon cameras given the jitter; cameras skipped while suspended
 bool g_jitterSuspended; // after the scene is handed over, until the next frame's first camera
 bool g_topJittered;     // the projection on top of the stack carries this frame's jitter
+uint32_t g_topJitterWidth, g_topJitterHeight; // the size that jitter was made for (undone with the same)
 bool g_dlssReset = true;
 DWORD g_jitterSwitchTick;
 // CRYMT_DLSS_JITTER="seq:<start s>:<step s>:<mode>,<mode>,..." for image comparisons: each mode is two signs (x, y)
@@ -2832,11 +2859,26 @@ void FillFPlusLamps(uintptr_t renderer, uint32_t width, uint32_t height)
 void DlssCamera(uintptr_t renderer, const uint8_t* camera, int level)
 {
     uint32_t width, height;
-    g_topJittered = false;
     // The main camera goes to the back end for DLSS and for GI; the jitter only with DLSS.
     const bool dlss = D3DLayerDlssScreen(&width, &height);
     if (!dlss && !D3DLayerScreen(&width, &height))
         return;
+    if (g_editor)
+    {
+        // The editor (GetMainViewport.patch): a preview shares the device and may have the camera's size, but only a
+        // camera on the main viewport's rectangle (the root EndEf3D's) with its aspect, not a recursive one, is the
+        // scene's; the jitter is made for that viewport's size. Not in the game: there main reads the renderer's
+        // viewport while the render thread still sets its own (shadow maps, reflections) for the frame before.
+        const uint64_t mainViewport = g_mainViewport.load(std::memory_order_acquire);
+        const int* vp = reinterpret_cast<const int*>(renderer + kViewportOffset);
+        const float vpAspect = *reinterpret_cast<const float*>(camera + kCamAspect);
+        if (!mainViewport || !ValidViewportRect(vp) || PackViewportRect(vp) != mainViewport ||
+            std::fabs(vpAspect - static_cast<float>(vp[2]) / static_cast<float>(vp[3])) > 0.02f || level > 1)
+            return;
+        width = static_cast<uint32_t>(vp[2]);
+        height = static_cast<uint32_t>(vp[3]);
+    }
+    g_topJittered = false;
     static float frameFov = 1.0f; // the frame's camera as the 3D engine sets it (level 0)
     if (level == 0)
     {
@@ -2881,6 +2923,8 @@ void DlssCamera(uintptr_t renderer, const uint8_t* camera, int level)
         return;
     ApplyJitter(proj, width, height, 1.0f);
     g_topJittered = true;
+    g_topJitterWidth = width;
+    g_topJitterHeight = height;
     g_jitteredCameras[nearZ >= 0.1f ? 0 : 1]++;
 }
 
@@ -2888,8 +2932,10 @@ void DlssCamera(uintptr_t renderer, const uint8_t* camera, int level)
 extern "C" void CameraMatricesHook(uintptr_t renderer, const uint8_t* camera, uintptr_t caller)
 {
     const int level = *reinterpret_cast<const int*>(kRecurseLevel);
-    NoteCamera(caller, level, renderer == g_renderer, camera);
-    if (renderer == g_renderer && GetCurrentThreadId() == g_rtTid)
+    // The editor: the renderer is gRenDev as the root EndEf3D found it (GetMainViewport.patch).
+    const bool mainRenderer = renderer == (g_editor ? g_mainRenderer.load(std::memory_order_acquire) : g_renderer);
+    NoteCamera(caller, level, mainRenderer, camera);
+    if (mainRenderer && GetCurrentThreadId() == g_rtTid)
         DlssCamera(renderer, camera, level);
     reinterpret_cast<void (*)(uintptr_t)>(kViewProjUpdateFn)(renderer);
 }
@@ -2900,6 +2946,16 @@ void DlssBeforeList(uintptr_t renderer)
     if (*reinterpret_cast<const int*>(kRecurseLevel) != 1 || *reinterpret_cast<const int*>(renderer + kBatchListOffset) != kListHdrPostProcess ||
         g_dlssSceneFrame == g_dlssFrame)
         return;
+    if (g_editor)
+    {
+        // The editor: only the main renderer's post-processing on the main viewport, with this frame's camera seen
+        // (GetMainViewport.patch); a preview's does not hand its picture over as the scene.
+        const uint64_t mainViewport = g_mainViewport.load(std::memory_order_acquire);
+        const int* vp = reinterpret_cast<const int*>(renderer + kViewportOffset);
+        if (renderer != g_mainRenderer.load(std::memory_order_acquire) || !g_dlssScene.valid || !mainViewport || !ValidViewportRect(vp) ||
+            PackViewportRect(vp) != mainViewport)
+            return;
+    }
     g_dlssSceneFrame = g_dlssFrame;
     g_dlssScenes++;
     // CRYMT_SUNDUMP=1 (diagnostics): the level-1 lights at this point, once at frame 600: id, origin, flags and the first
@@ -3174,9 +3230,12 @@ void DlssBeforeList(uintptr_t renderer)
     D3DLayerSceneDone(&g_dlssScene);
     g_dlssScene.valid = 0;
     // Post-processing and the HUD see the camera without jitter: undo it on the current projection.
+    // With the size the jitter was made for (the editor's viewport is not the screen's: GetMainViewport.patch).
     uint32_t width, height;
-    if (g_topJittered && D3DLayerDlssScreen(&width, &height))
+    if (g_topJittered && D3DLayerDlssScreen(&width, &height) && g_topJitterWidth && g_topJitterHeight)
     {
+        width = g_topJitterWidth;
+        height = g_topJitterHeight;
         ApplyJitter(**reinterpret_cast<float***>(renderer + kProjStackOffset), width, height, -1.0f);
         reinterpret_cast<void (*)(uintptr_t)>(kViewProjUpdateFn)(renderer);
         g_topJittered = false;
@@ -3190,6 +3249,13 @@ void DlssWriteStats(FILE* f)
 {
     if (!g_dlssOn)
         return;
+    if (g_editor)
+    {
+        const uint64_t viewport = g_mainViewport.load(std::memory_order_acquire);
+        fprintf(f, "editor's main viewport: gRenDev %llx, EndEf3D %llx, rect %d,%d %dx%d\n", static_cast<unsigned long long>(g_mainRenderer.load()),
+                static_cast<unsigned long long>(g_renderer), static_cast<int16_t>(viewport), static_cast<int16_t>(viewport >> 16),
+                static_cast<uint16_t>(viewport >> 32), static_cast<uint16_t>(viewport >> 48));
+    }
     fprintf(f, "dlss: scenes handed over %llu, jittered cameras: main %llu, weapon %llu, skipped while suspended %llu\n"
                "SetCamera calls (caller, level, real renderer, viewport, fov, aspect, near, far, count):\n",
             static_cast<unsigned long long>(g_dlssScenes), static_cast<unsigned long long>(g_jitteredCameras[0]),
@@ -5772,6 +5838,15 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
     if (!g_mainThread)
         g_mainThread = GetCurrentThreadId();
     g_renderer = reinterpret_cast<uintptr_t>(self);
+    if (g_editor) // the main viewport for DlssCamera (GetMainViewport.patch)
+    {
+        uintptr_t mainRenderer = *reinterpret_cast<const uintptr_t*>(kRendererGlobal);
+        if (!mainRenderer)
+            mainRenderer = reinterpret_cast<uintptr_t>(self);
+        g_mainRenderer.store(mainRenderer, std::memory_order_release);
+        const int* vp = reinterpret_cast<const int*>(mainRenderer + kViewportOffset);
+        g_mainViewport.store(ValidViewportRect(vp) ? PackViewportRect(vp) : 0, std::memory_order_release);
+    }
     const int64_t start = Now();
     if (g_inWindow)
         g_windowSum += start - g_windowStart;
@@ -8387,6 +8462,83 @@ void PrintUnwound(FILE* f, CONTEXT ctx)
     }
 }
 
+// The crash minidump (GetMainViewport.patch): written once by the unhandled-exception filter, through dbghelp's
+// MiniDumpWriteDump (Bin64\dbghelp.dll, CryMT's loader, forwards it to the system's), with the modules' data, the
+// memory the stacks point at, threads and handles; crymt_dump.txt says whether it worked. Then the filter before ours.
+void WriteDumpStatus(const char* text)
+{
+    if (g_dumpStatusPath.empty())
+        return;
+    HANDLE file = CreateFileW(g_dumpStatusPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+    DWORD written = 0;
+    WriteFile(file, text, static_cast<DWORD>(strlen(text)), &written, nullptr);
+    CloseHandle(file);
+}
+
+bool WriteCrashDump(EXCEPTION_POINTERS* info)
+{
+    if (!info || g_dumpPath.empty())
+    {
+        WriteDumpStatus("MiniDumpWriteDump unavailable: no exception context or output path\n");
+        return false;
+    }
+    HANDLE file = CreateFileW(g_dumpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        WriteDumpStatus("MiniDumpWriteDump failed: could not create dump file\n");
+        return false;
+    }
+    HMODULE dbghelp = GetModuleHandleW(L"dbghelp.dll");
+    if (!dbghelp)
+        dbghelp = LoadLibraryW(L"dbghelp.dll");
+    using WriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, const MINIDUMP_EXCEPTION_INFORMATION*,
+                                      const MINIDUMP_USER_STREAM_INFORMATION*, const MINIDUMP_CALLBACK_INFORMATION*);
+    const auto writeDump = dbghelp ? reinterpret_cast<WriteDumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    if (!writeDump)
+    {
+        CloseHandle(file);
+        DeleteFileW(g_dumpPath.c_str());
+        WriteDumpStatus("MiniDumpWriteDump failed: DbgHelp export is unavailable\n");
+        return false;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION exception{};
+    exception.ThreadId = GetCurrentThreadId();
+    exception.ExceptionPointers = info;
+    exception.ClientPointers = FALSE;
+    const MINIDUMP_TYPE type = static_cast<MINIDUMP_TYPE>(MiniDumpWithDataSegs | MiniDumpWithHandleData | MiniDumpWithUnloadedModules |
+                                                          MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo |
+                                                          MiniDumpWithFullMemoryInfo);
+    const BOOL ok = writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, type, &exception, nullptr, nullptr);
+    if (ok)
+        FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!ok)
+    {
+        DeleteFileW(g_dumpPath.c_str());
+        WriteDumpStatus("MiniDumpWriteDump failed while writing the dump\n");
+        return false;
+    }
+    WriteDumpStatus("MiniDumpWriteDump succeeded\n");
+    return true;
+}
+
+LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* info)
+{
+    if (InterlockedCompareExchange(&g_dumpWriting, 1, 0) == 0)
+        WriteCrashDump(info);
+    const LPTOP_LEVEL_EXCEPTION_FILTER previous = g_previousUnhandledFilter.load(std::memory_order_acquire);
+    return previous && previous != OnUnhandledException ? previous(info) : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void EnsureUnhandledExceptionFilter()
+{
+    const LPTOP_LEVEL_EXCEPTION_FILTER previous = SetUnhandledExceptionFilter(OnUnhandledException);
+    if (previous && previous != OnUnhandledException)
+        g_previousUnhandledFilter.store(previous, std::memory_order_release);
+}
+
 // Logs the thread and unwound stack of the first faults, then lets the normal handlers run.
 LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
 {
@@ -9510,6 +9662,13 @@ void RunTestCommands()
     {
         Dx12VoxSnap(command + 14);
         FocusLog("frame %llu: voxel snapshot '%s' asked", static_cast<unsigned long long>(g_frame), command + 14);
+        return;
+    }
+    // crymt_testcrash (tests of the crash path: the fault log, the minidump, the report): an access violation on main.
+    if (_stricmp(command, "crymt_testcrash") == 0)
+    {
+        FocusLog("frame %llu: crymt_testcrash", static_cast<unsigned long long>(g_frame));
+        *static_cast<volatile int*>(nullptr) = 0;
         return;
     }
     if (_stricmp(command, "crymt_cubepic") == 0) // the engine's cube as one picture (as Num0)
@@ -11007,6 +11166,18 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         }
         g_faultPath = CryMTLog("crymt_fault.txt");
         g_hangPath = CryMTLog("crymt_hang.txt");
+        g_dumpPath = CryMTDirW() + L"logs\\mt\\crymt_crash.dmp";
+        g_dumpStatusPath = CryMTDirW() + L"logs\\mt\\crymt_dump.txt";
+        DeleteFileW(g_dumpPath.c_str());
+        DeleteFileW(g_dumpStatusPath.c_str());
+        {
+            wchar_t exe[MAX_PATH] = {}, mark[4] = {};
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            const wchar_t* name = wcsrchr(exe, L'\\');
+            name = name ? name + 1 : exe;
+            g_editor = _wcsicmp(name, L"Editor.exe") == 0 || _wcsicmp(name, L"EditorLauncher.exe") == 0 ||
+                       (GetEnvironmentVariableW(L"CRYMT_EDITOR", mark, 4) && wcscmp(mark, L"1") == 0);
+        }
         LARGE_INTEGER freq;
         QueryPerformanceFrequency(&freq);
         g_qpcToMs = 1000.0 / freq.QuadPart;
@@ -11085,6 +11256,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
             g_policy[kBeginFrame] = kSync;
         if (GetEnvironmentVariableW(L"CRYMT_WARMUP", level, 8))
             g_warmupFrames = _wtoi(level);
+        EnsureUnhandledExceptionFilter();
         AddVectoredExceptionHandler(1, OnException);
         if (g_mode == 2)
             CreateThread(nullptr, 0, WatchdogMain, nullptr, 0, nullptr);
