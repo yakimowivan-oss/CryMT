@@ -7764,8 +7764,9 @@ public:
                                            // sky amount, 8 TerrainAO (under trees), 16 the terrain's vertex AO: by default all
                                            // (the user: our GI near, the baked further, in full far away); CRYMT_GI_BAKED=engine
                                            // none (the engine's everywhere, under the GI), or a list (ram,sky,terrainao,vertex)
-        float terrainAoNear = 30.0f;       // CRYMT_GI_TERRAINAONEAR: metres up to which the GI alone works; over 1.5 x that
-                                           // the GI fades out and the baked terms in (far trees are sprites, beyond the voxels)
+        float terrainAoNear = 62.0f;       // CRYMT_GI_TERRAINAONEAR: metres up to which the GI alone works; over 1.5 x that
+                                           // the GI fades out and the baked terms in (far trees are sprites, beyond the voxels);
+                                           // 62 (the panel's top, "up to 155") since 2026-11-14, the user (30 before)
         bool gtaoFull = false;             // CRYMT_GI_GTAOFULL=1: GTAO at full size (island 5120x1440: 3.5 ms against 1.2)
         bool gtaoNoFoliage = false;        // CRYMT_GI_GTAOFOLIAGE=0: grass and leaves (the foliage mask) occlude nothing in GTAO
                                            // (the user: plants looked worse without their occlusion)

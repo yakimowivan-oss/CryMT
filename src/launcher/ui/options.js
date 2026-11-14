@@ -238,8 +238,8 @@ window.CRYMT = (function () {
          hint: L('Движок затеняет по запечённым картам (под деревьями, в складках объектов, землю). Вблизи их заменяет наш GI, дальше они плавно возвращаются, вдали — полностью. Выкл: запечённое везде, поверх GI (вблизи затенение двойное).',
                  'The engine shades from baked maps (under trees, in objects\' creases, the ground). Near the camera our GI replaces them, further they come back smoothly, far away fully. Off: baked everywhere, on top of the GI (double near).'),
          affects: L('затенение вблизи и вдали', 'occlusion near and far')},
-        {id: 'terrainAoNear', section: 'baked', label: L('Наш GI в полную силу до', 'Our GI in full up to'), type: 'slider', def: 30, min: 10, max: 62, step: 2, unit: L('м', 'm'), needs: 'bakedFade', expert: true,
-         ini: ['Env', 'CRYMT_GI_TERRAINAONEAR'], codec: num(30), hint: L('До этого расстояния только наш GI; дальше до 2,5× него GI уходит, а запечённое затенение нарастает.', 'Up to here our GI alone; from here to 2.5x it the GI fades out and the baked occlusion comes in.'), affects: L('переход вблизи/вдали', 'near/far transition')},
+        {id: 'terrainAoNear', section: 'baked', label: L('Наш GI в полную силу до', 'Our GI in full up to'), type: 'slider', def: 62, min: 10, max: 62, step: 2, unit: L('м', 'm'), needs: 'bakedFade', expert: true,
+         ini: ['Env', 'CRYMT_GI_TERRAINAONEAR'], codec: num(62), hint: L('До этого расстояния только наш GI; дальше до 2,5× него GI уходит, а запечённое затенение нарастает.', 'Up to here our GI alone; from here to 2.5x it the GI fades out and the baked occlusion comes in.'), affects: L('переход вблизи/вдали', 'near/far transition')},
 
         // ---- engine
         {id: 'zown', section: 'engine', label: L('Свой z-проход', 'Own z-prepass'), type: 'toggle', def: true, expert: true, needs: 'dx12Mode',
