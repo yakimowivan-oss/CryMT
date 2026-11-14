@@ -42,32 +42,8 @@
 #include "BendSss.h"
 #include "ZPass.h"
 
-// The contact shadows' frame-to-frame mix (Device::SssTemporal): this frame's raw occlusion (t0) and the last output
-// (t1) in the same pixel, the history clamped to the raw result's 3x3 range, weighted by w (0: the raw result).
-static const char* const kSssTemporalShader = R"(
-Texture2D<float> rawTex : register(t0);
-Texture2D<float> histTex : register(t1);
-RWTexture2D<unorm float> outTex : register(u0);
-cbuffer C : register(b0) { uint width; uint height; float weight; float unused; };
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    if (id.x >= width || id.y >= height)
-        return;
-    const float c = rawTex.Load(int3(id.xy, 0));
-    float lo = c, hi = c;
-    [unroll] for (int y = -1; y <= 1; y++)
-        [unroll] for (int x = -1; x <= 1; x++)
-        {
-            const int2 p = clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(width - 1, height - 1));
-            const float v = rawTex.Load(int3(p, 0));
-            lo = min(lo, v);
-            hi = max(hi, v);
-        }
-    const float h = clamp(histTex.Load(int3(id.xy, 0)), lo, hi);
-    outTex[id.xy] = lerp(c, h, weight);
-}
-)";
+// (The contact shadows' frame-to-frame mix, CRYMT_SSS_TEMPORAL, made for the test camera's drift taken for flicker,
+// was removed 2026-11-15: tag experiments-2026-11-15.)
 
 #include <string>
 
@@ -2026,17 +2002,6 @@ float Strengthen(float occ, float indoor)
     float o = saturate(saturate(occ) * lerp(motionParams.w, occRange.y, indoor));
     return o * (1 - motionParams.z * o);
 }
-// ... outdoors under cover (a canopy, an eave: the ray up's cover, without the walls a room needs) the outdoor strength
-// grows towards the canopy's (CRYMT_GI_CANOPY, visAreas[kProbeOptions].y; 0 off). The user (2026-11-14, village forest):
-// v19's darker open forest (outdoor 1.0) looked better; at 0.45 the frame came out lighter than with no GI.
-float StrengthenUnder(float occ, float indoor, float canopy)
-{
-    const float c = visAreas[kProbeOptions].y;
-    const float outdoor = c > 0 ? lerp(motionParams.w, c, canopy) : motionParams.w;
-    float o = saturate(saturate(occ) * lerp(outdoor, occRange.y, indoor));
-    return o * (1 - motionParams.z * o);
-}
-
 // The depth texel a GI texel stands for: the top-left one of its 2x2 block, or (options & 2) the nearest one that is not
 // the weapon. With DLAA jitter a fixed texel lands on thin geometry in one frame and on what lies behind in the next, so
 // the GI texel flips and loses its history; the nearest of four keeps thin geometry its own texel, and the full-size
@@ -2318,14 +2283,12 @@ float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
     // relocation moved off walls skim floors and walls, a mip-3 block by a surface is never empty, and level 0's half
     // cells to 6 m made the probes pass 0.5 -> 1.9 ms). One loop a level (unrolled: the level is a constant in each, so
     // a wave's rays sample one texture, not every level's in turn as in one loop with the level chosen per step); a ray
-    // that leaves a level's grid goes on in the next. Precise rays (the panel's "Probe rays", to compare with the stage
-    // before the speed-ups, 3.2 ms): levels to 6 / 12 / 24 m, half cells to 6 m, no skip over mip 2.
-    const bool precise = visAreas[kProbeOptions].x > 0.5;
-    const float halfTo = precise ? 6 : 1.5;
+    // that leaves a level's grid goes on in the next. (Precise rays, CRYMT_GI_PROBEPRECISE - levels to 6 / 12 / 24 m, half
+    // cells to 6 m, no skip over mip 2: 2.2x the cost, no visible gain - removed 2026-11-15, tag experiments-2026-11-15.)
+    const float halfTo = 1.5;
     [unroll] for (int level = 0; level < 4; level++)
     {
-        const float tEnd = min(precise ? (level == 0 ? 6 : level == 1 ? 12 : level == 2 ? 24 : reach)
-                                       : (level == 0 ? 3 : level == 1 ? 8 : level == 2 ? 20 : reach), reach);
+        const float tEnd = min(level == 0 ? 3 : level == 1 ? 8 : level == 2 ? 20 : reach, reach);
         const float cell = vs * (1 << level);
         [loop] for (int i = 0; i < 64 && blocked < 0.95 && t < tEnd; i++)
         {
@@ -2341,7 +2304,7 @@ float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
                 t += cell * 3;
                 continue;
             }
-            if (!precise && SampleGrid(level, X, 2).a < 0.002)
+            if (SampleGrid(level, X, 2).a < 0.002)
             {
                 t += cell;
                 continue;
@@ -2399,8 +2362,8 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const int2 st = ProbeStateTexel(slot, c), texel = ProbeTile(slot, c) + int2(tid.xy);
     const float4 state = historyTex.Load(int3(st, 0));
     const bool valid = state.w >= 1 && all(state.xyz == ProbeKey(wc)) && temporal > 0;
-    // The outer cascades every 8th frame (precise rays: every 4th, as the near one).
-    const uint period = c == 0 || visAreas[kProbeOptions].x > 0.5 ? 3u : 7u;
+    // The outer cascades every 8th frame, the near one every 4th.
+    const uint period = c == 0 ? 3u : 7u;
     const bool due = !valid || (((uint)slot + (uint)frame) & period) == 0;
     const int2 ot = ProbeOffsetTexel(slot, c);
     const float3 offset = valid ? historyTex.Load(int3(ot, 0)).xyz : 0;
@@ -2810,13 +2773,11 @@ void trace(uint3 id : SV_DispatchThreadID)
             float roof = VisAreaAt(Pw + Nw * 0.5) >= 0 ? 1 : 0;
             if (roof < 1 && ((uint)options & 128) != 0) // CRYMT_GI_ROOFCELLS=1
                 roof = max(roof, RoofAt(Pw + Nw * (voxParams.x * 2)));
-            float canopy = 0; // the cover above outdoors (StrengthenUnder)
-            if (roof < 1 && (occRange.y != motionParams.w || visAreas[kProbeOptions].y > 0))
+            if (roof < 1 && occRange.y != motionParams.w)
             {
                 float ra = noise * 6.2831853;
                 float3 up = normalize(float3(0, 0, 1) + Nw * 0.5 + (T * cos(ra) + B * sin(ra)) * 0.25);
                 const float cover = RoofCover(O, up, frac(noise + 0.5));
-                canopy = cover;
                 if (occRange.y != motionParams.w)
                 {
                 // A roof alone is no room: an eave over an open yard, a canopy (the user, mine 2026-11-14: a wall under
@@ -2872,7 +2833,7 @@ void trace(uint3 id : SV_DispatchThreadID)
             // The screen part's occlusion takes the AO strength (occlusion), the cones' their own (voxParams2.x).
             nearLight += (1 - nearOcc) * farLight;
             nearOcc = 1 - (1 - saturate(nearOcc * occlusion)) * (1 - saturate(farOcc * voxParams2.x));
-            result = float4(nearLight, StrengthenUnder(nearOcc, roof, canopy)) * fade;
+            result = float4(nearLight, Strengthen(nearOcc, roof)) * fade;
         }
         else
             result = float4(nearLight, Strengthen(nearOcc * occlusion, 1)) * fade; // no grid: the strength everywhere
@@ -2998,21 +2959,6 @@ void upsample(uint3 id : SV_DispatchThreadID)
     if (d >= 0.99999)
     {
         outTex[id.xy] = float4(0, 0, 0, flags);
-        return;
-    }
-    // Grass and leaves (the z-prepass's foliage mask, t43: 1 leaves, 0.6 grass): the GI texels around, by place only.
-    // A GI texel stands for one depth sample of its block, and under DLAA's jitter a thin leaf is in it one frame and
-    // the ground behind the next: by distance a leaf took a different texel each frame (the user, 2026-11-14, village
-    // forest: the still view's spread per pixel 6.4 of 255 against 1.6 with no GI; 4.0 with no GI on foliage). Four
-    // bilinear taps a texel off each way average about 4 x 4 texels (visAreas[kProbeOptions].z, CRYMT_GI_FOLIAGESMOOTH).
-    if (visAreas[kProbeOptions].z > 0.5 && giFoliageTex.Load(int3(id.xy, 0)) > 0.5)
-    {
-        const float2 uv = (float2(id.xy) + 0.5) / fullSize;
-        const float2 px = 1.0 / giSize;
-        float4 smooth = 0;
-        [unroll] for (int k = 0; k < 4; k++)
-            smooth += srcTex.SampleLevel(linearClamp, uv + float2((k & 1) ? px.x : -px.x, (k & 2) ? px.y : -px.y), 0);
-        outTex[id.xy] = smooth * 0.25 + float4(0, 0, 0, flags);
         return;
     }
     float z = depthParams.y / (d + depthParams.x);
@@ -5704,7 +5650,6 @@ struct Stats
     uint64_t giStampTicks[5], giStampRuns; // GI pass timers: trace, filter, upsample, voxel geometry, voxel update
     uint64_t giProbeRuns;                  // GI v2: the probes' pass runs
     uint64_t sssRuns, sssDispatches, sssNoDepth; // RunSss: frames made, their dispatches, frames without the z-prepass target
-    uint64_t sssTemporalRuns;                    // SssTemporal: frames mixed with the last one
     uint64_t engineCubeDraws, engineCubeFaces[6]; // draws into the engine's environment cube (Dx12EngineEnvCube), per face
     uint64_t engineCubeUnbinds;                   // its source let go as a render target (ReleaseOutput)
     uint64_t engineCubeHdrRuns;                   // faces taken into the HDR copy (RunCubeUpdate)
@@ -8020,12 +7965,6 @@ public:
                                            // 1.0 before 2026-11-14 (with the voxels' occlusion 1.2 the cones darkened open
                                            // yards x0.15-0.2 against no GI; the indoor strength keeps the rooms dark), then
                                            // 0.45 (forest lighter than no GI), 0.7 the user's pick (forest 44.7, no GI 49.9)
-        bool foliageSmooth = false;        // CRYMT_GI_FOLIAGESMOOTH=1: grass and leaves take the GI texels around by place
-                                           // (upsample). Off: the "flicker" it was made for was the test camera's drift
-                                           // after the teleport (2026-11-14; a still view: GI 1.27 = no GI 1.3)
-        float canopyStrength = 0.0f;       // CRYMT_GI_CANOPY: the occlusion strength outdoors under cover (a canopy, an eave:
-                                           // the ray up's cover), the outdoor one towards it (StrengthenUnder); 0 off (the
-                                           // forest: 1.4 darkened the frame 53.3 -> 50.4 only, the leaves are hardly in the voxels)
         bool roofCells = false;            // CRYMT_GI_ROOFCELLS=1: the roof texture (kVoxShader "roof") as well as the ray
         bool thinFix = true;               // CRYMT_GI_THIN=0: thin features keep their own (chance) GI
         bool roomLight = true;             // CRYMT_GI_ROOMLIGHT=0: cones from inside a VisArea take light from outside it too
@@ -8038,8 +7977,6 @@ public:
                                            // of the cones near the camera (kGiShader "probes", ProbeLight); 2: the probes'
                                            // light with the cones' occlusion
         bool probeVisibility = true;       // CRYMT_GI_PROBEVIS=0: no visibility test (measures the light it keeps out)
-        bool probePrecise = false;         // CRYMT_GI_PROBEPRECISE=1: the probes' rays as before the speed-ups (2026-11-14,
-                                           // 3.2 ms for two cascades against 1.17; the panel's "Probe rays", to compare)
         float probeStrength = 1.5f;        // CRYMT_GI_PROBESTRENGTH: their bounce light's factor (the cones' is voxelStrength
                                            // 1.5: coarse mips lose light; the probes' thin rays see the cells' full light).
                                            // 1.0 until 2026-11-14 (at 1.5 the loop through the screen's colour once lit
@@ -8058,8 +7995,6 @@ public:
                                            // materials take them beyond the shadow maps too: fragLib, Terrain). 4000 m
                                            // since 2026-11-12 (the user; 0.235 ms at 5120x1440 against 0.231 at 1000 m)
         float sssNear = 0.0f;              // CRYMT_SSS_NEAR: metres; nearer pixels get none
-        float sssTemporal = 0.0f;          // CRYMT_SSS_TEMPORAL: the last frame's weight in the contact shadows (SssTemporal; 0 off:
-                                           // made for a "flicker" that was the test camera's drift, 2026-11-14)
         float sssWeaponThickness = 0.1f;   // CRYMT_SSS_WEAPONTHICK: the first-person view's thickness, a share of its depth (at
                                            // the world's 0.005 the weapon cast no shadow on the hands)
         float gtao = 1.5f;                 // CRYMT_GI_GTAO=<strength>: GTAO in place of the engine's SSAO, a factor on the GI's
@@ -8182,8 +8117,6 @@ public:
                 v.mipOpacity = _wtoi(text);
             read(L"CRYMT_GI_FLOOR", v.ambientFloor);
             read(L"CRYMT_GI_OUTDOOR", v.outdoorStrength);
-            read(L"CRYMT_GI_CANOPY", v.canopyStrength);
-            v.foliageSmooth = GetEnvironmentVariableW(L"CRYMT_GI_FOLIAGESMOOTH", text, 32) && wcscmp(text, L"0") != 0;
             v.roofCells = GetEnvironmentVariableW(L"CRYMT_GI_ROOFCELLS", text, 32) && wcscmp(text, L"0") != 0;
             v.thinFix = !(GetEnvironmentVariableW(L"CRYMT_GI_THIN", text, 32) && wcscmp(text, L"0") == 0);
             v.roomLight = !(GetEnvironmentVariableW(L"CRYMT_GI_ROOMLIGHT", text, 32) && wcscmp(text, L"0") == 0);
@@ -8193,7 +8126,6 @@ public:
                 v.probes = std::min(std::max(_wtoi(text), 0), 2);
             read(L"CRYMT_GI_PROBESTRENGTH", v.probeStrength);
             v.probeVisibility = !(GetEnvironmentVariableW(L"CRYMT_GI_PROBEVIS", text, 32) && wcscmp(text, L"0") == 0);
-            v.probePrecise = GetEnvironmentVariableW(L"CRYMT_GI_PROBEPRECISE", text, 32) && wcscmp(text, L"0") != 0;
             v.replaceSsao = !(GetEnvironmentVariableW(L"CRYMT_GI_SSAO", text, 32) && wcscmp(text, L"0") != 0);
             read(L"CRYMT_GI_GTAO", v.gtao);
             read(L"CRYMT_GI_GTAORADIUS", v.gtaoRadius);
@@ -8205,7 +8137,6 @@ public:
                 v.sssSamples = std::min(std::max(_wtoi(text), 16), 256);
             read(L"CRYMT_SSS_THICKNESS", v.sssThickness);
             read(L"CRYMT_SSS_CONTRAST", v.sssContrast);
-            read(L"CRYMT_SSS_TEMPORAL", v.sssTemporal);
             read(L"CRYMT_SSS_EDGE", v.sssEdge);
             read(L"CRYMT_SSS_REACH", v.sssReach);
             read(L"CRYMT_SSS_NEAR", v.sssNear);
@@ -8331,7 +8262,6 @@ public:
         g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
         g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 2) : b.dirLight;
         g.probes = g_giControl.probes >= 0 ? std::min(g_giControl.probes.load(), 2) : b.probes;
-        g.probePrecise = g_giControl.probePrecise >= 0 ? g_giControl.probePrecise > 0 : b.probePrecise;
         if (g_giControl.gtaoHistory >= 0) // the AO page's "Накопление GTAO": off, 0.5, 0.7, 0.9
         {
             static constexpr float kWeights[4] = {0.0f, 0.5f, 0.7f, 0.9f};
@@ -9562,105 +9492,6 @@ public:
         return SUCCEEDED(hr);
     }
 
-    // The contact shadows' frame-to-frame mix (RunSss): root 4 constants (b0: width, height, the history's weight) and a
-    // table of t0 this frame's raw result, t1 the last frame's output, u0 the output (m_sss).
-    bool EnsureSssTemporalPipeline()
-    {
-        if (m_sssTempPso || m_sssTempFailed)
-            return m_sssTempPso != nullptr;
-        m_sssTempFailed = true;
-        using CompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, ID3DBlob**, ID3DBlob**);
-        HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
-        auto compile = compiler ? reinterpret_cast<CompileFn>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
-        if (!compile || !g_serializeRoot)
-            return false;
-        ID3DBlob* code = nullptr;
-        ID3DBlob* errors = nullptr;
-        HRESULT hr = compile(kSssTemporalShader, strlen(kSssTemporalShader), "CryMT_SssTemporal", nullptr, nullptr, "main", "cs_5_0", 1 << 15, 0, &code, &errors);
-        if (FAILED(hr))
-        {
-            Log("contact shadows' temporal shader: %s", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile failed");
-            if (code)
-                code->Release();
-            if (errors)
-                errors->Release();
-            return false;
-        }
-        if (errors)
-            errors->Release();
-        D3D12_DESCRIPTOR_RANGE ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
-        D3D12_ROOT_PARAMETER params[2]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.Num32BitValues = 4;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable = {2, ranges};
-        D3D12_ROOT_SIGNATURE_DESC rd{};
-        rd.NumParameters = 2;
-        rd.pParameters = params;
-        ID3DBlob* blob = nullptr;
-        ID3DBlob* rootErrors = nullptr;
-        hr = g_serializeRoot(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rootErrors);
-        if (SUCCEEDED(hr))
-            hr = g.dev->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature),
-                                            reinterpret_cast<void**>(&m_sssTempRoot));
-        if (blob)
-            blob->Release();
-        if (rootErrors)
-            rootErrors->Release();
-        if (SUCCEEDED(hr))
-        {
-            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-            pd.pRootSignature = m_sssTempRoot;
-            pd.CS = {code->GetBufferPointer(), code->GetBufferSize()};
-            hr = g.dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), reinterpret_cast<void**>(&m_sssTempPso));
-        }
-        code->Release();
-        m_sssTempFailed = FAILED(hr);
-        Log("contact shadows' temporal pipeline: %s", SUCCEEDED(hr) ? "ready" : "failed");
-        return SUCCEEDED(hr);
-    }
-
-    // m_sss = this frame's raw result (m_sssRaw) mixed with the last output (m_sssHist), the history kept within the raw
-    // result's 3x3 range (what moved does not trail); then the output becomes the next frame's history. No history
-    // after a reset, a size change or a frame without contact shadows.
-    void SssTemporal(UINT w, UINT h)
-    {
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu;
-        D3D12_GPU_DESCRIPTOR_HANDLE gpu;
-        while (!m_srvRing.TryAlloc(3, cpu, gpu))
-        {
-            Submit();
-            WaitFence(m_srvRing.OldestFence() ? m_srvRing.OldestFence() : g.signaled);
-            PollFence();
-            m_srvRing.Reclaim();
-        }
-        const bool history = m_sssHistValid && m_sssFrame + 1 == m_frame && !m_giReset;
-        Require(&m_sssRaw, kSrvState);
-        Require(&m_sssHist, kSrvState);
-        Require(&m_sss, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        FlushBarriers();
-        g.dev->CreateShaderResourceView(m_sssRaw.res, nullptr, cpu);
-        g.dev->CreateShaderResourceView(m_sssHist.res, nullptr, {cpu.ptr + g.srvInc});
-        D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
-        ud.Format = DXGI_FORMAT_R8_UNORM;
-        ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        g.dev->CreateUnorderedAccessView(m_sss.res, nullptr, &ud, {cpu.ptr + 2 * g.srvInc});
-        uint32_t k[4] = {w, h, 0, 0};
-        const float weight = history ? std::min(Gi().sssTemporal, 0.95f) : 0.0f;
-        memcpy(&k[2], &weight, sizeof(weight));
-        m_list->SetComputeRootSignature(m_sssTempRoot);
-        m_list->SetPipelineState(m_sssTempPso);
-        m_list->SetComputeRootDescriptorTable(1, gpu);
-        m_list->SetComputeRoot32BitConstants(0, 4, k, 0);
-        m_list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-        Require(&m_sss, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Require(&m_sssHist, D3D12_RESOURCE_STATE_COPY_DEST);
-        FlushBarriers();
-        m_list->CopyResource(m_sssHist.res, m_sss.res);
-        m_sssHistValid = true;
-        m_stats.sssTemporalRuns += history ? 1 : 0;
-    }
-
     // Bend's screen-space shadows for the sun from the frame's z-prepass depth (its R32F target: view depth / far), before
     // the deferred shadow pass reads them: 1 to 8 dispatches by the sun's place on screen (Bend::BuildDispatchList), each
     // 64-pixel run of a line towards the sun sharing its depth samples. The depth goes in as 1 / linear depth (BendSss.h).
@@ -9705,29 +9536,9 @@ public:
             if (!m_sssSrv.ptr)
                 m_sssSrv = g_srvCpu.Alloc();
             g.dev->CreateShaderResourceView(m_sss.res, nullptr, m_sssSrv);
-            // The temporal pass's raw result and history (SssTemporal), the same size.
-            for (TextureCore* t : {&m_sssRaw, &m_sssHist})
-            {
-                DeferRelease(t->res);
-                t->res = nullptr;
-                if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                                                          __uuidof(ID3D12Resource), reinterpret_cast<void**>(&t->res))))
-                    t->res = nullptr;
-                t->width = w;
-                t->height = h;
-                t->format = DXGI_FORMAT_R8_UNORM;
-                t->samples = 1;
-                t->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-            }
-            m_sssHistValid = false;
             Log("screen-space shadows %ux%u", w, h);
         }
-        // Foliage flickered frame to frame under DLAA's jitter (the user, 2026-11-14, village forest: a still view's
-        // spread per pixel 6.8 of 255 against 1.6 with no GI; 4.0 with the contact shadows off, GTAO and the voxels did
-        // not matter): Bend's rays hit a leaf in one frame and miss it in the next. Its result now goes to m_sssRaw and is
-        // mixed with the last frame's (SssTemporal) into m_sss (CRYMT_SSS_TEMPORAL, the history's weight; 0 off).
-        const bool temporal = Gi().sssTemporal > 0 && m_sssRaw.res && m_sssHist.res && EnsureSssTemporalPipeline();
-        TextureCore* const bendOut = temporal ? &m_sssRaw : &m_sss;
+        TextureCore* const bendOut = &m_sss;
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
         while (!m_srvRing.TryAlloc(4, cpu, gpu))
@@ -9802,8 +9613,6 @@ public:
             m_list->SetComputeRoot32BitConstants(0, 16, k, 0);
             m_list->Dispatch(d.WaveCount[0], d.WaveCount[1], d.WaveCount[2]);
         }
-        if (temporal)
-            SssTemporal(w, h);
         if (m_giDumpWanted) // the capture key: the result as logs\play\<tag>_sss.pgm, the foliage mask as <tag>_foliage.pgm
         {
             Require(&m_sss, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -10914,9 +10723,7 @@ public:
                             : 0.0f;
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
-            f[(kVisFloat4s - 1) * 4] = Gi().probePrecise ? 1.0f : 0.0f; // [161].x: the probes' precise rays
-            f[(kVisFloat4s - 1) * 4 + 1] = Gi().canopyStrength;        // [161].y: the occlusion strength under cover outdoors
-            f[(kVisFloat4s - 1) * 4 + 2] = Gi().foliageSmooth ? 1.0f : 0.0f; // [161].z: grass and leaves take the GI around (upsample)
+            // [161].x..z: free (precise rays, canopy, foliage smoothing removed 2026-11-15)
             f[(kVisFloat4s - 1) * 4 + 3] = Gi().gtaoHistoryWeight;          // [161].w: GTAO's history weight (gtaoBlur)
         }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
@@ -11014,7 +10821,7 @@ public:
             g.dev->CreateShaderResourceView(probeCur, &pd, at(24 + kGiVoxTable - 3));
             g.dev->CreateShaderResourceView(probeDepthCur, &pdd, at(24 + kGiVoxTable - 2));
             // t43: the foliage mask for the upsample's smoothing on grass and leaves (null: none)
-            const bool foliageOk = Gi().foliageSmooth && m_foliageSrv && m_foliageFrame == m_frame && m_foliageW == m_giFullW && m_foliageH == m_giFullH;
+            const bool foliageOk = false && m_foliageSrv && m_foliageFrame == m_frame && m_foliageW == m_giFullW && m_foliageH == m_giFullH;
             if (foliageOk)
             {
                 m_foliageSrv->Refresh();
@@ -13050,7 +12857,6 @@ public:
         static const char* const giNear[] = {"30 М (ДО 75)|30 M (TO 75)", "40 М (ДО 100)|40 M (TO 100)", "50 М (ДО 125)|50 M (TO 125)",
                                              "62 М (ДО 155)|62 M (TO 155)"};
         static const char* const giMethod[] = {"КОНУСЫ|CONES", "ПРОБЫ (GI v2)|PROBES (GI v2)", "СВЕТ ПРОБ, ТЕНЬ КОНУСОВ|PROBE LIGHT, CONE SHADE"};
-        static const char* const probeRays[] = {"БЫСТРЫЕ|FAST", "ТОЧНЫЕ (ДОРОЖЕ)|PRECISE (SLOWER)"};
         static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
@@ -13109,10 +12915,6 @@ public:
             {0, "Метод GI|GI method", 0, 2, 1, true, giMethod, 0, nullptr,
              [] { const int v = g_giControl.probes; return v < 0 ? GiBase().probes : std::min(v, 2); },
              [] { return GiBase().probes; }, [](int v) { g_giControl.probes = v; }, true, nullptr},
-            // The probes' rays (CRYMT_GI_PROBEPRECISE): as before the speed-ups of 2026-11-14 (3.2 ms) to compare.
-            {0, "Лучи проб|Probe rays", 0, 1, 1, true, probeRays, 0, nullptr,
-             [] { const int v = g_giControl.probePrecise; return v < 0 ? (GiBase().probePrecise ? 1 : 0) : std::min(v, 1); },
-             [] { return GiBase().probePrecise ? 1 : 0; }, [](int v) { g_giControl.probePrecise = v; }, true, nullptr},
             {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
              [] { return GiBase().particlesGi ? 1 : 0; }, [](int v) { g_giControl.particles = v; }, true, nullptr},
@@ -15011,11 +14813,6 @@ private:
     ID3D12RootSignature* m_sssRoot = nullptr;
     ID3D12PipelineState* m_sssPso = nullptr;
     bool m_sssFailed = false;
-    TextureCore m_sssRaw{}, m_sssHist{}; // SssTemporal: Bend's raw result, the last output
-    bool m_sssHistValid = false;
-    ID3D12RootSignature* m_sssTempRoot = nullptr;
-    ID3D12PipelineState* m_sssTempPso = nullptr;
-    bool m_sssTempFailed = false;
     uint64_t m_sssTriedFrame = ~0ull, m_sssFrame = ~0ull;
     float m_sssClip[4] = {};
     float m_sssFar = 0;
@@ -18603,9 +18400,9 @@ void Dx12WriteStats(FILE* f, double frames)
             static_cast<unsigned long long>(s.engineCubeFaces[3]), static_cast<unsigned long long>(s.engineCubeFaces[4]),
             static_cast<unsigned long long>(s.engineCubeFaces[5]), static_cast<unsigned long long>(s.engineCubeUnbinds),
             static_cast<unsigned long long>(s.engineCubeHdrRuns));
-    fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu; mixed with the last frame %llu\n",
+    fprintf(f, "  screen-space shadows (Bend): made in %llu frames, %.2f dispatches each; frames without the z-prepass target %llu\n",
             static_cast<unsigned long long>(s.sssRuns), s.sssRuns ? static_cast<double>(s.sssDispatches) / s.sssRuns : 0.0,
-            static_cast<unsigned long long>(s.sssNoDepth), static_cast<unsigned long long>(s.sssTemporalRuns));
+            static_cast<unsigned long long>(s.sssNoDepth));
     fprintf(f, "  GI geometry: first-person draws (weapon, hands) left out %.1f per frame\n", s.voxGeomWeapon / frames);
     if (s.voxInjectRuns || s.voxInjectSkipped)
         fprintf(f, "  GI cells from the engine cube's faces (inject): faces %llu (%.2f per frame), skipped (depth and colour sizes differ) %llu\n",

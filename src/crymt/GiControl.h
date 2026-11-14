@@ -24,7 +24,6 @@ struct GiControl
     std::atomic<int> dirLight{-1};  // the voxels' light: 0 one colour, 1 colour + direction, 2 six directions; -1 as CRYMT_GI_DIRLIGHT
     std::atomic<int> probes{-1};    // GI method: 0 the cones, 1 probes through the voxels (GI v2), 2 the probes' light with
                                     // the cones' occlusion; -1 as CRYMT_GI_PROBES
-    std::atomic<int> probePrecise{-1}; // the probes' rays: 0 fast, 1 precise (as before the speed-ups); -1 as CRYMT_GI_PROBEPRECISE
     std::atomic<int> particles{-1}; // blended particles (smoke, dust) take the GI 1 / 0
     std::atomic<int> vfog{-1};      // the GI in the engine's fog 1 / 0 (2: a zero volume, the engine's fog); -1 as CRYMT_VFOG
     std::atomic<int> vfogGi{-1};    // ... its strength, percent; -1 as CRYMT_VFOG_GI
