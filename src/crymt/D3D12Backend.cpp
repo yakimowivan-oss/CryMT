@@ -1138,6 +1138,7 @@ const ResourceInfo* g_sssPlaceholder;     // Textures/CryMT/sss.dds (ShadowMaskG
 const ResourceInfo* g_envPlaceholder;     // Textures/CryMT/env.dds (fragLib's CryMT_EnvSampler), see IsEnvPlaceholder
 const ResourceInfo* g_waterEnvPlaceholder; // Textures/CryMT/waterenv.dds (Water.cfx's CryMT_WaterEnvSampler), see IsWaterEnvPlaceholder
 const ResourceInfo* g_hizPlaceholder;      // Textures/CryMT/hiz.dds (Water.cfx's CryMT_HiZSampler), see IsHizPlaceholder
+const ResourceInfo* g_ssrPrevPlaceholder;  // Textures/CryMT/ssrprev.dds (Water.cfx's CryMT_WaterPrevSampler), see IsSsrPrevPlaceholder
 const ResourceInfo* g_vfogPlaceholder;     // Textures/CryMT/vfog.dds (PostProcess.cfx's CryMT_VFogSampler), see IsVfogPlaceholder
 
 // The 2D environment map from the engine's cube (Device::RunEnv2D; the first-person weapons' Metal reads its own 2D map
@@ -8158,6 +8159,7 @@ public:
         FlushBarriers();
         m_list->CopyResource(m_giColor, color->res);
         m_barriers.push_back(Transition(m_giColor, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState));
+        m_giColorFrame = m_frame;
         m_giFrame++;
     }
 
@@ -8423,6 +8425,121 @@ public:
         m_zTargetFrame = m_frame;
     }
 
+    // The water's SSR reads the previous frame's finished scene (the GI's colour copy at SceneDone: after the particles and
+    // clouds, which the scene copy Water.cfx reads is taken before; the user, 2026-11-15: "чтобы отражались particle и
+    // облака"). Texels 8..10 (out[0..11]): this frame's homogeneous screen point s = (u w, v w, w, 1) - or a direction,
+    // w 0 - to the previous frame's (u w, v w, w), each frame with its own jitter, in double; texel 11: 1 when the copy
+    // is the last frame's, and its size. s = H A + t for H the point's offset from the camera (world), so H = (s - t)
+    // A^-1; the previous view is (H + c - c') R', then its projection.
+    void WaterPrevFrame(const DlssSceneInfo* info, float* out)
+    {
+        const bool prevCamera = m_ssrPrevCamFrame + 1 == m_frame;
+        // CRYMT_SSR_PREV=0: the current scene copy only, as before (A/B).
+        static const bool allowed = [] {
+            wchar_t v[8] = {};
+            return !(GetEnvironmentVariableW(L"CRYMT_SSR_PREV", v, 8) && wcscmp(v, L"0") == 0);
+        }();
+        m_ssrPrevOn = allowed && WaterSsrOn() && !m_hizFailed && m_giColor && m_giColorFrame + 1 == m_frame && prevCamera && !info->reset;
+        if (m_ssrPrevOn && m_ssrPrevRes != m_giColor)
+        {
+            if (!m_ssrPrevSrv.ptr)
+                m_ssrPrevSrv = g_srvCpu.Alloc();
+            g.dev->CreateShaderResourceView(m_giColor, nullptr, m_ssrPrevSrv);
+            m_ssrPrevRes = m_giColor;
+        }
+        if (m_ssrPrevOn)
+        {
+            // This frame: the columns of (u w, v w, w) over H (rows 0..2) and t (row 3).
+            double a[4][3] = {};
+            const double su = info->shiftU, sv = info->shiftV;
+            for (int i = 0; i < 4; i++)
+            {
+                double x = 0, y = 0, w = 0;
+                for (int j = 0; j < 3; j++)
+                {
+                    const double r = i < 3 ? static_cast<double>(info->view[i * 4 + j]) : 0.0;
+                    x += r * info->proj[j * 4 + 0];
+                    y += r * info->proj[j * 4 + 1];
+                    w += r * info->proj[j * 4 + 3];
+                }
+                if (i == 3)
+                {
+                    x = info->proj[12];
+                    y = info->proj[13];
+                    w = info->proj[15];
+                }
+                a[i][0] = 0.5 * x + (0.5 + su) * w;
+                a[i][1] = -0.5 * y + (0.5 + sv) * w;
+                a[i][2] = w;
+            }
+            // A^-1 (3x3, row-vector convention: s = H A).
+            const double (&m)[4][3] = a;
+            const double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+                               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            if (fabs(det) < 1e-12)
+                m_ssrPrevOn = false;
+            else
+            {
+                double inv[3][3];
+                inv[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det;
+                inv[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det;
+                inv[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det;
+                inv[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det;
+                inv[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det;
+                inv[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det;
+                inv[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det;
+                inv[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det;
+                inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det;
+                // H over s (rows 0..2) and the constant (row 3): H = s A^-1 - t A^-1.
+                double h[4][3] = {};
+                for (int i = 0; i < 3; i++)
+                    for (int k = 0; k < 3; k++)
+                        h[i][k] = inv[i][k];
+                for (int k = 0; k < 3; k++)
+                    h[3][k] = -(m[3][0] * inv[0][k] + m[3][1] * inv[1][k] + m[3][2] * inv[2][k]);
+                // The previous view (H + c - c') R', then its projection and jitter.
+                double c[3], cp[3];
+                CameraPlace(info->view, info->camPos, c);
+                CameraPlace(m_ssrPrevView, m_ssrPrevCamPos, cp);
+                double q[4][4] = {}; // (s, 1) -> the previous view (x, y, z, 1)
+                for (int i = 0; i < 4; i++)
+                {
+                    for (int j = 0; j < 3; j++)
+                    {
+                        double v = 0;
+                        for (int k = 0; k < 3; k++)
+                            v += (h[i][k] + (i == 3 ? c[k] - cp[k] : 0.0)) * m_ssrPrevView[k * 4 + j];
+                        q[i][j] = v;
+                    }
+                    q[i][3] = i == 3 ? 1.0 : 0.0;
+                }
+                const double pu = m_ssrPrevShift[0], pv = m_ssrPrevShift[1];
+                for (int i = 0; i < 4; i++)
+                {
+                    double x = 0, y = 0, w = 0;
+                    for (int j = 0; j < 4; j++)
+                    {
+                        x += q[i][j] * m_ssrPrevProj[j * 4 + 0];
+                        y += q[i][j] * m_ssrPrevProj[j * 4 + 1];
+                        w += q[i][j] * m_ssrPrevProj[j * 4 + 3];
+                    }
+                    out[i] = static_cast<float>(0.5 * x + (0.5 + pu) * w);
+                    out[4 + i] = static_cast<float>(-0.5 * y + (0.5 + pv) * w);
+                    out[8 + i] = static_cast<float>(w);
+                }
+                out[12] = 1.0f;
+                out[14] = static_cast<float>(m_giFullW);
+                out[15] = static_cast<float>(m_giFullH);
+            }
+        }
+        memcpy(m_ssrPrevView, info->view, sizeof(m_ssrPrevView));
+        memcpy(m_ssrPrevProj, info->proj, sizeof(m_ssrPrevProj));
+        memcpy(m_ssrPrevCamPos, info->camPos, sizeof(m_ssrPrevCamPos));
+        m_ssrPrevShift[0] = info->shiftU;
+        m_ssrPrevShift[1] = info->shiftV;
+        m_ssrPrevCamFrame = m_frame;
+    }
+
     void UpdateFrameTexture(const DlssSceneInfo* info)
     {
         if (!m_jitterTex)
@@ -8431,7 +8548,7 @@ public:
             hp.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC d{};
             d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            d.Width = 8;
+            d.Width = 16;
             d.Height = 1;
             d.DepthOrArraySize = 1;
             d.MipLevels = 1;
@@ -8447,7 +8564,7 @@ public:
             g.dev->CreateShaderResourceView(m_jitterTex, nullptr, m_jitterCpu);
         }
         const GiSettings& s = Gi();
-        float data[32] = {};
+        float data[64] = {};
         data[0] = info->shiftU;
         data[1] = info->shiftV;
         data[2] = 0.0f; // the contact shadows' noise frame: fixed (a noise that moved per frame shimmered on a still view)
@@ -8478,6 +8595,7 @@ public:
                                        : static_cast<float>(waterCube.kind);
         data[30] = info->nearZ;
         data[31] = WaterSsrOn() && !m_hizFailed ? 2.0f : 0.0f;
+        WaterPrevFrame(info, data + 32);
         m_hizNearOverFar = info->farZ > 0 ? info->nearZ / info->farZ : 0.0f;
         // The sun for RunSss: its clip position through the unjittered view-projection (a direction: w 0), moved by the
         // frame's jitter as the depth was drawn (the image shifted +x right, +y down: x + 2 shiftU w, y - 2 shiftV w).
@@ -8501,7 +8619,7 @@ public:
         src.pResource = up.res;
         src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         src.PlacedFootprint.Offset = up.offset;
-        src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, 8, 1, 1, 256};
+        src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, 16, 1, 1, 256};
         NoteCopy("jitter", dst, 0, 0, 0, src, nullptr);
         m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         m_barriers.push_back(Transition(m_jitterTex, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState));
@@ -14482,7 +14600,15 @@ private:
     uint64_t m_objMvFrame = ~0ull;
     float m_mvPrevTime = 0;
     bool m_mvHavePrevTime = false;
-    float m_frameLast[32] = {1e9f};             // the frame texture's last data
+    float m_frameLast[64] = {1e9f};             // the frame texture's last data
+    // The water's SSR on the previous frame's scene (WaterPrevFrame): the GI's colour copy and its frame, its view, the
+    // previous main camera (view, projection, place, jitter) and its frame.
+    uint64_t m_giColorFrame = ~0ull, m_ssrPrevCamFrame = ~0ull;
+    bool m_ssrPrevOn = false;
+    uint64_t m_ssrPrevBinds = 0;
+    ID3D12Resource* m_ssrPrevRes = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_ssrPrevSrv{};
+    float m_ssrPrevView[16] = {}, m_ssrPrevProj[16] = {}, m_ssrPrevCamPos[4] = {}, m_ssrPrevShift[2] = {};
     ID3D12Resource* m_giColor = nullptr;   // previous frame's HDR scene colour
     ID3D12Resource* m_giHist[2] = {};      // half-resolution GI, ping-pong
     D3D12_CPU_DESCRIPTOR_HANDLE m_giHistSrv[2] = {};
@@ -15689,6 +15815,12 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = m_sssSrv;
             if (v && s == kPS && v->info == g_hizPlaceholder && m_hizFrame == m_frame)
                 src[i] = m_hizSrv;
+            if (v && s == kPS && v->info == g_ssrPrevPlaceholder && m_ssrPrevOn && m_ssrPrevSrv.ptr)
+            {
+                src[i] = m_ssrPrevSrv;
+                if (m_ssrPrevBinds++ == 0)
+                    Log("water SSR: the previous frame's scene bound (frame %llu)", static_cast<unsigned long long>(m_frame));
+            }
             // The GI in the fog: the patched fog pass's two slots always filled (the engine's post-process code binds only
             // its own textures; whatever another pass left in these stays: the editor, 2026-11-15): this frame's volume
             // and parameters for the scene's fog pass, else typed null views (no mark: the pass keeps the engine's fog).
@@ -16177,17 +16309,32 @@ bool IsGiPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA
     return true;
 }
 
-// Textures/CryMT/jitter.dds: CryMT's 8x1 placeholder for the frame texture (patched ShadowMaskGen.cfx): texels 0..6
+// Textures/CryMT/jitter.dds: CryMT's 16x1 placeholder for the frame texture (patched ShadowMaskGen.cfx): texels 0..14
 // zero (what the shader reads: no jitter, no contact shadows without CryMT), the last 5A5A5A5A (the mark).
 bool IsJitterPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
 {
-    if (!init || !init->pSysMem || d.Width != 8 || d.Height != 1 || d.ArraySize != 1 ||
+    if (!init || !init->pSysMem || d.Width != 16 || d.Height != 1 || d.ArraySize != 1 ||
         (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
          d.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
         return false;
     const auto* p = static_cast<const uint8_t*>(init->pSysMem);
-    for (int i = 0; i < 32; i++)
-        if (p[i] != (i < 28 ? 0 : 0x5A))
+    for (int i = 0; i < 64; i++)
+        if (p[i] != (i < 60 ? 0 : 0x5A))
+            return false;
+    return true;
+}
+
+// Textures/CryMT/ssrprev.dds: CryMT's 2x1 placeholder for the previous frame's scene (the water's SSR, patched Water.cfx):
+// the first texel zero, the second 4E4E4E4E (the mark).
+bool IsSsrPrevPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
+{
+    if (!init || !init->pSysMem || d.Width != 2 || d.Height != 1 || d.ArraySize != 1 ||
+        (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+         d.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
+        return false;
+    const auto* p = static_cast<const uint8_t*>(init->pSysMem);
+    for (int i = 0; i < 8; i++)
+        if (p[i] != (i < 4 ? 0 : 0x4E))
             return false;
     return true;
 }
@@ -16368,6 +16515,11 @@ HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SU
     {
         g_hizPlaceholder = Info(t);
         Log("depth pyramid placeholder texture recognized");
+    }
+    else if (IsSsrPrevPlaceholder(*desc, init))
+    {
+        g_ssrPrevPlaceholder = Info(t);
+        Log("water previous-frame placeholder texture recognized");
     }
     else if (desc->Width == 4 && desc->Height <= 4 && Gi().on)
     {
@@ -17378,8 +17530,10 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
             a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared);
         }
         static uint64_t envBindsBefore, env2DBefore;
-        Log("environment map binds per frame: %.1f (2D maps %.1f)", (g_device->m_envBinds - envBindsBefore) / 3600.0,
-            (g_device->m_env2DBinds - env2DBefore) / 3600.0);
+        static uint64_t ssrPrevBefore;
+        Log("environment map binds per frame: %.1f (2D maps %.1f); water SSR on the previous frame %.1f", (g_device->m_envBinds - envBindsBefore) / 3600.0,
+            (g_device->m_env2DBinds - env2DBefore) / 3600.0, (g_device->m_ssrPrevBinds - ssrPrevBefore) / 3600.0);
+        ssrPrevBefore = g_device->m_ssrPrevBinds;
         envBindsBefore = g_device->m_envBinds;
         env2DBefore = g_device->m_env2DBinds;
         Log("heaps at frame %llu: video memory %.0f of %.0f MB, shared %.0f MB; upload pages %llu (+%llu dedicated), %.1f MB in free lists; "

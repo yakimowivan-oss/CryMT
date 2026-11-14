@@ -108,6 +108,8 @@ $defs = [ordered]@{
     can0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'}}
     fps60 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_FPSLIMIT = '60'}}   # the frame limiter (PaceFrame)
     fps90 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_FPSLIMIT = '90'}}
+    ssrprev = @{Gi = '1'; Env = @{CRYMT_SSR_PREV = '1'}}   # the water's SSR on the previous frame's scene (particles, clouds)
+    ssrnoprev = @{Gi = '1'; Env = @{CRYMT_SSR_PREV = '0'}} # ... on the current scene copy (before them), as before
     vfog = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}} # can0 + GPU time per pass (CryMT VFog)
     can0_eq = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_OCCSTRENGTH = '0.45'}} # the cover rays out (both strengths alike)
     can0_nosss = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_CONTACTSHADOWS = '0'}}

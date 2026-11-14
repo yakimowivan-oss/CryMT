@@ -363,11 +363,13 @@ samplerCUBE CryMT_WaterEnvSampler = sampler_state
   AddressV = Clamp;
 };
 
-// CryMT's frame texture (as ShadowMaskGen's): 0 the jitter (fractions of the screen), 2..5 the columns of the unjittered
+// CryMT's frame texture (as ShadowMaskGen's, 16x1): 0 the jitter (fractions of the screen), 2..5 the columns of the unjittered
 // view-projection, 7: x the cube's brightness on the water (CRYMT_WATERSKY, CRYMT_ENVCUBE_SCALE), y which cube: 0 the voxel
 // grid's, 1 the engine's own capture as it is (RGBK: rgb a 16, as HDRDecode_FromLDR_RGBK; faces flipped), 2 the back end's
 // HDR copy of it with mips (D3D's layout), 3 + L that copy at mip level L (debug); z the camera's near plane, w 2 when the
-// water's SSR is on (the depth pyramid has the screen's size: from the screen coordinate's derivatives).
+// water's SSR is on (the depth pyramid has the screen's size: from the screen coordinate's derivatives); 8..10 this
+// frame's homogeneous screen point (u w, v w, w, 1; w 0 for a direction) to the previous frame's (u w, v w, w), both with
+// their jitter; 11: x 1 when CryMT_WaterPrevSampler holds the previous frame's finished scene, zw its size.
 sampler2D CryMT_WaterFrameSampler = sampler_state
 {
   Texture = Textures/CryMT/jitter.dds;
@@ -399,9 +401,29 @@ sampler2D CryMT_HiZSampler = sampler_state
   AddressV = Clamp;
 };
 
+// The previous frame's finished HDR scene (after particles and clouds, before post-processing: the GI's copy), which the
+// back end shows in place of Textures/CryMT/ssrprev.dds; read only when the frame texture's texel 11 says so.
+sampler2D CryMT_WaterPrevSampler = sampler_state
+{
+  Texture = Textures/CryMT/ssrprev.dds;
+  MinFilter = LINEAR;
+  MagFilter = LINEAR;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
+
 float4 CryMT_WaterFrame(float i)
 {
-  return tex2Dlod(CryMT_WaterFrameSampler, float4((i + 0.5) / 8, 0.5, 0, 0));
+  return tex2Dlod(CryMT_WaterFrameSampler, float4((i + 0.5) / 16, 0.5, 0, 0));
+}
+
+// Where a point of this frame's screen (u w, v w, w, 1; a direction: w 0) was on the previous frame's; false off it.
+bool CryMT_PrevUv(float4 s, out float2 uv)
+{
+  float w = dot(s, CryMT_WaterFrame(10));
+  uv = float2(dot(s, CryMT_WaterFrame(8)), dot(s, CryMT_WaterFrame(9))) / max(w, 1e-7);
+  return w > 0 && all(uv >= 0) && all(uv <= 1);
 }
 
 float CryMT_HiZLoad(float2 mipPos, float mip, float2 mipRes)
@@ -499,6 +521,11 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   float xR = dot(r, c0.xyz), yR = dot(r, c1.xyz), wR = dot(r, c3.xyz);
   float3 Rh = float3(0.5 * xR + (0.5 + f0.x) * wR, -0.5 * yR + (0.5 + f0.y) * wR, wR);
   float t0 = wR < 0 ? 0.5 * wP / -wR : wP;
+  // The previous frame's finished scene: the particles and clouds, drawn after the scene copy Water.cfx reads (sceneMap);
+  // taken where the point was then (the camera's move between the frames), the current copy where it was off screen.
+  float4 pf = CryMT_WaterFrame(11);
+  bool prevOn = pf.x > 0.5 && all(abs(pf.zw - screenSize) < 0.5);
+  float2 uvPrev;
   // The sky and its clouds lie at infinity: the mirrored direction itself is the screen point to look at. Where that point
   // is on the screen and the scene there is the sky (linear depth 1; not the weapon, which is near), its colour as the
   // screen shows it (no seams of the cube's faces, the clouds as drawn for this view); faded at the screen's borders.
@@ -508,7 +535,12 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
     float2 skyEdge = smoothstep(0, 0.04, uvSky) * (1 - smoothstep(0.96, 1, uvSky));
     float wSky = skyEdge.x * skyEdge.y;
     if (wSky > 0 && tex2Dlod(CryMT_WaterDepthSampler, float4(uvSky, 0, 0)).r >= 0.999)
-      base.rgb = lerp(base.rgb, tex2Dlod(sceneMap, float4(uvSky, 0, 0)).rgb, wSky);
+    {
+      half3 sky = tex2Dlod(sceneMap, float4(uvSky, 0, 0)).rgb;
+      if (prevOn && CryMT_PrevUv(float4(Rh, 0), uvPrev))
+        sky = tex2Dlod(CryMT_WaterPrevSampler, float4(uvPrev, 0, 0)).rgb;
+      base.rgb = lerp(base.rgb, sky, wSky);
+    }
   }
   float3 Eh = float3(uvP * wP, wP) + t0 * Rh;
   float3 origin = float3(uvP, hz.z / wP);
@@ -519,6 +551,9 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   if (confidence <= 0)
     return base;
   half3 seen = tex2Dlod(sceneMap, float4(hit.xy, 0, 0)).rgb;
+  float wHit = hz.z / max(hit.z, 1e-7);
+  if (prevOn && CryMT_PrevUv(float4(hit.xy * wHit, wHit, 1), uvPrev))
+    seen = tex2Dlod(CryMT_WaterPrevSampler, float4(uvPrev, 0, 0)).rgb;
   return half4(lerp(base.rgb, seen, confidence), base.a);
 }
 #else
@@ -725,14 +760,14 @@ sampler2D CryMT_SSSSampler = sampler_state
   AddressV = Clamp;
 };
 
-// CryMT's frame texture, 8x1 (the placeholder's texels are zero but the last, CryMT's mark): 0 the camera jitter
+// CryMT's frame texture, 16x1 (the placeholder's texels are zero but the last, CryMT's mark): 0 the camera jitter
 // (fractions of the screen) and the frame (0..63); 1 towards the sun, w 2 with contact shadows, 3 with the screen-space
 // shadows instead (CryMT_SSSSampler); 2..5 the columns of
 // the unjittered view-projection; 6 the contact shadows' length and thickness at 10 m, their reach (metres), w 1:
 // foliage casts them too.
 float4 CryMT_Frame(float i)
 {
-  return tex2Dlod(CryMT_JitterSampler, float4((i + 0.5) / 8, 0.5, 0, 0));
+  return tex2Dlod(CryMT_JitterSampler, float4((i + 0.5) / 16, 0.5, 0, 0));
 }
 
 // The frame's jitter in pixels of this pass's target (fractions of the screen over the screen coordinate's step).
@@ -1452,13 +1487,13 @@ std::wstring InstallGi()
     const unsigned int pf[] = {32, 0x41, 0, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000, 0x1000};
     memcpy(&dds[76], pf, sizeof(pf));
     const std::wstring pak = g_game + L"Game\\" + kPak;
-    // The frame texture's placeholder: 8x1, texels 0..6 zero (no jitter, no contact shadows without CryMT), the last
-    // 5A5A5A5A (the mark).
-    std::string jitter(160, '\0');
-    const unsigned int jheader[] = {0x20534444, 124, 0x100F, 1, 8, 32, 0, 1};
+    // The frame texture's placeholder: 16x1, texels 0..14 zero (no jitter, no contact shadows, no previous frame for the
+    // water without CryMT), the last 5A5A5A5A (the mark).
+    std::string jitter(192, '\0');
+    const unsigned int jheader[] = {0x20534444, 124, 0x100F, 1, 16, 64, 0, 1};
     memcpy(&jitter[0], jheader, sizeof(jheader));
     memcpy(&jitter[76], pf, sizeof(pf));
-    memset(&jitter[156], 0x5A, 4);
+    memset(&jitter[188], 0x5A, 4);
     // The foliage mask's placeholder: 2x1, the first texel zero, the second A5A5A5A5 (the mark).
     std::string foliage(136, '\0');
     const unsigned int fheader[] = {0x20534444, 124, 0x100F, 1, 2, 8, 0, 1};
@@ -1485,6 +1520,9 @@ std::wstring InstallGi()
     std::string hiz = foliage;
     memset(&hiz[132], 0, 4);
     hiz[133] = hiz[135] = 0x7C;
+    // The previous frame's scene for the water's SSR: 2x1, the first texel zero, the second 4E4E4E4E (the mark).
+    std::string ssrPrev = foliage;
+    memset(&ssrPrev[132], 0x4E, 4);
     // The screen-space shadows' placeholder: 2x1, the first texel zero (no shadow), the second 005C005C (the mark: its
     // red is zero in either byte order, as fragLib reads the whole screen from it).
     std::string sss = foliage;
@@ -1526,6 +1564,7 @@ std::wstring InstallGi()
                               {"Textures/CryMT/vfogp.dds", vfogParams},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/hiz.dds", hiz},
+                              {"Textures/CryMT/ssrprev.dds", ssrPrev},
                               {"Textures/CryMT/env.dds", env},
                               {"Textures/CryMT/gi.dds", dds},
                               {"Textures/CryMT/jitter.dds", jitter},
