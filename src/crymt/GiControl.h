@@ -22,6 +22,7 @@ struct GiControl
     std::atomic<int> dirLight{-1};  // the voxels' light: 0 one colour, 1 colour + direction, 2 six directions; -1 as CRYMT_GI_DIRLIGHT
     std::atomic<int> probes{-1};    // GI method: 0 the cones, 1 probes through the voxels (GI v2), 2 the probes' light with
                                     // the cones' occlusion; -1 as CRYMT_GI_PROBES
+    std::atomic<int> probePrecise{-1}; // the probes' rays: 0 fast, 1 precise (as before the speed-ups); -1 as CRYMT_GI_PROBEPRECISE
     std::atomic<int> particles{-1}; // blended particles (smoke, dust) take the GI 1 / 0
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> dlssPreset{-1}; // the DLAA model, the panel's list index (K J L M F E); -1 as CRYMT_DLSS_PRESET

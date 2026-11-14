@@ -1405,6 +1405,8 @@ Texture3D<float4> dirTex1 : register(t8);
 Texture3D<float4> dirTex2 : register(t9);
 Texture3D<float4> dirTex3 : register(t10);
 Buffer<float4> visAreas : register(t11); // [0].x count; per area 10: x, y box, (z min, z max, points, 0), 16 points (x, y pairs)
+// After the 16 areas, [161]: GI v2's options, x 1 the precise rays (CRYMT_GI_PROBEPRECISE, the panel's "Probe rays").
+static const int kProbeOptions = 161;
 Texture3D<float> roofTex : register(t12); // cover above per cell of level 0 at half its resolution (RoofAt)
 Texture3D<float4> l1Tex : register(t13);  // the levels' light direction g (CRYMT_GI_DIRLIGHT 1, visAreas[0].z): out towards w
 Texture3D<float4> l1Tex1 : register(t14); // the colour times 1 + g.w
@@ -2027,10 +2029,14 @@ float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
     // relocation moved off walls skim floors and walls, a mip-3 block by a surface is never empty, and level 0's half
     // cells to 6 m made the probes pass 0.5 -> 1.9 ms). One loop a level (unrolled: the level is a constant in each, so
     // a wave's rays sample one texture, not every level's in turn as in one loop with the level chosen per step); a ray
-    // that leaves a level's grid goes on in the next.
+    // that leaves a level's grid goes on in the next. Precise rays (the panel's "Probe rays", to compare with the stage
+    // before the speed-ups, 3.2 ms): levels to 6 / 12 / 24 m, half cells to 6 m, no skip over mip 2.
+    const bool precise = visAreas[kProbeOptions].x > 0.5;
+    const float halfTo = precise ? 6 : 1.5;
     [unroll] for (int level = 0; level < 4; level++)
     {
-        const float tEnd = min(level == 0 ? 3 : level == 1 ? 8 : level == 2 ? 20 : reach, reach);
+        const float tEnd = min(precise ? (level == 0 ? 6 : level == 1 ? 12 : level == 2 ? 24 : reach)
+                                       : (level == 0 ? 3 : level == 1 ? 8 : level == 2 ? 20 : reach), reach);
         const float cell = vs * (1 << level);
         [loop] for (int i = 0; i < 64 && blocked < 0.95 && t < tEnd; i++)
         {
@@ -2046,7 +2052,7 @@ float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
                 t += cell * 3;
                 continue;
             }
-            if (SampleGrid(level, X, 2).a < 0.002)
+            if (!precise && SampleGrid(level, X, 2).a < 0.002)
             {
                 t += cell;
                 continue;
@@ -2069,7 +2075,7 @@ float4 RayTrace(float3 O, float3 dir, float reach, float jitter, out float hit)
             blocked += (1 - blocked) * v.a;
             if (blocked > 0.5 && hit >= reach)
                 hit = t;
-            t += level == 0 && t < 1.5 ? cell * 0.5 : cell; // half cells near the probe only
+            t += level == 0 && t < halfTo ? cell * 0.5 : cell; // half cells near the probe only
         }
         // Past this level's grid or its distance: on in the next level from here (its loop ends at once when blocked).
     }
@@ -2090,7 +2096,9 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const int2 st = ProbeStateTexel(slot, c), texel = ProbeTile(slot, c) + int2(tid.xy);
     const float4 state = historyTex.Load(int3(st, 0));
     const bool valid = state.w >= 1 && all(state.xyz == ProbeKey(wc)) && temporal > 0;
-    const bool due = !valid || (((uint)slot + (uint)frame) & (c == 0 ? 3u : 7u)) == 0; // the outer cascade every 8th frame
+    // The outer cascade every 8th frame (precise rays: every 4th, as the near one).
+    const uint period = c == 0 || visAreas[kProbeOptions].x > 0.5 ? 3u : 7u;
+    const bool due = !valid || (((uint)slot + (uint)frame) & period) == 0;
     const int2 ot = ProbeOffsetTexel(slot, c);
     const float3 offset = valid ? historyTex.Load(int3(ot, 0)).xyz : 0;
     float4 ray = 0;
@@ -7577,6 +7585,8 @@ public:
                                            // of the cones near the camera (kGiShader "probes", ProbeLight); 2: the probes'
                                            // light with the cones' occlusion
         bool probeVisibility = true;       // CRYMT_GI_PROBEVIS=0: no visibility test (measures the light it keeps out)
+        bool probePrecise = false;         // CRYMT_GI_PROBEPRECISE=1: the probes' rays as before the speed-ups (2026-11-14,
+                                           // 3.2 ms for two cascades against 1.17; the panel's "Probe rays", to compare)
         float probeStrength = 1.0f;        // CRYMT_GI_PROBESTRENGTH: their bounce light's factor (the cones' is voxelStrength
                                            // 1.5: coarse mips lose light; the probes' thin rays see the cells' full light,
                                            // and at 1.5 the loop through the screen's colour lit closed rooms by itself)
@@ -7704,6 +7714,7 @@ public:
                 v.probes = std::min(std::max(_wtoi(text), 0), 2);
             read(L"CRYMT_GI_PROBESTRENGTH", v.probeStrength);
             v.probeVisibility = !(GetEnvironmentVariableW(L"CRYMT_GI_PROBEVIS", text, 32) && wcscmp(text, L"0") == 0);
+            v.probePrecise = GetEnvironmentVariableW(L"CRYMT_GI_PROBEPRECISE", text, 32) && wcscmp(text, L"0") != 0;
             v.replaceSsao = !(GetEnvironmentVariableW(L"CRYMT_GI_SSAO", text, 32) && wcscmp(text, L"0") != 0);
             read(L"CRYMT_GI_GTAO", v.gtao);
             read(L"CRYMT_GI_GTAORADIUS", v.gtaoRadius);
@@ -7820,6 +7831,7 @@ public:
         g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
         g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 2) : b.dirLight;
         g.probes = g_giControl.probes >= 0 ? std::min(g_giControl.probes.load(), 2) : b.probes;
+        g.probePrecise = g_giControl.probePrecise >= 0 ? g_giControl.probePrecise > 0 : b.probePrecise;
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -9663,7 +9675,7 @@ public:
             }
         FlushBarriers();
         // The VisAreas near the camera for the trace (t11, VisInside): uploaded before the descriptors and any state.
-        constexpr UINT kVisFloat4s = 1 + 16 * 10;
+        constexpr UINT kVisFloat4s = 1 + 16 * 10 + 1; // the header, 16 areas, GI v2's options (kGiShader kProbeOptions)
         const UploadAlloc visUp = FrameUpload(kVisFloat4s * 16, 256);
         if (visUp.cpu)
         {
@@ -9678,6 +9690,7 @@ public:
                             : 0.0f;
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
+            f[(kVisFloat4s - 1) * 4] = Gi().probePrecise ? 1.0f : 0.0f; // [161].x: the probes' precise rays
         }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
@@ -11736,6 +11749,7 @@ public:
         static const char* const giNear[] = {"30 М (ДО 75)|30 M (TO 75)", "40 М (ДО 100)|40 M (TO 100)", "50 М (ДО 125)|50 M (TO 125)",
                                              "62 М (ДО 155)|62 M (TO 155)"};
         static const char* const giMethod[] = {"КОНУСЫ|CONES", "ПРОБЫ (GI v2)|PROBES (GI v2)", "СВЕТ ПРОБ, ТЕНЬ КОНУСОВ|PROBE LIGHT, CONE SHADE"};
+        static const char* const probeRays[] = {"БЫСТРЫЕ|FAST", "ТОЧНЫЕ (ДОРОЖЕ)|PRECISE (SLOWER)"};
         static const char* const cubePicture[] = {"Num4/6: СНЯТЬ|Num4/6: TAKE", "Num4/6: СНЯТЬ|Num4/6: TAKE"};
         static const char* const cubeRate[] = {"КАЖДЫЙ КАДР|EVERY FRAME", "РАЗ В 2 КАДРА|EVERY 2ND FRAME", "РАЗ В 3 КАДРА|EVERY 3RD FRAME",
                                                "РАЗ В 4 КАДРА|EVERY 4TH FRAME", "РАЗ В 6 КАДРОВ|EVERY 6TH FRAME", "РАЗ В 8 КАДРОВ|EVERY 8TH FRAME"};
@@ -11780,6 +11794,10 @@ public:
             {0, "Метод GI|GI method", 0, 2, 1, true, giMethod, 0, nullptr,
              [] { const int v = g_giControl.probes; return v < 0 ? GiBase().probes : std::min(v, 2); },
              [] { return GiBase().probes; }, [](int v) { g_giControl.probes = v; }, true, nullptr},
+            // The probes' rays (CRYMT_GI_PROBEPRECISE): as before the speed-ups of 2026-11-14 (3.2 ms) to compare.
+            {0, "Лучи проб|Probe rays", 0, 1, 1, true, probeRays, 0, nullptr,
+             [] { const int v = g_giControl.probePrecise; return v < 0 ? (GiBase().probePrecise ? 1 : 0) : std::min(v, 1); },
+             [] { return GiBase().probePrecise ? 1 : 0; }, [](int v) { g_giControl.probePrecise = v; }, true, nullptr},
             {0, "GI на дыме и пыли|GI on smoke and dust", 0, 1, 1, true, onOff, 0, nullptr,
              [] { const int v = g_giControl.particles; return v < 0 ? (GiBase().particlesGi ? 1 : 0) : v; },
              [] { return GiBase().particlesGi ? 1 : 0; }, [](int v) { g_giControl.particles = v; }, true, nullptr},
