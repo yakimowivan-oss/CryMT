@@ -674,6 +674,10 @@ uint32_t g_cubeDiffFaces[6], g_cubeDiffEngine[0x400][6], g_cubeDiffVam[0x100][6]
 uint32_t g_cubeDiffEngineVal[0x400][6][2], g_cubeDiffVamVal[0x100][6][2]; // the last change per face: before, after
 uint64_t g_cubeVisKept; // EnvCubeUpdate: the VisArea manager's words put back after a face
 bool g_cubeCloudsOff;       // EnvCubeUpdate: no clouds in this face (CloudRecursiveHook)
+uint64_t g_cubeShadowListsKept, g_cubeShadowListsLost; // EnvCubeUpdate: shadow frustum lists put back after a face / not (too small)
+uint64_t g_particleSoundSkipped; // ParticleSoundHook: particle sound updates left to main
+uint64_t g_cubeIdsAllRestored;   // EnvCubeUpdate: light ids (+0) put back after a face beyond its EF_ADDDlight ones
+uint64_t g_renderSysEventSyncs;  // RenderSysEventHook: renderer system events on main with the render thread made idle
 uint64_t g_cubeCloudsSkipped; // CloudRecursiveHook: cloud draws left out of the cube's faces
 EngineLightState g_cubeLightsAfter;
 std::atomic<bool> g_cubeLightsAfterSet;
@@ -1351,6 +1355,11 @@ void WriteStats()
                 static_cast<unsigned long long>(g_cubeCamIndicesRestored), static_cast<unsigned long long>(g_cubeProjectorsSeen));
         fprintf(f, "engine cube: the VisArea manager's words put back after a face %llu times; recursive cloud draws left out of its faces %llu\n",
                 static_cast<unsigned long long>(g_cubeVisKept), static_cast<unsigned long long>(g_cubeCloudsSkipped));
+        fprintf(f, "engine cube: shadow frustum lists put back after a face %llu (could not, smaller now %llu)\n",
+                static_cast<unsigned long long>(g_cubeShadowListsKept), static_cast<unsigned long long>(g_cubeShadowListsLost));
+        fprintf(f, "particle sound updates skipped on the render thread (left to main) %llu\n", static_cast<unsigned long long>(g_particleSoundSkipped));
+        fprintf(f, "engine cube: light ids (+0) put back after a face beyond its own EF_ADDDlight's %llu\n", static_cast<unsigned long long>(g_cubeIdsAllRestored));
+        fprintf(f, "renderer system events on main with the render thread made idle first %llu\n", static_cast<unsigned long long>(g_renderSysEventSyncs));
         fprintf(f, "projector lights' frustum tests %llu, with a camera outside the 3D engine's light cameras %llu (taken as inside, the camera-index crash)\n",
                 static_cast<unsigned long long>(g_lightCamTests), static_cast<unsigned long long>(g_lightCamBad));
         if (g_cubeDiffFaces[0] + g_cubeDiffFaces[1] + g_cubeDiffFaces[2] + g_cubeDiffFaces[3] + g_cubeDiffFaces[4] + g_cubeDiffFaces[5])
@@ -6368,6 +6377,31 @@ void EnvCubeUpdate()
             camIndices.push_back({at, *at});
         }
     }
+    // fleet's render-thread crash (2026-11-14): an object's shadow frustum list built by main held nulls ([f, 0, 0, 0,
+    // f]) 4 faces after the cube redrew all of them: the lights' ids (+0) main's masks are made of. The 3D engine's light
+    // pass of a face sets +0 = -1 for every light of its list (0x300FDBF3) and the face's EF_ADDDlight renumbers only the
+    // lights it draws (put back above by g_cubeLightIds). Every light's +0 is kept here and put back after the face too
+    // (CRYMT_ENVCUBE_KEEPIDS=0: not).
+    static const bool keepIds = EnvCubeSetting("CRYMT_ENVCUBE_KEEPIDS", 1) != 0;
+    static std::vector<CamIndex> lightIdsAll;
+    lightIdsAll.clear();
+    if (keepIds)
+        if (const auto* engine3d = *reinterpret_cast<const uint8_t* const*>(k3DEngineGlobal))
+        {
+            const auto* const* ents = *reinterpret_cast<const uint8_t* const* const*>(engine3d + kEngineLightEntities);
+            const int nents = *reinterpret_cast<const int*>(engine3d + kEngineLightEntities + 8);
+            for (int i = 0; ents && i < nents && i < 4096; i++)
+                if (ents[i])
+                {
+                    auto* at = const_cast<int*>(reinterpret_cast<const int*>(ents[i] + kLightEntityLight));
+                    lightIdsAll.push_back({at, *at});
+                }
+            for (int i = 0; lightsIn.list && i < lightsIn.count && i < 256; i++)
+            {
+                auto* at = reinterpret_cast<int*>(lightsIn.list + static_cast<uint64_t>(i) * 0x258);
+                lightIdsAll.push_back({at, *at});
+            }
+        }
     if (EnvCubeOwnFrame())
         ++*reinterpret_cast<volatile int*>(renderer + kFrameIdAllOffset); // the cube's own frame id (EnvCubeOwnFrame)
     CubeHiddenNode hidden[3];
@@ -6436,6 +6470,55 @@ void EnvCubeUpdate()
     if (keepVis & 8)
         for (int o : {0xFE8, 0xFEC})
             keep(engineObj, o);
+    // fleet's demo (2026-11-14, the user: fleet hangs and crashes): a render-thread crash 4 frames after the cube redrew
+    // all faces, every run at the same frame, none with the cube off: CryRenderD3D10 FUN_381118F0 walks a render
+    // object's shadow frustums (its +0xE8 list) and one was null. GetShadowFrustumsList (FUN_300F0920) keeps one list
+    // per shadow mask in two maps of the 3D engine (+0x808 + 0x30 x n, n = 0 / 1 by the first light's flag; node +0x10
+    // left, +0x18 right, +0x20 the mask, +0x28 the PodArray) and refills a mask's list on every call: the cube's face,
+    // asking EF_Query 0x1B at its recursion level, refilled main's lists with its own lights' frustums (null where its
+    // light has none) while main's objects of this very flush pointed at them. The lists are put back as main left them
+    // after each face (CRYMT_ENVCUBE_KEEPSHADOWLISTS=0: not).
+    static const bool keepShadowLists = EnvCubeSetting("CRYMT_ENVCUBE_KEEPSHADOWLISTS", 1) != 0;
+    struct ShadowListSave
+    {
+        uint8_t* list;
+        uint32_t first, count;
+    };
+    static std::vector<ShadowListSave> shadowLists;
+    static std::vector<uint64_t> shadowItems;
+    shadowLists.clear();
+    shadowItems.clear();
+    if (keepShadowLists && engineObj)
+    {
+        uint8_t* stack[256];
+        for (int m = 0; m < 2; m++)
+        {
+            const auto* head = reinterpret_cast<const uint8_t*>(engineObj) + 0x808 + m * 0x30;
+            int depth = 0, visited = 0;
+            if (auto* root = *reinterpret_cast<uint8_t* const*>(head + 8))
+                stack[depth++] = root;
+            while (depth > 0 && visited < 8192)
+            {
+                uint8_t* node = stack[--depth];
+                visited++;
+                if (node == head)
+                    continue;
+                if (auto* list = *reinterpret_cast<uint8_t**>(node + 0x28))
+                {
+                    const auto* data = *reinterpret_cast<const uint64_t* const*>(list);
+                    const int count = *reinterpret_cast<const int*>(list + 8);
+                    if (count >= 0 && count <= 256 && (data || count == 0))
+                    {
+                        shadowLists.push_back({list, static_cast<uint32_t>(shadowItems.size()), static_cast<uint32_t>(count)});
+                        shadowItems.insert(shadowItems.end(), data, data + count);
+                    }
+                }
+                for (int side : {0x10, 0x18})
+                    if (auto* child = *reinterpret_cast<uint8_t* const*>(node + side); child && child != head && depth < 256)
+                        stack[depth++] = child;
+            }
+        }
+    }
     g_cubeRendering = true;
     reinterpret_cast<uint64_t(__fastcall*)(uint8_t*, uint32_t, uint64_t, char)>(kEnvCubeRenderFn)(entry, drawFlags, ~0ull, 0);
     g_cubeRendering = false;
@@ -6445,6 +6528,25 @@ void EnvCubeUpdate()
             g_cubeVisKept++;
             *kept[i].at = kept[i].value;
         }
+    for (const ShadowListSave& s : shadowLists)
+    {
+        auto* data = *reinterpret_cast<uint64_t**>(s.list);
+        int& count = *reinterpret_cast<int*>(s.list + 8);
+        const int capacity = *reinterpret_cast<const int*>(s.list + 12);
+        const uint64_t* was = shadowItems.data() + s.first;
+        const bool changed = static_cast<uint32_t>(count) != s.count || (s.count && memcmp(data, was, s.count * sizeof(uint64_t)) != 0);
+        if (!changed)
+            continue;
+        if (data && capacity >= static_cast<int>(s.count))
+        {
+            if (s.count)
+                memcpy(data, was, s.count * sizeof(uint64_t));
+            count = static_cast<int>(s.count);
+            g_cubeShadowListsKept++;
+        }
+        else
+            g_cubeShadowListsLost++;
+    }
     if (cubeDiff && engineObj && vamObj && faceNow >= 0 && faceNow < 6)
     {
         g_cubeDiffFaces[faceNow]++;
@@ -6496,6 +6598,13 @@ void EnvCubeUpdate()
         if (*it->at != it->value)
         {
             g_cubeCamIndicesRestored++;
+            *it->at = it->value;
+        }
+    // ... and every light's id (lightIdsAll above).
+    for (auto it = lightIdsAll.rbegin(); it != lightIdsAll.rend(); ++it)
+        if (*it->at != it->value)
+        {
+            g_cubeIdsAllRestored++;
             *it->at = it->value;
         }
     const EngineLightState lightsOut = ReadEngineLights();
@@ -8255,6 +8364,24 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
     const CONTEXT& c = *info->ContextRecord;
     fprintf(f, "  rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx\n  r8=%llx r9=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
             c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.R8, c.R9, c.R12, c.R13, c.R14, c.R15);
+    // fleet's render-thread crash (2026-11-14, frame 1272 every run with the engine cube): FUN_381118F0 walks a render
+    // object's shadow frustums (r11 = [rsp + 0x50], its +0xE8 list = r14: data, count) and one is null.
+    if (c.Rip == 0x38111E37)
+    {
+        const auto* list = reinterpret_cast<const uint8_t*>(c.R14);
+        const auto* object = *reinterpret_cast<const uint8_t* const*>(c.Rsp + 0x50);
+        const auto* data = list ? *reinterpret_cast<const uint64_t* const*>(list) : nullptr;
+        const int count = list ? *reinterpret_cast<const int*>(list + 8) : -1;
+        fprintf(f, "  shadow frustum list %p (data %p, count %d, capacity %d) of render object %p (flags %x, +0xE8 %p), rbp %llx, cube rendering %d, "
+                   "cube faces %llu, lists put back %llu\n    items:",
+                static_cast<const void*>(list), static_cast<const void*>(data), count, list ? *reinterpret_cast<const int*>(list + 12) : -1,
+                static_cast<const void*>(object), object ? *reinterpret_cast<const uint32_t*>(object + 0x10) : 0,
+                object ? *reinterpret_cast<void* const*>(object + 0xE8) : nullptr, static_cast<unsigned long long>(c.Rbp), g_cubeRendering ? 1 : 0,
+                static_cast<unsigned long long>(g_envCubeFaces), static_cast<unsigned long long>(g_cubeShadowListsKept));
+        for (int i = 0; data && i < count && i < 24; i++)
+            fprintf(f, " %llx", static_cast<unsigned long long>(data[i]));
+        fprintf(f, "\n");
+    }
     // The camera-index crash (the frustum test at 0x30019FF0 given a light's camera, rcx = the 3D engine's light cameras
     // + 0x218 x the light's +0x200, 0x30102440): the cameras' and lights' arrays now, the camera's index, the cube's state.
     if (c.Rip >= 0x30019FF0 && c.Rip < 0x3001A100)
@@ -8452,6 +8579,50 @@ uint64_t CloudRecursiveHook(void* a, void* b, void* c, void* d)
         return 0;
     }
     return reinterpret_cast<uint64_t (*)(void*, void*, void*, void*)>(kCloudRecursiveFn)(a, b, c, d);
+}
+
+// fleet's demo (2026-11-14): a crash in fmodex on the render thread: CParticleContainer::SetVertices (the renderer, on
+// the render thread in CryMT) -> the container's update FUN_30070BE0 (whichever of main's Render and the renderer's
+// SetVertices comes first in a frame does it) -> FUN_30070480 -> FUN_3006ED80, a sub-emitter's sound (its ISound at
+// +0x90: position, parameters, play) while main's sound system runs; also seen as CrySoundSystem+0x2993D on main.
+// The sound update is left to main: its calls at 0x300704EB and 0x3006FABB skip it on the render thread
+// (CRYMT_PARTICLESOUND_RT=1: as the engine does).
+constexpr uintptr_t kParticleSoundFn = 0x3006ED80, kParticleSoundCall1 = 0x300704EB, kParticleSoundCall2 = 0x3006FABB;
+void ParticleSoundHook(void* subEmitter)
+{
+    if (GetCurrentThreadId() == g_rtTid)
+    {
+        g_particleSoundSkipped++;
+        return;
+    }
+    reinterpret_cast<void (*)(void*)>(kParticleSoundFn)(subEmitter);
+}
+
+// A player's reports (RayzenBlack, 2026-11-14, Mode=mt: the stock renderer on D3D11's runtime): at level loading (frame
+// 240 every time since 11-07) a crash in d3d11 on the render thread while main was in d3d11 too, and stalls with main
+// waiting in the NVIDIA driver. Main's path: CryNetwork -> CryAction -> CrySystem's event dispatch (+0x40F62) -> the
+// renderer's CSystemEventListner_Render::OnSystemEvent (vtable 0x38256B40 slot 0, 0x380E7FA0) -> texture loading
+// (FUN_3813A440 .. FUN_380D08C0): D3D calls on main, beside CryMT's queue. The render thread is now idle first (as for
+// the other direct calls; CRYMT_SYSEVENTSYNC=0: not).
+constexpr uintptr_t kRenderSysEventVtable = 0x38256B40;
+void (*g_origRenderSysEvent)(void*, int, uintptr_t, uintptr_t);
+void RenderSysEventHook(void* self, int event, uintptr_t wparam, uintptr_t lparam)
+{
+    const bool sync = g_async && GetCurrentThreadId() == g_mainThread;
+    if (sync)
+    {
+        WaitIdlePublic(296);
+        g_renderSysEventSyncs++;
+    }
+    static int logged;
+    if (logged < 32)
+    {
+        logged++;
+        FocusLog("frame %llu: renderer system event %d (%s thread)%s", static_cast<unsigned long long>(g_frame), event,
+                 GetCurrentThreadId() == g_mainThread ? "main" : GetCurrentThreadId() == g_rtTid ? "render" : "other",
+                 sync ? ": render thread made idle first" : "");
+    }
+    g_origRenderSysEvent(self, event, wparam, lparam);
 }
 
 extern "C" void LightCamTestThunk();
@@ -10505,6 +10676,11 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
         // dead emitters while the flush builds their vertices (crashed on a null container parameter block in
         // fill mode); clouds and volume objects are only moved there. Particle destruction is deferred.
         PatchParticleDelete();
+        if (EnvCubeSetting("CRYMT_PARTICLESOUND_RT", 0) == 0)
+            SetupLog(RedirectCall(kParticleSoundCall1, kParticleSoundFn, reinterpret_cast<const void*>(&ParticleSoundHook)) &&
+                             RedirectCall(kParticleSoundCall2, kParticleSoundFn, reinterpret_cast<const void*>(&ParticleSoundHook))
+                         ? "particle sounds left to main (not on the render thread)"
+                         : "particle sound call sites mismatch, not patched");
         SetupLog(RedirectCall(kCloudRecursiveCall, kCloudRecursiveFn, reinterpret_cast<const void*>(&CloudRecursiveHook))
                      ? "recursive cloud draw checked (no clouds in the engine cube)"
                      : "recursive cloud draw site mismatch, clouds may show in the engine cube");
@@ -10632,6 +10808,8 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
     {
         PatchDxgi(reinterpret_cast<uintptr_t>(GetModuleHandleW(L"dxgi.dll")));
         TryPatchRenderer(reinterpret_cast<uintptr_t>(data->base));
+        if (g_mode == 2 && EnvCubeSetting("CRYMT_SYSEVENTSYNC", 1) != 0)
+            PatchVtableSlot(kRenderSysEventVtable, 0, reinterpret_cast<uintptr_t*>(&g_origRenderSysEvent), reinterpret_cast<const void*>(&RenderSysEventHook));
         if (g_censusOn)
             InstallCensus();
         if (g_fillOn)

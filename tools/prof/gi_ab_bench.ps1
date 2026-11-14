@@ -20,6 +20,7 @@ $variantDefs = [ordered]@{
     screen = @{CRYMT_GI_SCREEN = '1'}
     nogi = @{CRYMT_GI = '0'}
     nocache = @{CRYMT_GI_GEOMCACHE = '0'}
+    nocube = @{CRYMT_ENVCUBE = '0'; CRYMT_ENVMAP = 'voxels'} # the engine cube off (reflections "normal")
 }
 $Variants = @($Variants | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 New-Item -ItemType Directory -Force (Split-Path $Out) | Out-Null
@@ -28,7 +29,7 @@ foreach ($r in 1..$Rounds) {
 foreach ($t in $Tests) {
     $test = $testDefs[$t]
     foreach ($v in $Variants) {
-        foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI_SCREEN', 'CRYMT_GI', 'CRYMT_GI_GEOMCACHE') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI_SCREEN', 'CRYMT_GI', 'CRYMT_GI_GEOMCACHE', 'CRYMT_ENVCUBE', 'CRYMT_ENVMAP') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
         foreach ($kv in $variantDefs[$v].GetEnumerator()) { Set-Item "Env:$($kv.Key)" $kv.Value }
         $log = "$g\Game\Levels\$($test.Level)\$($test.Log)"
         $before = if (Test-Path $log) { (Get-Content $log).Count } else { 0 }
@@ -53,4 +54,4 @@ foreach ($t in $Tests) {
     }
 }
 }
-foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI_SCREEN', 'CRYMT_GI', 'CRYMT_GI_GEOMCACHE') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI_SCREEN', 'CRYMT_GI', 'CRYMT_GI_GEOMCACHE', 'CRYMT_ENVCUBE', 'CRYMT_ENVMAP') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
