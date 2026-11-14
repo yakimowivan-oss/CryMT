@@ -91,6 +91,11 @@ $defs = [ordered]@{
     probes_novis = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '1'; CRYMT_GI_PROBEVIS = '0'}}
     probes_hyb = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '2'}}
     probes_precise = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '1'; CRYMT_GI_PROBEPRECISE = '1'}}
+    # The Full preset's quality switches (launcher: GI normal / high, reflections normal / high).
+    q_hh = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '2'}}
+    q_lh = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '0'}}
+    q_hl = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '2'; CRYMT_ENVMAP = 'voxels'; CRYMT_ENVCUBE = '0'}}
+    q_ll = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_GI_PROBES = '0'; CRYMT_ENVMAP = 'voxels'; CRYMT_ENVCUBE = '0'}}
     # Water reflections (give r_WaterReflections 0 in the commands for 1 and 2): planar, the voxel cube, SSR + the cube.
     water_planar = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     water_cube = @{Gi = '1'; Env = @{CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'; CRYMT_WATERCUBE = '1'}}
@@ -110,6 +115,9 @@ foreach ($v in ($Variants | ForEach-Object { $_ -split ',' })) {
                               "System.LogAlways('crymt spot '..math.floor(p.x)..' '..math.floor(p.y)..' '..math.floor(p.z)..' '..a.x..' '..a.z);quit"}
     if ($Commands) { $vars.CRYMT_TESTCMD = $Commands }
     if ($Capture) { $vars.CRYMT_CAPTURE_SEC = $Capture; $vars.CRYMT_CAPTURE_COUNT = '1'; $vars.CRYMT_CAPTURE_TAG = "${Tag}_$v" }
+    # The cones unless a variant says otherwise: since 2026-11-14 the proxy sets CRYMT_GI_PROBES=2 from the launcher's
+    # "GI quality high" when it is not set, and the runs before measured the cones.
+    $vars.CRYMT_GI_PROBES = '0'
     foreach ($e in $d.Env.GetEnumerator()) { $vars[$e.Key] = $e.Value }
     foreach ($e in $vars.GetEnumerator()) { Set-Item "Env:$($e.Key)" $e.Value }
     $focusLines = if (Test-Path $focus) { (Get-Content $focus).Count } else { 0 }

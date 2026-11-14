@@ -558,7 +558,7 @@
                 '<div class="card-name">' + esc(p.label) + '</div>' +
                 '<div class="card-text">' + esc(p.text) + '</div>' +
                 '<ul class="feats">' + FEATURES().map(([n, f]) => '<li class="' + (f(pv) ? 'on' : '') + '"><i></i>' + esc(n) + '</li>').join('') + '</ul>' +
-                tt('<div class="card-meta"><span>Видеокарта</span><b>', '<div class="card-meta"><span>GPU</span><b>') + (ms ? '≈ ' + fmt(ms) + tt(' мс', ' ms') : '—') + '</b></div>' + meter(ms) +
+                tt('<div class="card-meta card-gpu"><span>Видеокарта</span><b>', '<div class="card-meta card-gpu"><span>GPU</span><b>') + (ms ? '≈ ' + fmt(ms) + tt(' мс', ' ms') : '—') + '</b></div>' + meter(ms) +
                 tt('<div class="card-meta"><span>Шейдеры</span><b>', '<div class="card-meta"><span>Shaders</span><b>') + esc(p.shaders) + '</b></div>' +
                 benchBlock(p) +
                 '<div class="card-badge"></div>';
@@ -570,6 +570,19 @@
             };
             card.addEventListener('click', pick);
             card.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } });
+            // The Full preset's quality switches (GI, reflections): on the card itself; a click on them does not pick the
+            // card (they apply to it whenever it is picked: personal options).
+            if (p.id === 'full') {
+                const q = el('div', 'card-q');
+                [byId.giQuality, byId.reflQuality].filter(Boolean).forEach(o => {
+                    const row = el('div', 'card-q-row');
+                    row.dataset.o = o.id;
+                    row.append(el('span', 'card-q-label', esc(o.label)), control(o));
+                    q.append(row);
+                });
+                ['click', 'keydown'].forEach(ev => q.addEventListener(ev, e => e.stopPropagation()));
+                card.insertBefore(q, $('.card-badge', card));
+            }
             grid.append(card);
         });
         v.append(grid);
@@ -606,7 +619,17 @@
             const mine = cur.preset && cur.preset.id === c.dataset.p;
             c.classList.toggle('on', !!mine);
             $('.card-badge', c).innerHTML = mine ? (cur.diff ? tt('выбрано · изменено: ', 'selected · changed: ') + cur.diff : tt('выбрано', 'selected')) : '';
+            // The quality switches change the card's GPU load: its figure and meter follow them.
+            const p = C.PRESETS.find(x => x.id === c.dataset.p);
+            const gpu = $('.card-gpu b', c);
+            if (p && gpu) {
+                const ms = loadMs(presetValues(p));
+                gpu.textContent = ms ? '≈ ' + fmt(ms) + tt(' мс', ' ms') : '—';
+                const bar = $('.meter i', c);
+                if (bar) bar.style.width = Math.min(100, (ms / MS_SCALE) * 100) + '%';
+            }
         });
+        $$('#view-home .card-q-row').forEach(r => syncControl($('.ctl', r), byId[r.dataset.o]));
         const vals = S.values;
         const rows = C.OPTIONS.filter(o => o.ms && !blocker(o, vals) && o.ms(vals[o.id]) > 0);
         const ms = loadMs(vals);

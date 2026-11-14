@@ -300,6 +300,11 @@ kbd {
 .card-meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
 .card-meta b { color: var(--text); font-weight: 600; }
 .card .meter { margin: -2px 0 4px; }
+/* The Full preset's quality switches on its card (GI, reflections). */
+.card-q { display: grid; gap: 6px; padding-top: 8px; border-top: 1px solid var(--line); }
+.card-q-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+.card-q-row .ctl { flex: none; }
+.card-q-row .seg button { padding: 3px 8px; font-size: 11px; }
 .card-badge { min-height: 18px; font: 500 11px var(--font-head); text-transform: var(--caps); letter-spacing: 0.08em; color: var(--accent); }
 .home-low { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: var(--gap); margin-top: var(--gap); }
 .detail, .quick { padding: 14px 18px; }

@@ -124,6 +124,23 @@ void LoadCryMT(HMODULE self)
         GetPrivateProfileStringW(L"CryMT", L"GI", L"0", gi, 8, ini.c_str());
     if (mode != L"mt" && gi[0] && wcscmp(gi, L"0") != 0)
         SetEnvironmentVariableW(L"CRYMT_GI", gi); // GI, D3D12 modes; needs the patched shaders
+    // The Full preset's quality switches (the launcher's card, 2026-11-14): [CryMT] GIQuality high = the probes' light
+    // with the cones' occlusion (CRYMT_GI_PROBES=2), normal = the cones; Reflections high = the engine's live cube for
+    // the water and the materials (the DLL's defaults), normal = the voxel cube. A variable already set (a test
+    // script's) or an [Env] line (applied after) wins.
+    const auto setIfUnset = [](const wchar_t* name, const wchar_t* value) {
+        if (!GetEnvironmentVariableW(name, nullptr, 0))
+            SetEnvironmentVariableW(name, value);
+    };
+    wchar_t giQuality[16] = {}, reflections[16] = {};
+    GetPrivateProfileStringW(L"CryMT", L"GIQuality", L"high", giQuality, 16, ini.c_str());
+    GetPrivateProfileStringW(L"CryMT", L"Reflections", L"high", reflections, 16, ini.c_str());
+    setIfUnset(L"CRYMT_GI_PROBES", _wcsicmp(giQuality, L"normal") == 0 ? L"0" : L"2");
+    if (_wcsicmp(reflections, L"normal") == 0)
+    {
+        setIfUnset(L"CRYMT_ENVMAP", L"voxels");
+        setIfUnset(L"CRYMT_ENVCUBE", L"0");
+    }
     wchar_t env[4096] = {};
     GetPrivateProfileSectionW(L"Env", env, 4096, ini.c_str());
     for (wchar_t* p = env; *p; p += wcslen(p) + 1)
