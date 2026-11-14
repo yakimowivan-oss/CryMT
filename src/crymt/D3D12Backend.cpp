@@ -1940,8 +1940,9 @@ static const int3 kProbeN = int3(32, 32, 16);
 // Cascades (the user, 2026-11-14: blotches on ceilings with probes 1 m apart, 2-3 to a room's height): 0 the near one,
 // 0.5 m apart (+-8 m, +-4 m up), 1 the outer one, 1 m (+-16 m, +-8 m up); the cones beyond. Each cascade has its own
 // 1024 columns of the atlases (tiles, and its states and offsets in the rows under them).
-static const int kProbeCascades = 2;
-float CascadeSpacing(int c) { return c == 0 ? 0.5 : 1.0; }
+// 2 the far one, 2 m (+-32 m, +-16 m up; 2026-11-14: probes rather than cones out to 32 m).
+static const int kProbeCascades = 3;
+float CascadeSpacing(int c) { return 0.5 * (1 << c); }
 static const float2 kProbeAtlas = float2(1024 * kProbeCascades, 1152);
 // Phase 2, visibility (DDGI's): per probe the mean distance to what its rays hit and its square over the sphere, a tile
 // laid out as the light's (6 x 6 and a border, 1024 x 1024 RG16F); distances clamped at 1.5 x the probe cell's diagonal,
@@ -2096,7 +2097,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const int2 st = ProbeStateTexel(slot, c), texel = ProbeTile(slot, c) + int2(tid.xy);
     const float4 state = historyTex.Load(int3(st, 0));
     const bool valid = state.w >= 1 && all(state.xyz == ProbeKey(wc)) && temporal > 0;
-    // The outer cascade every 8th frame (precise rays: every 4th, as the near one).
+    // The outer cascades every 8th frame (precise rays: every 4th, as the near one).
     const uint period = c == 0 || visAreas[kProbeOptions].x > 0.5 ? 3u : 7u;
     const bool due = !valid || (((uint)slot + (uint)frame) & period) == 0;
     const int2 ot = ProbeOffsetTexel(slot, c);
@@ -2445,15 +2446,21 @@ void trace(uint3 id : SV_DispatchThreadID)
             const float probeW = abs(visAreas[0].w);
             const bool probeLightOnly = probeW >= 100;
             const float probeStrength = probeLightOnly ? probeW - 100 : probeW;
-            // The near cascade (0.5 m) inside its grid, blended to the outer one (1 m) over its last two probes.
+            // The finest cascade that holds the point, blended to the next over its last two probes (0.5 -> 1 -> 2 m).
             float4 probe = 0;
             if (visAreas[0].w != 0)
             {
-                float in0 = 0, in1 = 0;
-                const float4 p0 = ProbeLight(Pw, Nw, 0, in0);
-                const float4 p1 = in0 < 1 ? ProbeLight(Pw, Nw, 1, in1) : 0;
-                probeIn = in0 + (1 - in0) * in1;
-                probe = probeIn > 0 ? (p0 * in0 + p1 * (1 - in0) * in1) / probeIn : 0;
+                float rest = 1; // the share the finer cascades left
+                [unroll] for (int pc = 0; pc < kProbeCascades; pc++)
+                    if (rest > 0)
+                    {
+                        float inC = 0;
+                        const float4 pl = ProbeLight(Pw, Nw, pc, inC);
+                        probe += pl * inC * rest;
+                        probeIn += inC * rest;
+                        rest *= 1 - inC;
+                    }
+                probe = probeIn > 0 ? probe / probeIn : 0;
             }
             float3 farLight = 0;
             float farOcc = 0;
@@ -3154,7 +3161,7 @@ constexpr int kVoxLevels = 4;  // cells of voxelSize (0.25 m), 2, 4 and 8 times 
 // The GI root's second table (kGiShader t3..t41): per level the grid, per-axis opacity, L1 and six directions (9), the
 // VisAreas, the roof, the probes' atlases (t41 light and states, t42 distances).
 constexpr UINT kGiVoxTable = 9 * kVoxLevels + 4;
-constexpr UINT kProbeCascades = 2; // GI v2's probe cascades (kGiShader's kProbeCascades: 0.5 m and 1 m apart)
+constexpr UINT kProbeCascades = 3; // GI v2's probe cascades (kGiShader's kProbeCascades: 0.5, 1 and 2 m apart)
 constexpr UINT kVoxTable = 23; // descriptors per table: t0..t2, u0..u19 (u6/u7 the light direction, u8..u19 the six
                                // directions: CRYMT_GI_DIRLIGHT)
 const char* const kVoxShader = R"(

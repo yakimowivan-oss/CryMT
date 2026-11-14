@@ -28,9 +28,9 @@ def main():
     light = load(base + '_probes.raw')
     dist = load(base + '_probedist.raw')
     print('atlas', light.shape, 'distances', dist.shape, 'from', base)
-    # Cascades (2026-11-14 ~06:00): 1024 columns each, 0 the near one (0.5 m), 1 the outer one (1 m); CASCADE=1 picks it.
+    # Cascades (2026-11-14): 1024 columns each, 0.5 / 1 / 2 m apart; CASCADE=n picks one.
     cascade = int(os.environ.get('CASCADE', '0')) if light.shape[1] > 1024 else 0
-    spacing = (0.5 if cascade == 0 else 1.0) if light.shape[1] > 1024 else 1.0
+    spacing = 0.5 * 2 ** cascade if light.shape[1] > 1024 else 1.0  # 0.5, 1, 2 m
     light = light[:, 1024 * cascade:1024 * (cascade + 1), :]
     if dist.shape[1] > 1024:
         dist = dist[:, 1024 * cascade:1024 * (cascade + 1), :]
