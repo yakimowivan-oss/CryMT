@@ -30,7 +30,6 @@
 #include "MemoryFix.h"
 #include "Paths.h"
 #include "RenderDocCapture.h"
-#include "RenderLevelSites.h"
 #include "RendererClasses6156.h"
 #include "Window.h"
 #include "ZPass.h"
@@ -65,7 +64,6 @@ struct LateMiss
 };
 constexpr uint64_t kLateMissLog = 16;
 extern LateMiss g_lateMiss[kLateMissLog];
-void PrintShadowSkins(FILE* f);
 namespace
 {
 void NoteSyncUnderLock(int reason);
@@ -306,277 +304,16 @@ bool ParticleRayHook(uint64_t a, float* hit, const float* from, const float* to,
 int g_rtDepth;
 uint64_t g_rtFrameSeq;
 std::atomic<uint64_t> g_preDoneSeq{0};
-// CRYMT_EARLYBARRIER: main is released after preprocess; shadow prep (its callbacks into Cry3DEngine: terrain sectors,
-// casters) runs on while main finishes the frame and runs the next one's game update. Main's next RenderWorld (the
-// engine's pass state: camera, recursion level, terrain LOD) waits for this sequence (WaitShadowPrep).
-std::atomic<uint64_t> g_shadowDoneSeq{0};
-uint64_t g_shadowFenceWaits[4], g_shadowFenceTicks[4], g_shadowFenceChecks[4]; // RenderWorld, entity update, terrain, AI update
-bool g_shadowBarrier = true; // main waits until shadow prep is done unless CRYMT_EARLYBARRIER is set
-// The early release for the flush the render thread runs (set when it starts): not in the warm-up frames, where main
-// does not take the frame's poses in advance (PrepareSkinning), so the barrier holds main while shadow prep skins.
-bool g_rtEarly;
+// (The early release - main let go before shadow prep, CRYMT_EARLYBARRIER, with per-thread render levels
+// CRYMT_THREADLEVEL, the shadow-only characters' poses taken in advance, the fences of the next frame's updates and
+// the diagnostics CRYMT_EARLYFENCE / CRYMT_LEVELWATCH - crashed on shadow-only poses and was removed 2026-11-15; tag
+// experiments-2026-11-15.)
 int64_t g_preDoneTime;
 uint64_t g_frameSeq;
 uint64_t g_flushCmdIndex;
 uint64_t g_preWaitTicks;
-// Diagnostic CRYMT_EARLYFENCE=<point> with the early barrier: main waits for shadow prep at that point (1 right after
-// the release in HookEndEf3D, 2 at the end of HookEndEf3D, 3 when RenderScene returns on main), to find which of
-// main's steps after the release clashes with shadow prep.
-int EarlyFencePoint()
-{
-    static const int point = [] {
-        wchar_t v[8] = {};
-        return GetEnvironmentVariableW(L"CRYMT_EARLYFENCE", v, 8) ? _wtoi(v) : 0;
-    }();
-    return point;
-}
-
-void EarlyFenceWait(int point)
-{
-    if (g_shadowBarrier || EarlyFencePoint() != point)
-        return;
-    while (g_shadowDoneSeq.load(std::memory_order_acquire) != g_frameSeq && g_read.load(std::memory_order_acquire) <= g_flushCmdIndex)
-        _mm_pause();
-}
-
-// Cry3DEngine keeps one global render recursion level (0x302008E0: -1 outside rendering, 0 in the main pass, +1 per
-// nested pass), accessed at 100 sites (RenderLevelSites.h, from tools\prof\level_sites.py). The flush's callbacks into
-// the engine on the render thread change it too (terrain shadow sectors: level+1 / level-1), so with the early barrier
-// main's pop, main's own reads (RenderInner's tail, RegisterEntity) and the render thread's +1/-1 race; deferring
-// main's pop was not enough (NOTES "Early barrier, option (b) tried"). Per-thread levels (CRYMT_THREADLEVEL, always with
-// the early barrier): every site jumps to a copy of its instruction that uses the thread's TEB TlsSlots entry
-// (gs:[0x1480 + 8 * index]) and jumps back. Threads start at -1; the render thread is at 0 while it runs a top-level
-// flush, as the single-threaded engine is inside main's RenderScene.
+// Cry3DEngine's render recursion level (-1 outside rendering, 0 in the main pass, +1 per nested pass): one, shared.
 volatile int* const kRenderLevel = reinterpret_cast<volatile int*>(0x302008E0);
-DWORD g_levelTls = TLS_OUT_OF_INDEXES;
-DWORD g_levelTlsReserved = TLS_OUT_OF_INDEXES; // taken in DllMain, before the engine and the drivers fill the 64 TEB slots
-bool g_threadLevel;
-char g_threadLevelWhy[96];
-uint64_t g_levelChecks, g_levelSharedChanged, g_levelMainWrong, g_levelSharedFirst, g_levelMainFirst;
-
-void SetThreadRenderLevel(int level)
-{
-    TlsSetValue(g_levelTls, reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<uint32_t>(level))));
-}
-
-int ThreadRenderLevel()
-{
-    return static_cast<int>(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(TlsGetValue(g_levelTls))));
-}
-
-// Main at its top-level RenderWorld: its own level is -1, and the shared one was never touched (no site missed).
-void CheckRenderLevels()
-{
-    if (!g_threadLevel)
-        return;
-    g_levelChecks++;
-    if (*kRenderLevel != -1 && g_levelSharedChanged++ == 0)
-        g_levelSharedFirst = g_frame;
-    if (ThreadRenderLevel() != -1 && g_levelMainWrong++ == 0)
-        g_levelMainFirst = g_frame;
-}
-
-// Sets the slot of every thread the process has now (threads made later get -1 in DllMain).
-void InitThreadLevels(DWORD index, int value)
-{
-    using QueryFn = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
-    const auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (!query || snap == INVALID_HANDLE_VALUE)
-        return;
-    THREADENTRY32 te{};
-    te.dwSize = sizeof(te);
-    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
-    {
-        if (te.th32OwnerProcessID != GetCurrentProcessId())
-            continue;
-        HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-        if (!h)
-            continue;
-        struct
-        {
-            LONG exitStatus;
-            void* teb;
-            void* process;
-            void* thread;
-            ULONG_PTR affinity;
-            LONG priority, basePriority;
-        } info{};
-        if (query(h, 0, &info, sizeof(info), nullptr) >= 0 && info.teb) // ThreadBasicInformation
-            *reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(info.teb) + 0x1480 + 8 * index) = static_cast<uint32_t>(value);
-        CloseHandle(h);
-    }
-    CloseHandle(snap);
-}
-
-// At Cry3DEngine's load, before its code runs.
-bool InstallThreadLevel()
-{
-    for (const RenderLevelSite& s : kRenderLevelSites)
-        if (memcmp(reinterpret_cast<const void*>(static_cast<uintptr_t>(s.va)), s.orig, s.len) != 0)
-        {
-            sprintf_s(g_threadLevelWhy, "site %X differs", s.va);
-            return false;
-        }
-    const DWORD index = g_levelTlsReserved;
-    if (index >= 64) // only the first 64 slots live in the TEB itself
-    {
-        sprintf_s(g_threadLevelWhy, "no TLS slot below 64 (got %lu)", index);
-        return false;
-    }
-    size_t bytes = 0;
-    for (const RenderLevelSite& s : kRenderLevelSites)
-        bytes += s.newLen + 5;
-    bytes = (bytes + 0xFFF) & ~size_t{0xFFF};
-    uint8_t* cave = nullptr; // within rel32 reach of the sites (0x3002EAE0..0x301A9B3B)
-    for (uintptr_t hint = 0x34000000; hint < 0x50000000 && !cave; hint += 0x10000)
-        cave = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!cave)
-    {
-        sprintf_s(g_threadLevelWhy, "no memory near Cry3DEngine");
-        return false;
-    }
-    const uint32_t disp = 0x1480 + 8 * index;
-    uint8_t* stubs[std::size(kRenderLevelSites)];
-    uint8_t* p = cave;
-    for (size_t i = 0; i < std::size(kRenderLevelSites); i++)
-    {
-        const RenderLevelSite& s = kRenderLevelSites[i];
-        stubs[i] = p;
-        memcpy(p, s.code, s.newLen);
-        memcpy(p + s.dispAt, &disp, 4);
-        p += s.newLen;
-        const int32_t back = static_cast<int32_t>(static_cast<intptr_t>(s.va) + s.len - reinterpret_cast<intptr_t>(p + 5));
-        p[0] = 0xE9; // jmp back to the instruction after the site
-        memcpy(p + 1, &back, 4);
-        p += 5;
-    }
-    DWORD old;
-    VirtualProtect(cave, bytes, PAGE_EXECUTE_READ, &old);
-    g_levelTls = index; // from here DllMain gives new threads -1
-    InitThreadLevels(index, *kRenderLevel);
-    for (size_t i = 0; i < std::size(kRenderLevelSites); i++)
-    {
-        const RenderLevelSite& s = kRenderLevelSites[i];
-        auto* site = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(s.va));
-        VirtualProtect(site, s.len, PAGE_EXECUTE_READWRITE, &old);
-        const int32_t rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(stubs[i]) - reinterpret_cast<intptr_t>(site + 5));
-        site[0] = 0xE9;
-        memcpy(site + 1, &rel, 4);
-        memset(site + 5, 0x90, s.len - 5);
-        VirtualProtect(site, s.len, old, &old);
-    }
-    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
-    return true;
-}
-
-extern bool g_levelWatch;
-void LevelWatchArm(bool on);
-extern DWORD g_rtTid;
-
-// Render thread, when shadow prep of flush `seq` is done (or skipped).
-void MarkShadowDone(uint64_t seq)
-{
-    g_shadowDoneSeq.store(seq, std::memory_order_release);
-    if (g_levelWatch && GetCurrentThreadId() == g_rtTid)
-        LevelWatchArm(true);
-}
-
-// Diagnostic CRYMT_LEVELWATCH=1: a hardware data breakpoint on the render recursion level, on main only, from
-// RenderScene's return to the next top-level RenderWorld: which code reads or writes the level between frames.
-bool g_levelWatch;
-struct LevelHit
-{
-    uintptr_t at; // the instruction after the access (data breakpoints trap after it)
-    uint64_t count;
-    int level;
-    bool rt;
-    uint64_t frame;
-    uintptr_t callers[5];
-};
-std::atomic<DWORD> g_levelHitOwner; // the thread inside OnLevelWatch: its own read of the level traps again
-LevelHit g_levelHits[48];
-int g_levelHitKinds;
-uint64_t g_levelHitsTotal, g_levelHitsLost;
-
-void LevelWatchArm(bool on)
-{
-    CONTEXT c{};
-    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (on)
-    {
-        c.Dr0 = reinterpret_cast<DWORD64>(kRenderLevel);
-        c.Dr7 = 1 | (3 << 16) | (3 << 18); // L0, read or write, 4 bytes
-    }
-    SetThreadContext(GetCurrentThread(), &c);
-}
-
-LONG CALLBACK OnLevelWatch(EXCEPTION_POINTERS* info)
-{
-    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !(info->ContextRecord->Dr6 & 1))
-        return EXCEPTION_CONTINUE_SEARCH;
-    info->ContextRecord->Dr6 = 0;
-    const DWORD tid = GetCurrentThreadId();
-    if (g_levelHitOwner.load(std::memory_order_relaxed) == tid)
-        return EXCEPTION_CONTINUE_EXECUTION;
-    const bool rt = tid == g_rtTid;
-    for (DWORD none = 0; !g_levelHitOwner.compare_exchange_weak(none, tid, std::memory_order_acquire); none = 0)
-        _mm_pause();
-    struct Unlock
-    {
-        ~Unlock() { g_levelHitOwner.store(0, std::memory_order_release); }
-    } unlock;
-    g_levelHitsTotal++;
-    const uintptr_t at = info->ContextRecord->Rip;
-    for (int i = 0; i < g_levelHitKinds; i++)
-        if (g_levelHits[i].at == at && g_levelHits[i].rt == rt)
-        {
-            g_levelHits[i].count++;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-    if (g_levelHitKinds == static_cast<int>(std::size(g_levelHits)))
-    {
-        g_levelHitsLost++;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    LevelHit& h = g_levelHits[g_levelHitKinds++];
-    h.at = at;
-    h.count = 1;
-    h.rt = rt;
-    h.frame = g_frame;
-    h.level = *kRenderLevel;
-    CONTEXT ctx = *info->ContextRecord;
-    for (int k = 0; k < 5 && ctx.Rip; k++)
-    {
-        DWORD64 imageBase = 0;
-        RUNTIME_FUNCTION* fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
-        if (!fn)
-        {
-            ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
-            ctx.Rsp += 8;
-        }
-        else
-        {
-            void* handlerData = nullptr;
-            DWORD64 establisher = 0;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData, &establisher, nullptr);
-        }
-        h.callers[k] = ctx.Rip;
-    }
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-void PrintModuleOffset(FILE* f, uintptr_t a)
-{
-    HMODULE mod = nullptr;
-    char name[MAX_PATH] = "?";
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCSTR>(a), &mod);
-    if (mod)
-        GetModuleFileNameA(mod, name, sizeof(name));
-    const char* base = strrchr(name, '\\');
-    fprintf(f, " %s+0x%llx", base ? base + 1 : name, static_cast<unsigned long long>(a - reinterpret_cast<uintptr_t>(mod)));
-}
 // Top-level flush phases on the render thread: start to the preprocess call, preprocess, shadow prep.
 int64_t g_flushStartTick, g_phaseMark;
 uint64_t g_phaseTicks[3], g_phaseFrames;
@@ -1379,34 +1116,6 @@ void WriteStats()
         fprintf(f, "engine cube and the 3D engine's lights: list moved %llu, counts changed %llu, light cameras moved %llu; main's scene found them changed since %llu\n",
                 static_cast<unsigned long long>(g_cubeLightsMoved), static_cast<unsigned long long>(g_cubeLightsCounted),
                 static_cast<unsigned long long>(g_cubeCamsMoved), static_cast<unsigned long long>(g_sceneAfterCubeDiff));
-        fprintf(f, "early barrier: %s; main waited for shadow prep (times of checks, ms/frame):", g_shadowBarrier ? "off" : "on");
-        for (int k = 0; k < 4; k++)
-            fprintf(f, " %s %llu of %llu, %.3f;", k == 0 ? "RenderWorld" : k == 1 ? "entity update" : k == 2 ? "terrain" : "AI update",
-                    static_cast<unsigned long long>(g_shadowFenceWaits[k]), static_cast<unsigned long long>(g_shadowFenceChecks[k]),
-                    g_shadowFenceTicks[k] * g_qpcToMs / frames);
-        fprintf(f, "\n");
-        if (g_threadLevel)
-            fprintf(f, "render level per thread: %llu checks at RenderWorld; shared level changed %llu (first frame %llu), main not at -1 %llu (first frame %llu)\n",
-                    static_cast<unsigned long long>(g_levelChecks), static_cast<unsigned long long>(g_levelSharedChanged),
-                    static_cast<unsigned long long>(g_levelSharedFirst), static_cast<unsigned long long>(g_levelMainWrong),
-                    static_cast<unsigned long long>(g_levelMainFirst));
-        if (g_levelWatch)
-        {
-            fprintf(f, "level watch (main: RenderScene end to next RenderWorld; render: shadow prep done to next flush): %llu accesses, %d sites, %llu lost\n",
-                    static_cast<unsigned long long>(g_levelHitsTotal), g_levelHitKinds, static_cast<unsigned long long>(g_levelHitsLost));
-            for (int i = 0; i < g_levelHitKinds; i++)
-            {
-                const LevelHit& h = g_levelHits[i];
-                fprintf(f, "  %s %llu x, first at frame %llu level %d, after", h.rt ? "render" : "main", static_cast<unsigned long long>(h.count),
-                        static_cast<unsigned long long>(h.frame), h.level);
-                PrintModuleOffset(f, h.at);
-                fprintf(f, " <-");
-                for (uintptr_t a : h.callers)
-                    if (a)
-                        PrintModuleOffset(f, a);
-                fprintf(f, "\n");
-            }
-        }
         PrintCasterCensus(f);
         if (g_phaseFrames)
             fprintf(f, "flush phases ms/frame: start to preprocess %.3f, preprocess %.3f, shadow prep %.3f (shadow map draws %.3f, %.2f per frame)\n",
@@ -1472,8 +1181,6 @@ void WriteStats()
                 static_cast<unsigned long long>(g_freesDeferred), static_cast<unsigned long long>(g_posePrepared),
                 static_cast<unsigned long long>(g_poseHits), static_cast<unsigned long long>(g_poseMisses),
                 static_cast<unsigned long long>(g_poseMissesLate));
-        if (!g_shadowBarrier)
-            PrintShadowSkins(f);
         for (uint64_t i = 0; i < std::min(g_poseMissesLate, kLateMissLog); i++)
             fprintf(f, "  late pose miss: skin vtable %llx caller %llx object %llx lod %d\n",
                     static_cast<unsigned long long>(g_lateMiss[i].vtable), static_cast<unsigned long long>(g_lateMiss[i].ret),
@@ -1644,8 +1351,8 @@ void WriteTrace()
 // The world frame counter (EndEf3D dispatches since start; the same frame of a timedemo in every run), for capture.
 uint64_t CryMTWorldFrame() { return g_frame; }
 
-// The 3D engine's render recursion level as the calling thread sees it (its own with per-thread levels).
-int CryMTRenderLevel() { return g_threadLevel ? ThreadRenderLevel() : *kRenderLevel; }
+// The 3D engine's render recursion level.
+int CryMTRenderLevel() { return *kRenderLevel; }
 
 // Shader file investigation (CRYMT_PAKLOG=1): ICryPak::FOpen through the renderer's gEnv (0x382E74D0, pCryPak at
 // +0x80), vtable slot 17 FOpen(name, mode, flags) (the renderer calls *0x88 so) and slot 16 FOpen(name, mode, game path,
@@ -3446,10 +3153,7 @@ void ExecuteCommand(Command& c)
     const uint8_t* renderer = reinterpret_cast<const uint8_t*>(c.regs.rcx);
     if (c.slot == kEndEf3DSlot)
     {
-        if (g_levelWatch)
-            LevelWatchArm(g_threadLevel);
         g_rtFrameSeq = c.count;
-        g_rtEarly = !g_shadowBarrier && c.count > g_warmupFrames + 1;
         memcpy(g_fake + kViewportOffset, renderer + kViewportOffset, 16);
         memcpy(g_fake + kCameraOffset, renderer + kCameraOffset, kCameraBytes);
         memcpy(g_snapMv, **reinterpret_cast<float* const* const*>(renderer + kModelViewStackOffset), 64);
@@ -3487,8 +3191,6 @@ void ExecuteCommand(Command& c)
         TranslateQueued(&c.regs.rdx, 3, c.stack, ProxyStackArgs(c.slot));
     if (c.slot == kEndEf3DSlot)
     {
-        if (g_threadLevel && GetCurrentThreadId() == g_rtTid)
-            SetThreadRenderLevel(0); // the flush runs as if inside main's RenderScene
         GpuFrameBegin(c.regs.rcx, c.count);
         ProbeFlushStart();
         FlushLightsBegin();
@@ -3533,8 +3235,6 @@ void ExecuteCommand(Command& c)
     }
     if (c.slot == kEndEf3DSlot)
     {
-        if (g_threadLevel && GetCurrentThreadId() == g_rtTid)
-            SetThreadRenderLevel(-1);
         GpuMark(kGpuAfterFlush << 28);
         if (g_frustumTest)
             ProbeCompare();
@@ -3640,13 +3340,12 @@ void PumpSentMessages()
     PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
 }
 
-// Main's last sync points (reason, frame, whether shadow prep of the last dispatched flush was done), printed with a
+// Main's last sync points (reason, frame), printed with a
 // fault on the render thread: main often waits inside a generated thunk, which the unwinder cannot walk past.
 struct MainSync
 {
     int reason;
     uint32_t frame;
-    bool shadowDone;
 };
 MainSync g_mainSyncs[16];
 uint32_t g_mainSyncCount;
@@ -3656,8 +3355,7 @@ void WaitIdle(int reason)
     if (!g_async)
         return;
     if (GetCurrentThreadId() == g_mainThread)
-        g_mainSyncs[g_mainSyncCount++ % 16] = {reason, static_cast<uint32_t>(g_frame),
-                                               g_shadowDoneSeq.load(std::memory_order_relaxed) == g_frameSeq};
+        g_mainSyncs[g_mainSyncCount++ % 16] = {reason, static_cast<uint32_t>(g_frame)};
     NoteSyncUnderLock(reason);
     const uint64_t target = g_write.load(std::memory_order_relaxed);
     const int64_t start = Now();
@@ -5781,9 +5479,6 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
             if ((spin & 0xFFF) == 0xFFF)
                 PumpSentMessages();
         }
-        // Diagnostic (CRYMT_EARLYFENCE=1 with CRYMT_EARLYBARRIER): the early signal, but main waits for shadow prep right
-        // here as with the barrier, so nothing of main runs alongside it (does a crash come from main or the signal?).
-        EarlyFenceWait(1);
         g_preWaitTicks += Now() - waitStart;
         // The engine callbacks of this flush are done: the engine cube (and the water reflection) moved the renderer's id
         // that counts recursive renders; main's next frame continues above it (EnvCubeOwnFrame).
@@ -5836,8 +5531,6 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
         }
     }
     g_waitAtFrameStart = g_mainWaitTicks;
-    if (GetCurrentThreadId() == g_mainThread)
-        EarlyFenceWait(2);
     return r;
 }
 
@@ -6879,8 +6572,6 @@ void SignalEngineCallbacksDone()
     }
     g_preSignals++;
     g_preDoneTime = Now();
-    if (!g_rtEarly)
-        MarkShadowDone(g_rtFrameSeq);
     g_preDoneSeq.store(g_rtFrameSeq, std::memory_order_release);
 }
 
@@ -6891,13 +6582,11 @@ extern "C" uintptr_t PrePop(uint64_t r13)
     if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0)
     {
         g_phaseTicks[1] += Now() - g_phaseMark;
-        // Shadow prep only calls back into the engine for terrain sectors; with the terrain calls of the
-        // next frame's C3DEngine::Update fenced, main may continue as soon as preprocess is done.
+        // No shadow prep this frame (none, or skipped): main may continue as soon as preprocess is done; else when
+        // shadow prep is (ShadowPop).
         const bool shadowsSkipped = *reinterpret_cast<const int*>(kShadowPrepGlobal) == 0 || (r13 & 8) != 0;
-        if (shadowsSkipped || g_rtEarly)
-            SignalEngineCallbacksDone();
         if (shadowsSkipped)
-            MarkShadowDone(g_rtFrameSeq);
+            SignalEngineCallbacksDone();
     }
     return ret;
 }
@@ -6921,13 +6610,8 @@ extern "C" uintptr_t ShadowPop()
     const uintptr_t ret = s->ret[--s->depth];
     if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0)
         g_phaseTicks[2] += Now() - g_phaseMark;
-    if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0 && !g_rtEarly)
+    if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0)
         SignalEngineCallbacksDone();
-    else if (s->depth == 0 && GetCurrentThreadId() == g_rtTid && g_rtDepth == 0)
-    {
-        CarryBack(true); // the frustum bytes shadow prep wrote, before main's next pass computes its own
-        MarkShadowDone(g_rtFrameSeq);
-    }
     return ret;
 }
 
@@ -7007,64 +6691,6 @@ struct PendingOp
 std::vector<PendingOp> g_pendingReleases;
 uint64_t g_releaseDeferred;
 
-// Early barrier: characters only shadow prep draws (casters the main view did not draw) are skinned after main is
-// released, so their poses cannot be read live. The render thread lists them (g_rtShadowSkins, render thread only while
-// a flush runs); main takes their poses with the frame's others before the next flush is queued (CaptureShadowSkins),
-// and forgets a character when it is destroyed or loses its model (main, render thread idle). The frame a character
-// first appears only in shadows its shadow is skipped (HookGetPose returns no bones).
-struct ShadowSkin
-{
-    void* skin;
-    int lod;
-    uint64_t seen; // world frame of the last miss
-};
-std::vector<ShadowSkin> g_rtShadowSkins;     // misses of the current flush (render thread)
-uint64_t g_missFrames, g_missLastSeq;           // flushes with at least one early-mode late miss
-struct RecentMiss
-{
-    uint64_t frame;
-    uintptr_t vtable;
-    int lod;
-};
-RecentMiss g_recentMisses[16];
-uint64_t g_recentMissCount;
-std::vector<ShadowSkin> g_shadowSkins;       // known shadow-only characters (main)
-uint64_t g_shadowSkinCaptures, g_shadowSkinSkips, g_shadowSkinForgotten;
-
-extern uint64_t g_casterCharPoses, g_casterCharSeen, g_casterAttachments, g_casterNodes;
-extern ptrdiff_t g_charManagerOffset;
-uintptr_t RenderProxyNodeVtable();
-
-void PrintShadowSkins(FILE* f)
-{
-    fprintf(f, "early barrier poses: entity casters %llu (node vtable %llx), their characters seen %llu, taken on main %llu "
-               "(attachments %llu, manager at +0x%llx); late misses answered with no bones %llu; listed misses taken later %llu, "
-               "known %zu, forgotten %llu\n",
-            static_cast<unsigned long long>(g_casterNodes), static_cast<unsigned long long>(RenderProxyNodeVtable()),
-            static_cast<unsigned long long>(g_casterCharSeen), static_cast<unsigned long long>(g_casterCharPoses),
-            static_cast<unsigned long long>(g_casterAttachments), static_cast<unsigned long long>(g_charManagerOffset),
-            static_cast<unsigned long long>(g_shadowSkinSkips), static_cast<unsigned long long>(g_shadowSkinCaptures), g_shadowSkins.size(),
-            static_cast<unsigned long long>(g_shadowSkinForgotten));
-    fprintf(f, "  flushes with misses %llu; last misses (frame, skin vtable, lod):", static_cast<unsigned long long>(g_missFrames));
-    for (uint64_t i = g_recentMissCount > 16 ? g_recentMissCount - 16 : 0; i < g_recentMissCount; i++)
-        fprintf(f, " %llu/%llx/%d", static_cast<unsigned long long>(g_recentMisses[i % 16].frame),
-                static_cast<unsigned long long>(g_recentMisses[i % 16].vtable), g_recentMisses[i % 16].lod);
-    fprintf(f, "\n");
-}
-
-void ForgetShadowSkin(void* skin)
-{
-    for (auto* list : {&g_shadowSkins, &g_rtShadowSkins})
-        for (size_t i = 0; i < list->size();)
-            if ((*list)[i].skin == skin)
-            {
-                (*list)[i] = list->back();
-                list->pop_back();
-                g_shadowSkinForgotten++;
-            }
-            else
-                i++;
-}
 
 bool DeferCharacterOpsNow()
 {
@@ -7090,7 +6716,6 @@ extern "C" void* __fastcall DeferredCharDelete(void* self, uint64_t flags)
         g_releaseDeferred++;
         return self;
     }
-    ForgetShadowSkin(self);
     return reinterpret_cast<void*(__fastcall*)(void*, uint64_t)>(g_charDeletingDtor)(self, flags);
 }
 
@@ -7102,7 +6727,6 @@ extern "C" void* __fastcall DeferredSkinDelete(void* self, uint64_t flags)
         g_releaseDeferred++;
         return self;
     }
-    ForgetShadowSkin(self);
     return reinterpret_cast<void*(__fastcall*)(void*, uint64_t)>(g_skinDeletingDtor)(self, flags);
 }
 
@@ -7378,26 +7002,6 @@ uint32_t __fastcall HookGetPose(void* skin, int lod, const void* matrix, void** 
             g_lateMiss[g_poseMissesLate] = {*static_cast<uintptr_t*>(skin), reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
                                             reinterpret_cast<uintptr_t>(matrix) - 0x14, lod};
         g_poseMissesLate++;
-        if (g_rtEarly && g_async) // main is running its frame: no live pose (CaptureCasterCharacters took the casters' ones)
-        {
-            bool listed = false; // main takes it from the next frame on (CaptureShadowSkins)
-            for (const ShadowSkin& k : g_rtShadowSkins)
-                listed = listed || k.skin == skin;
-            if (!listed)
-                g_rtShadowSkins.push_back({skin, lod, g_frame});
-            g_shadowSkinSkips++;
-            if (g_rtFrameSeq != g_missLastSeq)
-            {
-                g_missLastSeq = g_rtFrameSeq;
-                g_missFrames++;
-            }
-            g_recentMisses[g_recentMissCount++ % 16] = {g_frame, *static_cast<const uintptr_t*>(skin), lod};
-            *l = *s = *mbl = *mbs = nullptr;
-            memset(shape, 0, kShapeDeformBytes);
-            *morph = 0;
-            *remap = nullptr;
-            return 0;
-        }
     }
     return OriginalGetPose(skin)(skin, lod, matrix, l, s, mbl, mbs, shape, morph, remap);
 }
@@ -7434,195 +7038,13 @@ void CaptureObjectPoses(std::vector<uintptr_t>& objects, void* (*alloc)(size_t))
     objects.clear();
 }
 
-// Main, render thread idle: the shadow-only characters the last flushes listed, unless the main view has them.
-void CaptureShadowSkins()
-{
-    for (const ShadowSkin& s : g_rtShadowSkins)
-    {
-        bool known = false;
-        for (ShadowSkin& k : g_shadowSkins)
-            if (k.skin == s.skin)
-            {
-                k = s;
-                known = true;
-            }
-        if (!known)
-            g_shadowSkins.push_back(s);
-    }
-    g_rtShadowSkins.clear();
-    static const float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-    for (size_t i = 0; i < g_shadowSkins.size();)
-    {
-        const ShadowSkin& s = g_shadowSkins[i];
-        if (g_frame - s.seen > 300) // not drawn in shadows for ~5 s
-        {
-            g_shadowSkins[i] = g_shadowSkins.back();
-            g_shadowSkins.pop_back();
-            continue;
-        }
-        i++;
-        bool cached = false;
-        for (const PoseEntry& e : g_poseCache)
-            cached = cached || e.skin == s.skin;
-        if (cached)
-            continue;
-        const auto vt = *static_cast<const uintptr_t*>(s.skin);
-        if ((vt != kCharInstanceVtable && vt != kSkinInstanceVtable) ||
-            (vt == kSkinInstanceVtable && !*reinterpret_cast<void* const*>(static_cast<uint8_t*>(s.skin) + 0xE8)))
-            continue; // detached (or not a character any more)
-        PoseEntry e{};
-        e.skin = s.skin;
-        e.lod = s.lod;
-        e.matrix = identity;
-        if (!CapturePose(e, ArenaAllocPublic))
-            break;
-        g_poseCache.push_back(e);
-        g_shadowSkinCaptures++;
-    }
-}
-
-// Early barrier: the characters shadow prep will skin, taken on main before the flush is queued (render thread idle).
-// Shadow prep runs after main is released and draws casters the main view may not have drawn; their poses cannot be read
-// live then. The sun's and lamps' frustums list their casters (main gathered them): entity casters are CRenderProxy's
-// IRenderNode (vtable 0x320BBAA8, object at -8), whose slots (vector at +0x48) hold characters (CEntityObject +0x78; the
-// node's slot 3 returns one with the slot's world matrix). A character's attachments (manager embedded in
-// CCharInstance, its offset found once by the manager's vtable; attachments vector at manager +8; an attachment's object
-// at +0x110; CCHRAttachment objects hold a character at +8) are taken too: skin attachments (CSkinInstance: attachment
-// at +0xE8, null when detached) and attached characters (weapons). HookGetPose's same-skin fallback then serves the
-// flush; what is still missing gets no bones (no shadow that frame) rather than a live read.
-// CRenderProxy's IRenderNode vtable: CryEntitySystem +0xBBAA8 (the module may not sit at its preferred 0x32000000).
-constexpr uintptr_t kAttachmentManagerVtable = 0x31669D58, kChrAttachmentVtable = 0x31668FF8;
-uintptr_t RenderProxyNodeVtable()
-{
-    static const uintptr_t vt = [] {
-        const auto mod = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"CryEntitySystem.dll"));
-        return mod ? mod + 0xBBAA8 : 0;
-    }();
-    return vt;
-}
-uint64_t g_casterCharPoses, g_casterCharSeen, g_casterAttachments, g_casterNodes;
-ptrdiff_t g_charManagerOffset = -1; // CCharInstance -> its embedded CAttachmentManager
-
-void CaptureCharacter(void* ci, const float* matrix)
-{
-    const auto vt = *static_cast<const uintptr_t*>(ci);
-    if (vt != kCharInstanceVtable && vt != kSkinInstanceVtable)
-        return;
-    if (vt == kSkinInstanceVtable && !*reinterpret_cast<void* const*>(static_cast<uint8_t*>(ci) + 0xE8))
-        return; // a detached skin attachment: nothing to draw
-    g_casterCharSeen++;
-    for (const PoseEntry& e : g_poseCache)
-        if (e.skin == ci)
-            return;
-    PoseEntry e{};
-    e.skin = ci;
-    e.lod = 0;
-    e.matrix = matrix;
-    if (CapturePose(e, ArenaAllocPublic))
-    {
-        g_poseCache.push_back(e);
-        g_casterCharPoses++;
-    }
-}
-
-void CaptureCharacterTree(void* ci, const float* matrix, int depth)
-{
-    CaptureCharacter(ci, matrix);
-    if (depth > 3 || *static_cast<const uintptr_t*>(ci) != kCharInstanceVtable)
-        return;
-    auto* base = static_cast<uint8_t*>(ci);
-    if (g_charManagerOffset < 0)
-        for (ptrdiff_t o : {0x180, 0x938, 0x40, 0x88, 0x12D8})
-            if (*reinterpret_cast<const uintptr_t*>(base + o) == kAttachmentManagerVtable)
-                g_charManagerOffset = o;
-    if (g_charManagerOffset < 0)
-        return;
-    uint8_t* manager = base + g_charManagerOffset;
-    if (*reinterpret_cast<const uintptr_t*>(manager) != kAttachmentManagerVtable)
-        return;
-    auto** begin = *reinterpret_cast<uint8_t** const*>(manager + 8);
-    auto** end = *reinterpret_cast<uint8_t** const*>(manager + 0x10);
-    for (auto** a = begin; begin && a < end && a - begin < 256; a++)
-    {
-        uint8_t* att = *a;
-        if (!att)
-            continue;
-        uint8_t* obj = *reinterpret_cast<uint8_t* const*>(att + 0x110);
-        if (!obj || *reinterpret_cast<const uintptr_t*>(obj) != kChrAttachmentVtable)
-            continue;
-        void* child = *reinterpret_cast<void* const*>(obj + 8);
-        if (child)
-        {
-            g_casterAttachments++;
-            CaptureCharacterTree(child, matrix, depth + 1);
-        }
-    }
-}
-
-void CaptureCasterCharacters(uint8_t* renderer)
-{
-    if (*reinterpret_cast<const int*>(kShadowPrepGlobal) == 0)
-        return;
-    const uint8_t* list = renderer + kRdLevelLights + 16;
-    auto** lights = *reinterpret_cast<uint8_t** const*>(list);
-    const int count = *reinterpret_cast<const int*>(list + 8);
-    if (!lights)
-        return;
-    std::vector<uintptr_t> done;
-    for (int i = 0; i < count; i++)
-    {
-        uint8_t* light = lights[i];
-        if (!light || !(*reinterpret_cast<const uint32_t*>(light + kLightFlags) & 0x10))
-            continue;
-        auto** frustums = *reinterpret_cast<uint8_t** const*>(light + kLightFrustums);
-        for (int k = 0; frustums && k < 8 && frustums[k]; k++)
-        {
-            const uint8_t* casters = *reinterpret_cast<const uint8_t* const*>(frustums[k] + kFrustumCasters);
-            if (!casters)
-                continue;
-            auto** data = *reinterpret_cast<uint8_t** const*>(casters);
-            const int n = *reinterpret_cast<const int*>(casters + 8);
-            for (int c = 0; c < n && data; c++)
-            {
-                uint8_t* node = data[c];
-                if (!node || *reinterpret_cast<const uintptr_t*>(node) != RenderProxyNodeVtable())
-                    continue;
-                if (std::find(done.begin(), done.end(), reinterpret_cast<uintptr_t>(node)) != done.end())
-                    continue;
-                done.push_back(reinterpret_cast<uintptr_t>(node));
-                g_casterNodes++;
-                const uint8_t* proxy = node - 8;
-                auto** slotsBegin = *reinterpret_cast<uint8_t** const*>(proxy + 0x48);
-                auto** slotsEnd = *reinterpret_cast<uint8_t** const*>(proxy + 0x50);
-                for (int s = 0; slotsBegin && slotsBegin + s < slotsEnd && s < 64; s++)
-                {
-                    if (!slotsBegin[s] || !*reinterpret_cast<void* const*>(slotsBegin[s] + 0x78))
-                        continue;
-                    // IRenderNode slot 3 (GetEntityCharacter): the character and the slot's world matrix.
-                    float* m = static_cast<float*>(ArenaAllocPublic(48));
-                    if (!m)
-                        return;
-                    using GetCharFn = void*(__fastcall*)(void*, int, float*, bool);
-                    void* ch = reinterpret_cast<GetCharFn>((*reinterpret_cast<void***>(node))[3])(node, s, m, false);
-                    if (ch)
-                        CaptureCharacterTree(ch, m, 0);
-                }
-            }
-        }
-    }
-}
-
 // Called on main with the render thread idle, right before the frame is queued.
 void PrepareSkinning(uintptr_t renderer)
 {
     g_poseCache.clear();
     g_rtPoseUsed = 0;
     CaptureObjectPoses(g_frameObjects, ArenaAllocPublic);
-    if (!g_shadowBarrier)
-    {
-        CaptureCasterCharacters(reinterpret_cast<uint8_t*>(renderer));
-        CaptureShadowSkins();
-    }
+    (void)renderer;
 }
 
 // Render thread, main still held: characters the flush itself put on render objects (shadow casters
@@ -7643,7 +7065,6 @@ extern "C" void __fastcall DeferredCharClearModel(void* self)
         g_releaseDeferred++;
         return;
     }
-    ForgetShadowSkin(self);
     reinterpret_cast<void(__fastcall*)(void*)>(g_charClearModel)(self);
 }
 
@@ -7655,7 +7076,6 @@ extern "C" void __fastcall DeferredSkinClearModel(void* self)
         g_releaseDeferred++;
         return;
     }
-    ForgetShadowSkin(self);
     reinterpret_cast<void(__fastcall*)(void*)>(g_skinClearModel)(self);
 }
 
@@ -7738,8 +7158,6 @@ void RunPendingGc()
 {
     for (const PendingOp& op : g_pendingReleases)
     {
-        if (op.fn == g_charDeletingDtor || op.fn == g_skinDeletingDtor || op.fn == g_charClearModel || op.fn == g_skinClearModel)
-            ForgetShadowSkin(op.self);
         reinterpret_cast<void(__fastcall*)(void*, uint64_t)>(op.fn)(op.self, op.arg);
     }
     g_pendingReleases.clear();
@@ -7821,12 +7239,6 @@ extern "C" uintptr_t ScenePop()
     const uintptr_t ret = s->ret[--s->depth];
     if (g_sceneSync && GetCurrentThreadId() == g_mainThread)
         WaitIdlePublic(299);
-    if (s->depth == 0 && GetCurrentThreadId() == g_mainThread)
-    {
-        EarlyFenceWait(3);
-        if (g_levelWatch)
-            LevelWatchArm(true);
-    }
     return ret;
 }
 
@@ -7835,28 +7247,6 @@ DWORD g_worldTls = TLS_OUT_OF_INDEXES;
 bool g_worldSync;
 
 void CensusBegin();
-
-// Main, before its RenderWorld with the early barrier: until the last dispatched flush's shadow prep is done (or the
-// whole flush command has run).
-void WaitShadowPrep(int site = 0)
-{
-    if (g_shadowBarrier || g_mode != 2 || !g_async)
-        return;
-    g_shadowFenceChecks[site]++;
-    if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
-        return;
-    const int64_t start = Now();
-    for (uint32_t spin = 0;; spin++)
-    {
-        if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
-            break;
-        _mm_pause();
-        if ((spin & 0xFFF) == 0xFFF)
-            PumpSentMessages();
-    }
-    g_shadowFenceWaits[site]++;
-    g_shadowFenceTicks[site] += Now() - start;
-}
 
 extern "C" void WorldPush(uintptr_t ret)
 {
@@ -7868,10 +7258,6 @@ extern "C" void WorldPush(uintptr_t ret)
     }
     if (s->depth == 0 && GetCurrentThreadId() == g_mainThread)
     {
-        if (g_levelWatch && !g_threadLevel)
-            LevelWatchArm(false);
-        WaitShadowPrep();
-        CheckRenderLevels();
         CensusBegin();
         if (g_fillOn && g_mode == 2)
         {
@@ -8514,9 +7900,9 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
             {
                 fprintf(f, "main thread at the same moment:\n");
                 PrintUnwound(f, mc);
-                fprintf(f, "main's last syncs (oldest first: reason/frame/shadow prep done):");
+                fprintf(f, "main's last syncs (oldest first: reason/frame):");
                 for (uint32_t k = g_mainSyncCount > 16 ? g_mainSyncCount - 16 : 0; k < g_mainSyncCount; k++)
-                    fprintf(f, " %d/%u/%d", g_mainSyncs[k % 16].reason, g_mainSyncs[k % 16].frame, g_mainSyncs[k % 16].shadowDone ? 1 : 0);
+                    fprintf(f, " %d/%u", g_mainSyncs[k % 16].reason, g_mainSyncs[k % 16].frame);
                 fprintf(f, "\n");
             }
             ResumeThread(main);
@@ -10332,14 +9718,6 @@ extern "C" void __cdecl FenceHook(int reason)
         WaitIdlePublic(reason);
 }
 
-// With CRYMT_EARLYBARRIER: main waits only until the last flush's shadow prep is done (reason 1: entity system update,
-// 2: terrain calls of C3DEngine::Update), not for the whole flush.
-extern "C" void __cdecl ShadowFenceHook(int site)
-{
-    if (GetCurrentThreadId() == g_mainThread)
-        WaitShadowPrep(site);
-}
-
 namespace
 {
 // Generates "call hook(arg), then jump to original" with all argument registers kept.
@@ -10378,57 +9756,6 @@ void* MakeHookThunk(uintptr_t original, void (*hookFn)(int), int arg)
 void* MakeFenceThunk(uintptr_t original, int reason)
 {
     return MakeHookThunk(original, &FenceHook, reason);
-}
-
-void* MakeShadowFenceThunk(uintptr_t original, int site)
-{
-    return MakeHookThunk(original, &ShadowFenceHook, site);
-}
-
-// A shadow prep fence in front of a 6-byte virtual call sequence in CSystem::Update: the site becomes "call cave; nop",
-// the cave jumps to a fence thunk, which runs `tail` (the replaced instructions, ending in a jmp through the vtable).
-bool FenceVirtualCall(uintptr_t at, const uint8_t (&expect)[6], const uint8_t (&tail)[6], int fenceSite)
-{
-    auto* site = reinterpret_cast<uint8_t*>(at);
-    if (memcmp(site, expect, sizeof(expect)) != 0)
-        return false;
-    auto* virt = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    memcpy(virt, tail, sizeof(tail));
-    DWORD old;
-    VirtualProtect(virt, 4096, PAGE_EXECUTE_READ, &old);
-    void* thunk = MakeShadowFenceThunk(reinterpret_cast<uintptr_t>(virt), fenceSite);
-    uint8_t* cave = nullptr;
-    for (uintptr_t hint = (at & ~uintptr_t{0xFFFF}) + 0x4000000; hint < at + 0x40000000 && !cave; hint += 0x10000)
-        cave = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
-    if (!cave)
-        return false;
-    const auto target = reinterpret_cast<uint64_t>(thunk);
-    cave[0] = 0x48; // movabs rax, thunk; jmp rax
-    cave[1] = 0xB8;
-    memcpy(cave + 2, &target, 8);
-    cave[10] = 0xFF;
-    cave[11] = 0xE0;
-    VirtualProtect(cave, 4096, PAGE_EXECUTE_READ, &old);
-    const int32_t rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(cave) - reinterpret_cast<intptr_t>(site + 5));
-    VirtualProtect(site, sizeof(expect), PAGE_EXECUTE_READWRITE, &old);
-    site[0] = 0xE8; // call cave; nop: the virtual call returns to the nop
-    memcpy(site + 1, &rel, 4);
-    site[5] = 0x90;
-    VirtualProtect(site, sizeof(expect), old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, sizeof(expect));
-    return true;
-}
-
-// With the early barrier main runs on while shadow prep draws: shadow prep skins characters with their live poses
-// (casters the main view did not draw) and its terrain sectors read the engine's pass state. CSystem::Update's AI update
-// (0x365378E0: movaps xmm2,xmm6; call [rsi+0x20]) and entity system update (0x36537A61: mov rax,[rcx]; call
-// [rax+0x10]; entity registration, animation) change both, so they wait for shadow prep.
-bool FenceEntityUpdate()
-{
-    static const uint8_t aiExpect[6] = {0x0F, 0x28, 0xD6, 0xFF, 0x56, 0x20}, aiTail[6] = {0x0F, 0x28, 0xD6, 0xFF, 0x66, 0x20};
-    static const uint8_t entExpect[6] = {0x48, 0x8B, 0x01, 0xFF, 0x50, 0x10}, entTail[6] = {0x48, 0x8B, 0x01, 0xFF, 0x60, 0x10};
-    const bool ai = !GetEnvironmentVariableW(L"CRYMT_EARLYAIFENCE", nullptr, 0) || FenceVirtualCall(0x365378E0, aiExpect, aiTail, 3);
-    return FenceVirtualCall(0x36537A61, entExpect, entTail, 1) && ai;
 }
 
 // Puts a fence in front of the function referenced by a vtable slot (an absolute address in .rdata).
@@ -10856,52 +10183,8 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
         }
         wchar_t mask[16] = {};
         int fences = GetEnvironmentVariableW(L"CRYMT_FENCE", mask, 16) ? _wtoi(mask) : 0;
-        // Releasing main before shadow prep crashes on the first async frame (terrain LOD for shadow
-        // sectors reads engine state main has already moved on), so it stays an experiment.
-        g_shadowBarrier = GetEnvironmentVariableW(L"CRYMT_EARLYBARRIER", mask, 16) == 0;
         g_casterCensus = GetEnvironmentVariableW(L"CRYMT_CASTERCENSUS", nullptr, 0) != 0;
-        // Per-thread render levels: with the early barrier always, otherwise on request (CRYMT_THREADLEVEL=1).
-        const bool levelVar = GetEnvironmentVariableW(L"CRYMT_THREADLEVEL", mask, 16) != 0;
-        if (levelVar ? wcscmp(mask, L"0") != 0 : !g_shadowBarrier)
-        {
-            g_threadLevel = InstallThreadLevel();
-            char line[160];
-            if (g_threadLevel)
-                sprintf_s(line, "render recursion level: one per thread (%zu sites, TLS slot %lu)", std::size(kRenderLevelSites),
-                          g_levelTlsReserved);
-            else
-                sprintf_s(line, "render recursion level stays shared: %s", g_threadLevelWhy);
-            SetupLog(line);
-        }
-        if (!g_shadowBarrier && !g_threadLevel)
-        {
-            g_shadowBarrier = true;
-            SetupLog("early barrier needs per-thread render levels: barrier kept");
-        }
-        g_levelWatch = GetEnvironmentVariableW(L"CRYMT_LEVELWATCH", nullptr, 0) != 0;
-        if (g_levelWatch)
-            AddVectoredExceptionHandler(1, OnLevelWatch);
         g_overlay.on = GetEnvironmentVariableW(L"CRYMT_OVERLAY", nullptr, 0) != 0; // Ctrl+F11 toggles it in game
-        if (!g_shadowBarrier)
-        {
-            // Terrain work in C3DEngine::Update must not overlap shadow prep drawing terrain sectors: wait for shadow
-            // prep only (CRYMT_EARLYIDLE=1: the old fences, which waited for the whole flush).
-            if (GetEnvironmentVariableW(L"CRYMT_EARLYIDLE", nullptr, 0))
-            {
-                fences |= 16 | 32;
-                RedirectCall(0x300F81B5, 0x30142AF0, MakeFenceThunk(0x30142AF0, 420));
-                RedirectCall(0x300F831E, 0x300B6C00, MakeFenceThunk(0x300B6C00, 421));
-            }
-            else
-            {
-                RedirectCall(0x300F8143, 0x30141FE0, MakeShadowFenceThunk(0x30141FE0, 2));
-                RedirectCall(0x300F814F, 0x301415C0, MakeShadowFenceThunk(0x301415C0, 2));
-                RedirectCall(0x300F81B5, 0x30142AF0, MakeShadowFenceThunk(0x30142AF0, 2));
-                RedirectCall(0x300F831E, 0x300B6C00, MakeShadowFenceThunk(0x300B6C00, 2));
-            }
-            SetupLog(FenceEntityUpdate() ? "early barrier: AI and entity system updates wait for shadow prep"
-                                         : "early barrier: CSystem::Update's AI or entity update call differs, a fence is missing");
-        }
         if (fences & 1)
             FenceVtableEntry(0x301D3840, 0x300F5450, 401); // C3DEngine::OnFrameStart
         if (fences & 2)
@@ -10968,21 +10251,12 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
 {
     if (reason == DLL_THREAD_ATTACH)
     {
-        if (g_levelTls != TLS_OUT_OF_INDEXES) // per-thread render levels: a new thread is outside rendering
-            SetThreadRenderLevel(-1);
         return TRUE;
     }
     if (reason == DLL_THREAD_DETACH)
         return TRUE;
     if (reason == DLL_PROCESS_ATTACH)
     {
-        // Per-thread render levels need a TLS slot below 64 (it lives in the TEB): take one now, while they are free.
-        g_levelTlsReserved = TlsAlloc();
-        if (g_levelTlsReserved != TLS_OUT_OF_INDEXES && g_levelTlsReserved >= 64)
-        {
-            TlsFree(g_levelTlsReserved);
-            g_levelTlsReserved = TLS_OUT_OF_INDEXES;
-        }
         g_faultPath = CryMTLog("crymt_fault.txt");
         g_hangPath = CryMTLog("crymt_hang.txt");
         g_dumpPath = CryMTDirW() + L"logs\\mt\\crymt_crash.dmp";
