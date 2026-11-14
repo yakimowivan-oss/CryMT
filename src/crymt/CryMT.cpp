@@ -704,6 +704,7 @@ uint64_t g_cubeIdsAllRestored;   // EnvCubeUpdate: light ids (+0) put back after
 uint64_t g_renderSysEventSyncs;  // RenderSysEventHook: renderer system events on main with the render thread made idle
 uint64_t g_cubeGsmChanged;       // EnvCubeUpdate: light entities' shadow frustum pointers a face changed
 const volatile uint64_t* g_nullFrustumsSkipped; // PatchNoNullFrustums: the cave's counter of null cascades left out
+const volatile uint64_t* g_nullShadowLights;    // PatchNullShadowLights: lights past the frame's list left out of masks
 uint64_t g_cubeCloudsSkipped; // CloudRecursiveHook: cloud draws left out of the cube's faces
 EngineLightState g_cubeLightsAfter;
 std::atomic<bool> g_cubeLightsAfterSet;
@@ -1389,6 +1390,8 @@ void WriteStats()
         fprintf(f, "engine cube: light ids (+0) put back after a face beyond its own EF_ADDDlight's %llu\n", static_cast<unsigned long long>(g_cubeIdsAllRestored));
         fprintf(f, "renderer system events on main with the render thread made idle first %llu\n", static_cast<unsigned long long>(g_renderSysEventSyncs));
         fprintf(f, "engine cube: light entities' shadow frustum pointers changed by its faces %llu\n", static_cast<unsigned long long>(g_cubeGsmChanged));
+        fprintf(f, "shadow frustum lists: lights past the frame's list left out %llu\n",
+                static_cast<unsigned long long>(g_nullShadowLights ? *g_nullShadowLights : 0));
         fprintf(f, "shadow frustum lists: null cascades left out %llu\n",
                 static_cast<unsigned long long>(g_nullFrustumsSkipped ? *g_nullFrustumsSkipped : 0));
         fprintf(f, "projector lights' frustum tests %llu, with a camera outside the 3D engine's light cameras %llu (taken as inside, the camera-index crash)\n",
@@ -8550,6 +8553,11 @@ LONG CALLBACK OnException(EXCEPTION_POINTERS* info)
         return EXCEPTION_CONTINUE_SEARCH;
     if (InterlockedIncrement(&g_faults) > 3)
         return EXCEPTION_CONTINUE_SEARCH;
+    // The editor catches its crashes itself (the 2026-11-14 20:55 crash: the fault logged here, no minidump from the
+    // unhandled-exception filter): there the first access violation on main or the render thread writes it (once).
+    if (g_editor && code == EXCEPTION_ACCESS_VIOLATION && (GetCurrentThreadId() == g_mainThread || GetCurrentThreadId() == g_rtTid) &&
+        InterlockedCompareExchange(&g_dumpWriting, 1, 0) == 0)
+        WriteCrashDump(info);
     FILE* f = nullptr;
     if (fopen_s(&f, g_faultPath.c_str(), "a") != 0 || !f)
         return EXCEPTION_CONTINUE_SEARCH;
@@ -8802,6 +8810,58 @@ void ParticleSoundHook(void* subEmitter)
         return;
     }
     reinterpret_cast<void (*)(void*)>(kParticleSoundFn)(subEmitter);
+}
+
+// The editor's crash of 2026-11-14 20:55 (and 2026-11-13 03:02 / 04:15, game 06:26 / 06:46): Cry3DEngine+0xF0DCE in
+// GetShadowFrustumsList. Its mask comes from the ids (+0) of the lights affecting the object; one had id 1 while main's
+// level-1 list held only the sun ("EF_Query 0x1B light 1 past main's list (fill window) ... counts 1 0 0 0": a lamp 8 m
+// behind the camera, in the list frames before), so EF_Query 0x1B gave null and +0x90 of it was read. A stale id: the
+// cube's ids and every light's +0 are put back after a face, this one still got through. A light the frame's list does
+// not hold casts no shadow this frame: its bit is left out where the answer is used (0x300F0DCE: mov rcx, [rax + 0x90];
+// mov eax, [rbx + 8]): a cave checks the answer and its +0x90 (the entity; +0x2D0 is read from it next) and on null
+// goes on with the next bit (ebp 1 as the loop expects), counting it (CRYMT_NONULLLIGHTS=0: not).
+constexpr uintptr_t kShadowLightUse = 0x300F0DCE, kShadowLightUseEnd = 0x300F0DD8, kShadowLightNextBit = 0x300F0E18;
+bool PatchNullShadowLights()
+{
+    static const uint8_t kOriginal[10] = {0x48, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x43, 0x08};
+    auto* site = reinterpret_cast<uint8_t*>(kShadowLightUse);
+    if (memcmp(site, kOriginal, sizeof(kOriginal)) != 0)
+        return false;
+    uint8_t* cave = nullptr;
+    for (uintptr_t hint = (kShadowLightUse & ~uintptr_t{0xFFFF}) + 0x4000000; hint < kShadowLightUse + 0x40000000 && !cave; hint += 0x10000)
+        cave = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (!cave)
+        return false;
+    static const uint8_t kCave[] = {
+        0x48, 0x85, 0xC0,                         // 0: test rax, rax
+        0x74, 0x1D,                               // 3: jz 34
+        0x48, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, // 5: mov rcx, [rax + 0x90]
+        0x48, 0x85, 0xC9,                         // 12: test rcx, rcx
+        0x74, 0x11,                               // 15: jz 34
+        0x8B, 0x43, 0x08,                         // 17: mov eax, [rbx + 8]
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 20: jmp [rip] -> kShadowLightUseEnd (at 26)
+        0, 0, 0, 0, 0, 0, 0, 0,                   // 26
+        0x48, 0xFF, 0x05, 0x17, 0x00, 0x00, 0x00, // 34: inc qword [rip + 0x17] (the counter at 64)
+        0xBD, 0x01, 0x00, 0x00, 0x00,             // 41: mov ebp, 1
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // 46: jmp [rip] -> kShadowLightNextBit (at 52)
+    };
+    memcpy(cave, kCave, sizeof(kCave));
+    const uint64_t back = kShadowLightUseEnd, next = kShadowLightNextBit;
+    memcpy(cave + 26, &back, 8);
+    memcpy(cave + 52, &next, 8);
+    memset(cave + 64, 0, 8);
+    g_nullShadowLights = reinterpret_cast<const volatile uint64_t*>(cave + 64);
+    uint8_t patch[10];
+    memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xE9;
+    const int32_t rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(cave) - static_cast<intptr_t>(kShadowLightUse + 5));
+    memcpy(patch + 1, &rel, 4);
+    DWORD old;
+    VirtualProtect(site, sizeof(patch), PAGE_EXECUTE_READWRITE, &old);
+    memcpy(site, patch, sizeof(patch));
+    VirtualProtect(site, sizeof(patch), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, sizeof(patch));
+    return true;
 }
 
 // fleet's render-thread crash (2026-11-14, CryRenderD3D10+0x111E37, frame 1272 in five runs, then gone in three runs
@@ -10979,6 +11039,9 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
         if (EnvCubeSetting("CRYMT_NONULLFRUSTUMS", 1) != 0)
             SetupLog(PatchNoNullFrustums() ? "shadow frustum lists: null cascades left out"
                                            : "shadow frustum list append site mismatch, not patched");
+        if (EnvCubeSetting("CRYMT_NONULLLIGHTS", 1) != 0)
+            SetupLog(PatchNullShadowLights() ? "shadow frustum lists: lights past the frame's list left out"
+                                             : "shadow light use site mismatch, not patched");
         if (EnvCubeSetting("CRYMT_PARTICLESOUND_RT", 0) == 0)
             SetupLog(RedirectCall(kParticleSoundCall1, kParticleSoundFn, reinterpret_cast<const void*>(&ParticleSoundHook)) &&
                              RedirectCall(kParticleSoundCall2, kParticleSoundFn, reinterpret_cast<const void*>(&ParticleSoundHook))
