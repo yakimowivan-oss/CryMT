@@ -5202,6 +5202,7 @@ public:
     UINT fogOffset[4] = {};
     int vfogSlot = -1;      // the patched fog pass's CryMT_VFogSampler texture slot (RunVfog's volume goes there)
     int vfogParamSlot = -1; // ... its CryMT_VFogParamSampler slot (the parameters, with the mark)
+    int postParamSlot = -1; // the patched final HDR pass's CryMT_PostParamSampler slot (tone mapping: UpdatePostParams)
 
     // SM4 token stream (the SHDR chunk): opcode in bits 0-10, length in 24-30 (custom data: the next token).
     static bool HasDiscard(const std::vector<uint8_t>& dxbc)
@@ -5302,6 +5303,8 @@ public:
                 vfogSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "CryMT_VFogParamSampler") == 0)
                 vfogParamSlot = static_cast<int>(b.BindPoint);
+            if (b.Type == D3D10_SIT_TEXTURE && b.Name && strcmp(b.Name, "CryMT_PostParamSampler") == 0)
+                postParamSlot = static_cast<int>(b.BindPoint);
             if (b.Type == D3D10_SIT_CBUFFER)
                 cbMask |= ((1u << b.BindCount) - 1) << b.BindPoint;
             else if (b.Type == D3D10_SIT_SAMPLER)
@@ -8734,6 +8737,86 @@ public:
         memcpy(m_frameLast, data, sizeof(data));
     }
 
+    // The tone mapping (the engine page's "Тонмаппинг", CRYMT_TONEMAP 0/1/2; CRYMT_TONEMAP_SCALE its exposure scale):
+    // 0 the engine's curve, 1 GT7's per-channel curve, 2 GT7's full operator (kTonemapDecl).
+    static int TonemapBase()
+    {
+        static const int env = [] {
+            wchar_t v[8] = {};
+            return GetEnvironmentVariableW(L"CRYMT_TONEMAP", v, 8) ? std::min(std::max(_wtoi(v), 0), 2) : 0;
+        }();
+        return env;
+    }
+    static int TonemapMode()
+    {
+        const int panel = g_giControl.tonemap;
+        return panel < 0 ? TonemapBase() : std::min(panel, 2);
+    }
+    // GT7's exposure against the engine's: 2.6 puts the median of island's 9:30 frame where the engine's is (56.9; 1.53,
+    // mid grey k x = 0.5 matched, left it at 40: GT's toe darkens what lies below); the panel's list or
+    // CRYMT_TONEMAP_SCALE.
+    static float TonemapScaleBase()
+    {
+        static const float scale = [] {
+            wchar_t v[16] = {};
+            const float s = GetEnvironmentVariableW(L"CRYMT_TONEMAP_SCALE", v, 16) ? static_cast<float>(_wtof(v)) : 0.0f;
+            return s > 0.01f && s < 100.0f ? s : 2.6f;
+        }();
+        return scale;
+    }
+    static float TonemapScale()
+    {
+        const int panel = g_giControl.tonemapScale;
+        return panel > 0 ? panel / 100.0f : TonemapScaleBase();
+    }
+
+    // The final HDR pass's parameters (the back end fills its CryMT_PostParamSampler slot): made once, copied when they
+    // change.
+    void UpdatePostParams()
+    {
+        if (!m_postParam)
+        {
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = 1;
+            d.Height = 1;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            d.SampleDesc.Count = 1;
+            if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, kSrvState, nullptr, __uuidof(ID3D12Resource),
+                                                      reinterpret_cast<void**>(&m_postParam))))
+            {
+                m_postParam = nullptr;
+                return;
+            }
+            m_postParamSrv = g_srvCpu.Alloc();
+            g.dev->CreateShaderResourceView(m_postParam, nullptr, m_postParamSrv);
+        }
+        const float data[4] = {static_cast<float>(TonemapMode()), TonemapScale(), 0.0f, 4242.0f};
+        if (!memcmp(data, m_postParamLast, sizeof(data)))
+            return;
+        const UploadAlloc up = FrameUpload(256, 512);
+        if (!up.cpu)
+            return;
+        memcpy(up.cpu, data, sizeof(data));
+        m_barriers.push_back(Transition(m_postParam, kSrvState, D3D12_RESOURCE_STATE_COPY_DEST));
+        FlushBarriers();
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = m_postParam;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.pResource = up.res;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = up.offset;
+        src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 1, 256};
+        m_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        m_barriers.push_back(Transition(m_postParam, D3D12_RESOURCE_STATE_COPY_DEST, kSrvState));
+        memcpy(m_postParamLast, data, sizeof(data));
+        Log("tone mapping: %s (exposure scale %.2f)", data[0] > 1.5f ? "GT7 full" : data[0] > 0.5f ? "GT7 per-channel" : "the engine's", data[1]);
+    }
+
     // The Forward+ test (CRYMT_FPLUS=1 or the engine page's Num1): -1 until the panel sets it.
     static bool FPlusOn()
     {
@@ -8955,6 +9038,8 @@ public:
         m_pastScene = false;
         if (info->valid && g_jitterPlaceholder)
             UpdateFrameTexture(info);
+        if (info->valid)
+            UpdatePostParams();
         if (info->valid && g_fplusPlaceholder)
             UpdateFPlus(info);
         g_wantPassMatrices.store(Gi().on && ((Gi().geometry && (Gi().shadowGeometry || Gi().cubeGeometry || Gi().cubeInject)) ||
@@ -12976,6 +13061,9 @@ public:
         static const char* const fogHaze[] = {"ВЫКЛ|OFF", "10%", "20%", "35%", "50%"};
         static const int fogHazeValues[5] = {0, 10, 20, 35, 50};
         static const char* const fogSamples[] = {"1", "4", "8"};
+        static const char* const tonemap[] = {"ДВИЖОК|ENGINE", "GT7 ЛЁГКИЙ|GT7 LIGHT", "GT7 ПОЛНЫЙ|GT7 FULL"};
+        static const char* const tonemapScale[] = {"1.5", "2.0", "2.6", "3.0", "3.5"};
+        static const int tonemapScales[5] = {150, 200, 260, 300, 350};
         static const char* const dlssModel[] = {"K (ТРАНСФОРМЕР)|K (TRANSFORMER)", "J", "L (DLSS 4.5)|L (DLSS 4.5)", "M (DLSS 4.5)|M (DLSS 4.5)",
                                                 "F (CNN)|F (CNN)", "E (CNN)|E (CNN)"};
         static const char* const dlssCompare[] = {"ВЫКЛ|OFF", "СПРАВА K|RIGHT: K", "СПРАВА J|RIGHT: J", "СПРАВА L|RIGHT: L", "СПРАВА M|RIGHT: M",
@@ -13205,6 +13293,27 @@ public:
              [] { return static_cast<int>(lroundf(g_giControl.envAllScale * 2.0f)); }, [] { return 2; },
              [](int v) { g_giControl.envAllScale = v / 2.0f; }, true, nullptr},
             // Engine
+            // The last tone curve: the engine's or GT7's (Polyphony Digital's operator, kTonemapDecl), to compare.
+            {4, "Тонмаппинг|Tone mapping", 0, 2, 1, true, tonemap, 0, nullptr, [] { return TonemapMode(); },
+             [] { return TonemapBase(); }, [](int v) { g_giControl.tonemap = v; }, true, nullptr},
+            {4, "Экспозиция GT7|GT7 exposure", 0, 4, 1, false, tonemapScale, 0, nullptr,
+             [] {
+                 const int v = static_cast<int>(TonemapScale() * 100.0f + 0.5f);
+                 int best = 0;
+                 for (int i = 1; i < 5; i++)
+                     if (abs(tonemapScales[i] - v) < abs(tonemapScales[best] - v))
+                         best = i;
+                 return best;
+             },
+             [] {
+                 const int v = static_cast<int>(TonemapScaleBase() * 100.0f + 0.5f);
+                 int best = 0;
+                 for (int i = 1; i < 5; i++)
+                     if (abs(tonemapScales[i] - v) < abs(tonemapScales[best] - v))
+                         best = i;
+                 return best;
+             },
+             [](int v) { g_giControl.tonemapScale = tonemapScales[v]; }, true, nullptr},
             {4, "Кэш дальних теней|Far shadow cache", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.gsmCache > 0 ? 1 : 0; },
              [] { const int d = g_giControl.gsmDefault; return d < 0 ? (g_giControl.gsmCache > 0 ? 1 : 0) : d; },
              [](int v) {
@@ -14938,6 +15047,11 @@ private:
     TextureCore m_vfogParam{}; // the fog pass's parameters (1x1 RGBA32F: the near air, the mark 4242), written by the pass
     D3D12_CPU_DESCRIPTOR_HANDLE m_vfogParamSrv{}, m_vfogParamUav{};
     D3D12_CPU_DESCRIPTOR_HANDLE m_vfogNull3d{}; // a null 3D view: the volume's slot when there is none (reads zero)
+    // The final HDR pass's parameters (UpdatePostParams; the patched HDRFinalScenePS, Settings.cpp kTonemapDecl): 1x1
+    // RGBA32F x the tone mapping (0 the engine's, 1 GT7's per-channel curve, 2 GT7 full), y its exposure scale, w 4242.
+    ID3D12Resource* m_postParam = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_postParamSrv{};
+    float m_postParamLast[4] = {-1, -1, -1, -1};
     ID3D12RootSignature* m_vfogRoot = nullptr;
     ID3D12PipelineState* m_vfogPso = nullptr;
     bool m_vfogFailed = false;
@@ -16102,6 +16216,9 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
             // The GI in the fog: the patched fog pass's two slots always filled (the engine's post-process code binds only
             // its own textures; whatever another pass left in these stays: the editor, 2026-11-15): this frame's volume
             // and parameters for the scene's fog pass, else typed null views (no mark: the pass keeps the engine's fog).
+            // The final HDR pass's parameters (tone mapping), always filled: the engine binds its own textures only.
+            if (s == kPS && m_ps && static_cast<int>(i) == m_ps->postParamSlot)
+                src[i] = m_postParamSrv.ptr ? m_postParamSrv : g_nullSrv;
             if (s == kPS && m_ps && m_ps->vfogSlot >= 0 && (static_cast<int>(i) == m_ps->vfogSlot || static_cast<int>(i) == m_ps->vfogParamSlot))
             {
                 const bool valid = m_vfogFrame == m_frame && m_rtv[0] && m_rtv[0]->info == m_vfogTarget && m_vfogParamSrv.ptr;

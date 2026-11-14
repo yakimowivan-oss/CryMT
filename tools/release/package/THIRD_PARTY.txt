@@ -36,5 +36,10 @@ AMD FidelityFX SDK 1.1.4: Stochastic Screen Space Reflections (ffx_sssr_intersec
            reflections (CryMT's patch of Water.cfx, written by CryMTSettings.exe).
   License: MIT, Copyright (C) 2024 Advanced Micro Devices, Inc. (fidelityfx.license.txt)
 
+Polyphony Digital: GT7 Tone Mapping sample (gt7_tone_mapping.cpp 1.0; SIGGRAPH 2025)
+  Use:     ported to HLSL as an optional tone mapping to compare with the game's (CryMT's patch of
+           PostProcess.cfx, written by CryMTSettings.exe; off unless chosen on the in-game panel).
+  License: MIT, Copyright (c) 2025 Polyphony Digital Inc. (gt7_tone_mapping.license.txt)
+
 Crysis
   Crysis and CryEngine are trademarks of Crytek. The package contains no game files.
