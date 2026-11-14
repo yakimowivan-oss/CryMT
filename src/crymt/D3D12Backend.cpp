@@ -1610,10 +1610,11 @@ cbuffer GiConstants : register(b0)
     float2 fullSize; float2 giSize;
     float2 invProj;     // 1 / proj._11, 1 / proj._22
     float2 depthParams; // proj._33, proj._43 (right-handed): distance = _43 / (d + _33)
-    float radius; float bounce; float occlusion; float temporal;
-    float maxDistance; float frame; float debug; float options; // options: 1 fixed sample pattern, 2 nearest depth of the 2x2 block, 4 plain bounce sum,
+    float radius; float bounce; float occlusion; float temporal; // radius..occlusion: 0 in trace (its screen part's, removed
+                                                                 // 2026-11-15); the motion, GTAO and exposure passes' own
+    float maxDistance; float frame; float debug; float options; // options: 1 fixed sample pattern, 2 nearest depth of the 2x2 block, 4 unused,
                                                                  // 8 narrow normals, 16 the first-person view takes the camera's GI (upsample t2),
-                                                                 // 32 two screen-part directions (else four), 64 opacity per axis,
+                                                                 // 32 unused, 64 opacity per axis,
                                                                  // 128 the roof texture (CRYMT_GI_ROOFCELLS), 256 thin features
                                                                  // take their surroundings' GI (CRYMT_GI_THIN, on); upsample:
                                                                  // 512 the GI replaces the engine's SSAO (GTAO), 1024 GTAO's
@@ -1627,7 +1628,7 @@ cbuffer GiConstants : register(b0)
                                // floor (Strengthen)
     float4 toWorldX; float4 toWorldY; float4 toWorldZ; // the engine's view (x, y, -distance, 1) dotted with these: world
     float4 voxGrid;   // xyz the grid's first cell, w cells per axis
-    float4 voxParams; // x cell size (m), y 0 off / 1 on / 2 voxel part only / 3 screen part only, z cone reach (m), w strength
+    float4 voxParams; // x cell size (m), y 0 no grid (no GI) / 1 the cones, z cone reach (m), w strength
     float4 voxParams2; // x occlusion strength of the cones; near occlusion cones: y lift, z start (cells of level 0),
                        // w strength (0: none)
     float2 occRange;   // x: the cones' occlusion counts fully up to x / 2 metres, fading to none at x (light from all the
@@ -2568,128 +2569,13 @@ void trace(uint3 id : SV_DispatchThreadID)
         }
         if (dot(N, P) > 0)
             N = -N; // facing the camera
-        float2 radiusUv = min(radius / (P.z * invProj) * 0.5, 0.15);
         float noise = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))) + ((uint)options & 1 ? 0 : frame * 0.618034));
-        float3 indirect = 0, toned = 0;
-        float occ = 0, weights = 0;
-        // Slices: 4 directions, or 2 (options & 32, turned with the frame's noise; the filter and the history average
-        // them), each both ways; steps by the radius on screen: one per 1.5 GI texels, 2 to 6 (distant points have a
-        // small radius in pixels; the trace was 0.57 ms of screen part at 5120x1440).
-        int dirs = ((uint)options & 32) ? 2 : 4;
-        int traced = voxParams.y == 2 ? 0 : dirs; // the cones' part only: the screen part is not used
-        int steps = clamp((int)ceil(length(radiusUv * fullSize) / (1.5 * GiScale())), 2, 6);
-        // Visibility bitmask (Therrien et al. 2023): per slice 32 sectors of the hemisphere around the normal, spaced
-        // by the projected cosine (each one the same share of irradiance); a sample occupies the sectors between its
-        // front and its back (pushed away from the camera by a thickness), occludes them once and gives its light only
-        // to the sectors it is the first to cover: occlusion and light from the same visibility, no light through
-        // thin objects counted twice. CRYMT_GI_SCREENCLASSIC=1 (debug 5): the horizon method before.
-        bool classic = debug == 5;
-        float3 Vc = normalize(-P);
-        float thickness = max(radius, 0.5);
-        float sinMax = sin(1.5707963 - kBias);
-        [loop] for (int k = 0; k < traced; k++)
-        {
-            float a = (k + noise) * (3.14159265 / dirs);
-            float2 dir = float2(cos(a), sin(a));
-            float3 dvec = ViewPosAt(uv + dir / fullSize, d0) - P; // the slice's direction at this depth
-            float3 ortho = normalize(dvec - dot(dvec, Vc) * Vc + 1e-6);
-            float3 axis = cross(ortho, Vc);
-            float3 pn = N - axis * dot(N, axis);
-            float n = (dot(ortho, pn) < 0 ? -1.0 : 1.0) * acos(saturate(dot(pn, Vc) / max(length(pn), 1e-5)));
-            uint occluded = 0;
-            [unroll] for (int side = -1; side <= 1; side += 2)
-            {
-                float horizon = kBias; // cosine to the normal of the highest sample so far
-                [loop] for (int s = 1; s <= steps; s++)
-                {
-                    float2 offset = side * dir * radiusUv * ((s - noise * 0.5) / steps);
-                    if (dot(offset * fullSize, offset * fullSize) < 9) // closer than 3 pixels: depth precision only
-                        continue;
-                    float2 suv = Snap(uv + offset);
-                    if (any(suv < 0) || any(suv > 1))
-                        break;
-                    float sd = depthTex.SampleLevel(pointClamp, suv, 0);
-                    if (sd < kWeaponDepth)
-                        continue;
-                    float3 S = ViewPosAt(suv, sd);
-                    float3 v = S - P;
-                    float len2 = dot(v, v);
-                    float c = dot(N, v * rsqrt(max(len2, 1e-8)));
-                    float fall = saturate(1 - len2 / (radius * radius));
-                    uint fresh = 0;
-                    if (classic)
-                    {
-                        if (!(c > horizon))
-                            continue;
-                    }
-                    else
-                    {
-                        if (fall <= 0)
-                            continue;
-                        // The sample's front and back as angles in the slice from the view direction, then from the
-                        // normal (u), then as the projected-cosine position 0..1 (the edges kBias off the plane).
-                        float3 back = S + normalize(S) * thickness;
-                        float uf = side * acos(clamp(dot(v * rsqrt(max(len2, 1e-8)), Vc), -1, 1)) - n;
-                        float ub = side * acos(clamp(dot(normalize(back - P), Vc), -1, 1)) - n;
-                        float t0 = saturate((sin(clamp(uf, -1.5707963, 1.5707963)) / sinMax + 1) * 0.5);
-                        float t1 = saturate((sin(clamp(ub, -1.5707963, 1.5707963)) / sinMax + 1) * 0.5);
-                        uint lo = (uint)floor(min(t0, t1) * 32), hi = (uint)ceil(max(t0, t1) * 32);
-                        uint count = hi > lo ? hi - lo : 0;
-                        uint bits = count >= 32 ? 0xFFFFFFFFu : (((1u << count) - 1u) << lo);
-                        fresh = bits & ~occluded;
-                        occluded |= bits;
-                        if (fresh == 0)
-                            continue;
-                    }
-                    // The colour is last frame's: read it where this point was then.
-                    float4 sc = mul(float4(S.xy, -S.z, 1), reproj);
-                    float2 cuv = float2(sc.x, -sc.y) / sc.w * 0.5 + 0.5;
-                    float3 colour = srcTex.SampleLevel(linearClamp, cuv, 0).rgb;
-                    if (all(cuv >= 0) && all(cuv <= 1) && Finite(float4(colour, 0)))
-                    {
-                        float3 lit = clamp(colour, 0, 4.0);
-                        float w;
-                        if (classic)
-                            w = (c - horizon) * fall;
-                        else
-                        {
-                            // Less of our own light fed back: the colour there holds last frame's GI times its albedo
-                            // (taken as 0.5); indoors that loop lit the corners (wall to corner to wall, times the bounce).
-                            float3 own = historyTex.SampleLevel(linearClamp, cuv, 0).rgb;
-                            lit = max(lit - 0.5 * max(own, 0), 0);
-                            w = countbits(fresh) / 32.0;
-                        }
-                        indirect += lit * w;
-                        toned += lit / (1 + max(lit.r, max(lit.g, lit.b))) * w;
-                        weights += w;
-                    }
-                    if (classic)
-                        horizon = lerp(horizon, c, fall);
-                }
-                if (classic)
-                    occ += (horizon - kBias) / (1 - kBias);
-            }
-            if (!classic)
-                occ += countbits(occluded) / 32.0 * 2; // both sides in one mask: counted as two halves
-        }
-        // Bright spots among the samples (a sunlit patch seen from the shade) make single texels flare, white flicker in
-        // motion once the bounce is strong: the samples are averaged as c / (1 + max(c)) and turned back (Karis), so
-        // one bright sample weighs no more than a dull one while an evenly lit area keeps its light. options & 4: plain.
-        if (!((uint)options & 4) && weights > 0)
-        {
-            float3 mean = toned / weights;
-            indirect = mean / max(1 - max(mean.r, max(mean.g, mean.b)), 0.05) * weights;
-        }
+        // (The screen part - bounce and occlusion traced on screen with a visibility bitmask, CRYMT_GI_SCREEN, off
+        // since 2026-11-10 - was removed 2026-11-15: noisy, at odds with the rest of the GI; tag experiments-2026-11-15.)
         // Near the GI alone, then over 1.5 x that the engine's baked occlusion takes over (the shader patch's
         // CryMT_GIBakedMix, the same window): full up to options >> 16 (5 bits) x 2 metres, none from 2.5 x that on.
         float fadeStart = (float)(((uint)options >> 16) & 31u) * 2;
         float fade = fadeStart > 0 ? saturate((fadeStart * 2.5 - P.z) / (fadeStart * 1.5)) : saturate(1 - P.z / maxDistance);
-        float3 nearLight = indirect * (bounce / (dirs * (classic ? 2 : 1)));
-        float nearOcc = occ / (dirs * 2);
-        // With the GTAO passes (in place of the engine's SSAO) the near occlusion is theirs alone: this part keeps the
-        // bounce light (two near occlusions darkened the creases twice).
-        if (((uint)options & 512) != 0 && motionParams.y > 0)
-            nearOcc = 0;
         if (voxParams.y > 0)
         {
             // Five cones of 60 degrees (the normal and four around it, turned per texel) through the voxel grid, from a
@@ -2820,23 +2706,9 @@ void trace(uint3 id : SV_DispatchThreadID)
             const float outer = saturate(EdgeCells(3, Pw, 0) / 16);
             farLight *= outer;
             farOcc *= outer;
-            if (voxParams.y == 2)
-            {
-                nearLight = 0;
-                nearOcc = 0;
-            }
-            if (voxParams.y == 3)
-            {
-                farLight = 0;
-                farOcc = 0;
-            }
-            // The screen part's occlusion takes the AO strength (occlusion), the cones' their own (voxParams2.x).
-            nearLight += (1 - nearOcc) * farLight;
-            nearOcc = 1 - (1 - saturate(nearOcc * occlusion)) * (1 - saturate(farOcc * voxParams2.x));
-            result = float4(nearLight, Strengthen(nearOcc, roof)) * fade;
+            result = float4(farLight, Strengthen(saturate(farOcc * voxParams2.x), roof)) * fade;
         }
-        else
-            result = float4(nearLight, Strengthen(nearOcc * occlusion, 1)) * fade; // no grid: the strength everywhere
+        // No grid (not ready yet, CRYMT_GI_VOXELS=0): no GI.
     }
     if (debug == 2) // CRYMT_GI_DEBUG=2: the occlusion only, 3: the bounce light only (measurements), 4: the VisArea mask
         result.rgb = 0;
@@ -7902,20 +7774,18 @@ public:
     struct GiSettings
     {
         bool on = false;
-        float radius = 2.5f, bounce = 1.0f, occlusion = 0.8f, temporal = 0.75f, maxDistance = 120.0f, debug = 0.0f;
+        float temporal = 0.75f, maxDistance = 120.0f, debug = 0.0f;
         bool upsample = true;    // CRYMT_GI_UPSAMPLE=0: the engine reads the half-size GI directly (v1.3)
         bool fixedNoise = false; // CRYMT_GI_FIXEDNOISE=1: the same sample pattern every frame
         bool nearest = false;    // CRYMT_GI_NEAREST=1: a GI texel stands for the nearest depth of its 2x2 block
-        bool plainBounce = false; // CRYMT_GI_FIREFLY=0: the screen part's bounce as a plain sum (no bright-sample damping)
         bool narrowNormals = false; // CRYMT_GI_NARROWNORMALS=1: normals one GI texel wide only (faces show on round meshes)
         bool weaponGi = true;       // CRYMT_GI_WEAPON=0: no GI on the first-person view (weapon, hands, held objects)
-        int directions = 2;         // CRYMT_GI_DIRECTIONS: screen-part directions a GI texel, 2 (turned each frame) or 4
         float occFar = 16;          // CRYMT_GI_OCCRANGE (m): the cones' occlusion full to half of it, gone at it (0: no limit)
         float occStrength = 1;      // CRYMT_GI_OCCSTRENGTH: occlusion strength under cover (Num4 / Num7 multiply it)
         bool voxels = false;     // CRYMT_GI_VOXELS=1: the voxel grid around the camera (kVoxShader)
         float voxelSize = 0.25f; // CRYMT_GI_VOXELSIZE, metres (the finest level)
         float voxelView = 0;     // CRYMT_GI_VOXELVIEW: 1 wire faces over the frame + GI inset, 2 solid voxels (implies VOXELS)
-        float voxelMix = 0;      // CRYMT_GI_VOXELS value: 1 cones through the grid in the GI, 2 their part only, 3 the screen part only, 4 the grid without cones
+        float voxelMix = 0;      // CRYMT_GI_VOXELS value: 1 the cones through the grid (the GI), 4 the grid without cones (cost)
         float voxelStrength = 1.5f, voxelReach = 64.0f; // CRYMT_GI_VOXELSTRENGTH (bounce light of the cones), CRYMT_GI_VOXELREACH (m)
         float voxelOcclusion = 0.6f; // CRYMT_GI_VOXELAO: how much of the flat ambient the cones' occlusion removes
         bool geometry = true;        // the z-prepass draws voxelized into level 0 (RunVoxelGeometry); CRYMT_GI_GEOMETRY=0 off
@@ -7925,8 +7795,6 @@ public:
         bool opacityGeometry = true;  // the cells' opacity from the voxelized geometry only, the screen gives only their colour
                                       // (levels with geometry; the coarsest keeps the screen); CRYMT_GI_OCCUPANCY=screen: also
                                       // from the screen (before 2026-11-10: 12 x the cells coming and going on a still camera)
-        bool screenPart = false;      // CRYMT_GI_SCREEN=1: the screen part (bounce and occlusion traced on screen) with the
-                                      // cones; off by default since 2026-11-10 (the user), it is not traced then
         float foliageOpacity = 0.5f;  // CRYMT_GI_FOLIAGE: an alpha-tested material's cell opacity (by leaf shape with materials)
         bool materials = true;        // CRYMT_GI_MATERIALS=0: geometry without textures (no albedo, no alpha test)
         float coneLift = 0.5f, coneStart = 1; // CRYMT_GI_CONELIFT, CRYMT_GI_CONESTART: the near cones', cells of level 0
@@ -8051,28 +7919,20 @@ public:
                 if (GetEnvironmentVariableW(name, t, 32))
                     value = static_cast<float>(_wtof(t));
             };
-            read(L"CRYMT_GI_RADIUS", v.radius);
-            read(L"CRYMT_GI_BOUNCE", v.bounce);
-            read(L"CRYMT_GI_AO", v.occlusion);
             read(L"CRYMT_GI_TEMPORAL", v.temporal);
             read(L"CRYMT_GI_DISTANCE", v.maxDistance);
             read(L"CRYMT_GI_DEBUG", v.debug);
-            if (v.debug == 0 && GetEnvironmentVariableW(L"CRYMT_GI_SCREENCLASSIC", text, 32) && wcscmp(text, L"0") != 0)
-                v.debug = 5; // the screen part's horizon method (before the visibility bitmask)
             v.upsample = !(GetEnvironmentVariableW(L"CRYMT_GI_UPSAMPLE", text, 32) && wcscmp(text, L"0") == 0);
             v.fixedNoise = GetEnvironmentVariableW(L"CRYMT_GI_FIXEDNOISE", text, 32) && wcscmp(text, L"0") != 0;
             v.nearest = GetEnvironmentVariableW(L"CRYMT_GI_NEAREST", text, 32) && wcscmp(text, L"0") != 0;
-            v.plainBounce = GetEnvironmentVariableW(L"CRYMT_GI_FIREFLY", text, 32) && wcscmp(text, L"0") == 0;
             v.narrowNormals = GetEnvironmentVariableW(L"CRYMT_GI_NARROWNORMALS", text, 32) && wcscmp(text, L"0") != 0;
             v.weaponGi = !(GetEnvironmentVariableW(L"CRYMT_GI_WEAPON", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_GI_OCCRANGE", v.occFar);
             read(L"CRYMT_GI_OCCSTRENGTH", v.occStrength);
-            if (GetEnvironmentVariableW(L"CRYMT_GI_DIRECTIONS", text, 32))
-                v.directions = _wtoi(text) <= 2 ? 2 : 4;
-            // The voxel cones come with GI (the screen part alone looks poor); CRYMT_GI_VOXELS=0 turns them off.
+            // The voxel cones are the GI; CRYMT_GI_VOXELS=0: no grid (no GI, to measure), 4 the grid without cones.
             const bool voxelVar = GetEnvironmentVariableW(L"CRYMT_GI_VOXELS", text, 32) != 0;
             v.voxels = voxelVar ? wcscmp(text, L"0") != 0 : v.on;
-            v.voxelMix = !v.voxels ? 0.0f : voxelVar ? static_cast<float>(_wtof(text)) : 1.0f;
+            v.voxelMix = !v.voxels ? 0.0f : voxelVar && _wtof(text) == 4 ? 4.0f : 1.0f;
             read(L"CRYMT_GI_VOXELSTRENGTH", v.voxelStrength);
             read(L"CRYMT_GI_VOXELREACH", v.voxelReach);
             read(L"CRYMT_GI_VOXELAO", v.voxelOcclusion);
@@ -8085,9 +7945,6 @@ public:
             v.geometryPersist = !(GetEnvironmentVariableW(L"CRYMT_GI_GEOMPERSIST", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_GI_FOLIAGE", v.foliageOpacity);
             v.opacityGeometry = !(GetEnvironmentVariableW(L"CRYMT_GI_OCCUPANCY", text, 32) && _wcsicmp(text, L"screen") == 0);
-            v.screenPart = GetEnvironmentVariableW(L"CRYMT_GI_SCREEN", text, 32) && wcscmp(text, L"0") != 0;
-            if (v.voxelMix == 1 && !v.screenPart)
-                v.voxelMix = 2; // the cones' part only
             v.materials = !(GetEnvironmentVariableW(L"CRYMT_GI_MATERIALS", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_GI_CONELIFT", v.coneLift);
             read(L"CRYMT_GI_CONESTART", v.coneStart);
@@ -8215,14 +8072,10 @@ public:
         if (!g.on && !m_giSrv)
             m_giCpu = {}; // shaders see the placeholder: no GI (CRYMT_GITEST keeps its texture)
         g.occStrength = b.occStrength * occlusion; // Num4 / Num7: where there is cover above (Strengthen), not everywhere
-        g.bounce = b.bounce * bounce;
         g.voxelStrength = b.voxelStrength * bounce;
         g.probeStrength = b.probeStrength * bounce; // GI v2 too (the user liked Sponza's strong bounce)
         g.voxels = b.on; // the grid keeps up, so the cones and the view switch on at once
-        if (g_giControl.parts < 0)
-            g_giControl.parts = b.voxelMix == 2 ? 1 : 0;
-        const int parts = g_giControl.parts; // Num1: both parts, the cones only
-        g.voxelMix = parts == 1 ? 2.0f : (b.voxelMix > 0 && b.voxelMix < 4 && b.voxelMix != 2 ? b.voxelMix : 1.0f);
+        g.voxelMix = b.voxelMix == 4 ? 4.0f : 1.0f; // the cones (as the grid, they keep up with GI on)
         g.weaponGi = b.weaponGi && g_giControl.weapon;
         g.voxelView = static_cast<float>(g_giControl.view.load());
         // Num3: the voxel geometry with the near occlusion cones; off gives the ini's settings exactly.
@@ -10821,9 +10674,9 @@ public:
         const GiSettings& s = Gi();
         float c[kGiConstants] = {static_cast<float>(m_giFullW), static_cast<float>(m_giFullH), static_cast<float>(m_giW), static_cast<float>(m_giH),
                                  1.0f / m_giProj[0], 1.0f / m_giProj[5], m_giProj[10], m_giProj[14],
-                                 s.radius, s.bounce, s.occlusion, m_giReset ? 0.0f : s.temporal,
-                                 s.maxDistance, static_cast<float>(m_giFrame & 1023), s.debug, (s.fixedNoise ? 1.0f : 0.0f) + (s.nearest ? 2.0f : 0.0f) + (s.plainBounce ? 4.0f : 0.0f) + (s.narrowNormals ? 8.0f : 0.0f) +
-                                 (cones && s.weaponGi && m_giCam && m_giPsoCamera ? 16.0f : 0.0f) + (s.directions <= 2 ? 32.0f : 0.0f) +
+                                 0.0f, 0.0f, 0.0f, m_giReset ? 0.0f : s.temporal,
+                                 s.maxDistance, static_cast<float>(m_giFrame & 1023), s.debug, (s.fixedNoise ? 1.0f : 0.0f) + (s.nearest ? 2.0f : 0.0f) + (s.narrowNormals ? 8.0f : 0.0f) +
+                                 (cones && s.weaponGi && m_giCam && m_giPsoCamera ? 16.0f : 0.0f) +
                                  (s.mipOpacity >= 4 ? 64.0f : 0.0f) + (s.roofCells ? 128.0f : 0.0f) + (s.thinFix ? 256.0f : 0.0f) +
                                  (s.replaceSsao ? 512.0f : 0.0f) + static_cast<float>((s.bakedOff & 30) << 10) + (s.gtaoFull ? 32768.0f : 0.0f) + (s.gtaoHistory ? 1024.0f : 0.0f) + (s.gtaoNoFoliage ? 4194304.0f : 0.0f) +
                                  (s.gtaoFoliageShade ? 8388608.0f : 0.0f) +
@@ -12701,7 +12554,6 @@ public:
     static const std::vector<PanelItem>& PanelItems()
     {
         static const char* const onOff[] = {"ВЫКЛ|OFF", "ВКЛ|ON"};
-        static const char* const parts[] = {"ЭКРАН+ВОКСЕЛИ|SCREEN+VOXELS", "ВОКСЕЛИ|VOXELS"};
         static const char* const ao[] = {"SSAO ИГРЫ|GAME'S SSAO", "GTAO"};
         static const char* const gtaoAcc[] = {"ВЫКЛ|OFF", "0.5", "0.7", "0.9"};
         static const char* const contact[] = {"ВЫКЛ|OFF", "СТАРЫЕ, 12 ШАГОВ|OLD, 12 STEPS", "SSS (BEND)"};
@@ -12742,9 +12594,6 @@ public:
             // GI
             {0, "GI|GI", 0, 1, 1, true, onOff, 0, nullptr, [] { return g_giControl.enabled ? 1 : 0; }, [] { return 1; },
              [](int v) { g_giControl.enabled = v != 0; }, true, nullptr},
-            {0, "Части GI|GI parts", 0, 1, 1, true, parts, 0, nullptr,
-             [] { const int v = g_giControl.parts; return v < 0 ? (GiBase().voxelMix == 2 ? 1 : 0) : v; },
-             [] { return GiBase().voxelMix == 2 ? 1 : 0; }, [](int v) { g_giControl.parts = v; }, true, nullptr},
             {0, "Окклюзия под укрытием|Occlusion under cover", 0, 30, 1, false, nullptr, 0.1f, "x%.1f",
              [] { return static_cast<int>(lroundf(g_giControl.occlusionScale * 10.0f)); }, [] { return 10; },
              [](int v) { g_giControl.occlusionScale = v / 10.0f; }, true, nullptr},

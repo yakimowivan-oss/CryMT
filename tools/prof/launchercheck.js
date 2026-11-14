@@ -20,7 +20,7 @@ const INTERNAL = /^CRYMT_(CAPTURE_|.*CENSUS|.*VERIFY|.*TRACE|.*DUMP$|.*LOG$|PSOL
 const HIDDEN = new Set([
     'ASYNCPSO', 'ASYNCSAVE', 'BUFFERS', 'COMPILEFENCE', 'D3DWRAP', 'DLSS_AUTOEXPOSURE', 'DLSS_CLAMP',
     'DLSS_EXPOSURE', 'DLSS_EXPOSUREKEY', 'DLSS_EXPOSURESCALE', 'DLSS_JITTER', 'DLSS_MVSCALE', 'EARLYBARRIER',
-    'FENCE', 'FENCEAT', 'FRUSTUMTEST', 'GI_CONELIFT', 'GI_CONESTART', 'GI_DIRECTIONS', 'GI_DISTANCE', 'GI_FIREFLY',
+    'FENCE', 'FENCEAT', 'FRUSTUMTEST', 'GI_CONELIFT', 'GI_CONESTART', 'GI_DISTANCE', 'GI_VOXELS',
     'GI_FIXEDNOISE', 'GI_FLOOR', 'GI_FOLIAGE', 'GI_LAMPS', 'GI_MATERIALS', 'GI_MIPOPACITY', 'GI_NARROWNORMALS',
     'GI_NEAREST', 'GI_NEAROCC', 'GI_OCCRANGE', 'GI_OCCSTRENGTH', 'GI_PARTICLECELL', 'GI_ROOFCELLS', 'GI_SCALE', 'GI_CUBEGEOM', 'GI_CUBEINJECT', 'GI_SUNMARCH', 'GI_ROOMLIGHT', 'GI_DIRLIGHT', 'ENVCUBE_DOWNMOVE', 'ENVCUBE_PLAYER', 'ENVCUBE_NEARHIDDEN', 'ENVCUBE_CLOUDS', 'GI_PROBES', 'GI_PROBESTRENGTH', 'VFOG', 'VFOG_GI', 'VFOG_OUT', 'VFOG_SUN', 'VFOG_HAZE', 'VFOG_HAZEREACH', 'VFOG_SAMPLES', 'GI_PROBEVIS', 'GI_PROBEPRECISE',
     // 2026-11-14: guards and A/B switches of the cube, fleet and editor fixes; experiments kept off
@@ -78,7 +78,7 @@ const diff = (a, b) => {
     return out;
 };
 console.log('CryMT.ini (' + lines(text).length + ' строк): сохранение без изменений ' + (same === text ? 'даёт тот же файл' : 'МЕНЯЕТ файл:\n  ' + diff(text, same).join('\n  ')));
-const tries = [['giBounce', 5], ['zown', !values.zown], ['geometry', values.geometry === 'off' ? 'on' : 'off'], ['keys', !values.keys], ['devmode', !values.devmode]];
+const tries = [['voxStrength', 3], ['zown', !values.zown], ['geometry', values.geometry === 'off' ? 'on' : 'off'], ['keys', !values.keys], ['devmode', !values.devmode]];
 for (const [k, v] of tries) {
     const t = I.merge(C, text, Object.assign({}, values, {[k]: v}));
     const d = diff(text, t);

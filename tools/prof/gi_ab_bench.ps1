@@ -4,7 +4,7 @@
 #   powershell -File tools\prof\gi_ab_bench.ps1 [-Width 2560 -Height 1440] [-Tests harbor,gpu] [-Rounds 1]
 #   [-PreCfg name]: a Game\Config\<name>.cfg executed before the test's (cvar experiments, after the spec is applied)
 param([int]$Width = 2560, [int]$Height = 1440, [string]$Out = "$PSScriptRoot\..\..\logs\gi_ab_bench.jsonl", [int]$MaxSec = 600,
-      [string[]]$Tests = @('harbor', 'gpu', 'village'), [int]$Rounds = 1, [string]$PreCfg = "", [string[]]$Variants = @('default', 'nogeom', 'screen', 'nogi'))
+      [string[]]$Tests = @('harbor', 'gpu', 'village'), [int]$Rounds = 1, [string]$PreCfg = "", [string[]]$Variants = @('default', 'nogeom', 'nogi'))
 $g = 'D:\Games\Crysis'
 $testDefs = @{
     cpu2 = @{Level = 'ice'; Cfg = 'crymt_q_cpu'; Log = 'benchmark_cpu.log'}
@@ -17,9 +17,7 @@ $testDefs = @{
 $variantDefs = [ordered]@{
     default = @{}
     nogeom = @{CRYMT_GI_GEOMETRY = '0'}
-    screen = @{CRYMT_GI_SCREEN = '1'}
     nogi = @{CRYMT_GI = '0'}
-    nocache = @{CRYMT_GI_GEOMCACHE = '0'}
     nocube = @{CRYMT_ENVCUBE = '0'; CRYMT_ENVMAP = 'voxels'} # the engine cube off (reflections "normal")
 }
 $Variants = @($Variants | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
@@ -29,7 +27,7 @@ foreach ($r in 1..$Rounds) {
 foreach ($t in $Tests) {
     $test = $testDefs[$t]
     foreach ($v in $Variants) {
-        foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI_SCREEN', 'CRYMT_GI', 'CRYMT_GI_GEOMCACHE', 'CRYMT_ENVCUBE', 'CRYMT_ENVMAP') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+        foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI', 'CRYMT_ENVCUBE', 'CRYMT_ENVMAP') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
         foreach ($kv in $variantDefs[$v].GetEnumerator()) { Set-Item "Env:$($kv.Key)" $kv.Value }
         $log = "$g\Game\Levels\$($test.Level)\$($test.Log)"
         $before = if (Test-Path $log) { (Get-Content $log).Count } else { 0 }
@@ -54,4 +52,4 @@ foreach ($t in $Tests) {
     }
 }
 }
-foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI_SCREEN', 'CRYMT_GI', 'CRYMT_GI_GEOMCACHE', 'CRYMT_ENVCUBE', 'CRYMT_ENVMAP') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
+foreach ($name in 'CRYMT_GI_GEOMETRY', 'CRYMT_GI', 'CRYMT_ENVCUBE', 'CRYMT_ENVMAP') { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }

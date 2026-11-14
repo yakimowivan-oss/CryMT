@@ -9,7 +9,6 @@ struct GiControl
 {
     std::atomic<bool> active{false};
     std::atomic<bool> enabled{true}, panel{true}, fastTime{false};
-    std::atomic<int> parts{-1};         // 0 both GI parts, 1 the voxel cones only; -1 as CRYMT_GI_SCREEN says
     std::atomic<bool> weapon{true};     // GI on the first-person view (weapon, hands, held objects)
     std::atomic<int> view{0}; // voxel debug view: 0 off, 1 wire, 2 solid
     std::atomic<int> geometry{-1}; // voxel geometry: 0 off, 1 on, 2 with foliage as partly open
