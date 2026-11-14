@@ -8711,6 +8711,30 @@ void DumpThreadStack(FILE* f, DWORD tid, const char* name)
     CloseHandle(h);
 }
 
+// Whether the main thread is waiting in a window message loop (its instruction in win32u.dll: GetMessage, a modal
+// dialog): the Sandbox Editor draws no frames while nothing changes, which is no hang (a friend's editor report of
+// 2026-11-15 had crymt_hang.txt full of such "stalls", main in MFC's message loop).
+bool MainWaitsForMessages()
+{
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, g_mainThread);
+    if (!t)
+        return false;
+    bool waits = false;
+    if (SuspendThread(t) != static_cast<DWORD>(-1))
+    {
+        CONTEXT c{};
+        c.ContextFlags = CONTEXT_CONTROL;
+        const bool got = GetThreadContext(t, &c) != 0;
+        ResumeThread(t);
+        HMODULE at = nullptr;
+        if (got && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                      reinterpret_cast<LPCWSTR>(c.Rip), &at))
+            waits = at == GetModuleHandleW(L"win32u.dll");
+    }
+    CloseHandle(t);
+    return waits;
+}
+
 DWORD WINAPI WatchdogMain(void*)
 {
     uint64_t last = 0;
@@ -8725,6 +8749,11 @@ DWORD WINAPI WatchdogMain(void*)
         last = now;
         if (still < 10 || dumped)
             continue;
+        if (g_editor && MainWaitsForMessages())
+        {
+            still = 0; // the editor idling in its message loop: no frames, no hang
+            continue;
+        }
         dumped = true;
         FILE* f = nullptr;
         if (fopen_s(&f, g_hangPath.c_str(), "a") != 0 || !f)
