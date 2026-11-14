@@ -276,20 +276,9 @@ int g_devSiteCount;
 uint64_t g_devCallsAsync;
 DWORD g_rtTid;
 
-// Physics turn. Particles ray-cast CryPhysics from the flush (CREParticle::vf2 -> CParticleContainer::SetVertices ->
-// 3D FUN_30074040 -> RayWorldIntersection, caller slot 1), and main's game update (CEntitySystem::Update inside
-// CCryAction::PreUpdate) uses physics too; CryPhysics' spin locks deadlocked with both at once (both threads spinning:
-// 2026-11-11 with the early release, 2026-11-12 in the user's play once the queued HUD let main run alongside the
-// flush). Main holds the turn through CEntitySystem::Update (EntityUpdateHook) and lets it go whenever it waits for
-// the render thread; the render thread takes it shared around each particle element (CREParticle vtable 0x38262D68
-// slot 2), before the particle code takes its engine lock, so both take the turn first. The render thread waits at
-// most kPhysicsTurnWaitMs, and not again in that flush after such a wait.
-// CRYMT_PHYSTURN=0 off.
-constexpr uintptr_t kParticleReVtable = 0x38262D68;
-constexpr uintptr_t kParticleRePrepare = 0x38127BF0; // slot 2
-constexpr DWORD kPhysicsTurnWaitMs = 20;
-SRWLOCK g_physicsTurn = SRWLOCK_INIT;
-bool g_physicsTurnOn = false; // CRYMT_PHYSTURN=1 (experiment; the particle rays below replace it)
+// The physics turn (CRYMT_PHYSTURN: main's entity update and the render thread's particles taking turns at CryPhysics)
+// was removed 2026-11-15: the level start stalled 24 s or hung; the particle rays below replaced it. Kept at git tag
+// experiments-2026-11-15.
 
 // Particles' object collisions from the render thread. CryPhysics has two caller slots (static blocks at 0x353DD510,
 // 0x313B8 each, a lock at +0x313B4); the 3D engine's particle ray (FUN_30074040) passes slot 1 explicitly, the slot
@@ -312,24 +301,6 @@ bool ParticleRayHook(uint64_t a, float* hit, const float* from, const float* to,
     }
     return reinterpret_cast<Fn>(kParticleRayFn)(a, hit, from, to, length, flags);
 }
-bool g_mainHoldsPhysicsTurn;
-uint64_t g_physicsTurnWaits, g_physicsTurnTimeouts, g_physicsTurnWaitTicks;
-
-bool DropPhysicsTurn()
-{
-    if (!g_mainHoldsPhysicsTurn || GetCurrentThreadId() != g_mainThread)
-        return false;
-    g_mainHoldsPhysicsTurn = false;
-    ReleaseSRWLockExclusive(&g_physicsTurn);
-    return true;
-}
-
-void RetakePhysicsTurn()
-{
-    AcquireSRWLockExclusive(&g_physicsTurn);
-    g_mainHoldsPhysicsTurn = true;
-}
-
 // The flush calls back into Cry3DEngine (water reflections, FUN_300eefe0) only from the preprocess
 // stage, FUN_380a6d20 called at 0x380AA61F. Main may run ahead once that call has returned.
 int g_rtDepth;
@@ -912,24 +883,10 @@ std::atomic<uint64_t> g_saveWrites, g_saveWriteFailures, g_saveWriteTicks, g_sav
 bool g_saveWriterOn;
 uint64_t g_texUpdatesQueued, g_texUpdateChecks, g_texUpdateMismatch; // DownLoadToVideoMemory with an existing id
 uint64_t g_occlusionReadsQueued; // CREOcclusionQuery::mfReadResult_Try
-// Shadow caster recording (CRYMT_SHADOWREC, fill mode). Shadow prep (PrepareDepthMap, vf207) calls every caster's
-// Render on the render thread, which runs 3D engine and game code there while main is held. Instead main renders
-// each caster of each shadow frustum at dispatch, while the render thread is idle, with the SRendParams vf207 builds;
-// the renderer calls this makes are recorded rather than queued, and vf207's caster call (CasterRenderHook) replays
-// the caster's recording in the shadow pass it set up.
-struct CasterRecording
-{
-    uintptr_t caster, frustum; // frustum: main's original (the flush draws copies, see FlushLightsBegin)
-    uint32_t first, count;     // commands in g_recCommands
-    float distance;
-};
-bool g_shadowRec;
+// Shadow caster recording (CRYMT_SHADOWREC: main rendered every shadow caster at dispatch, the render thread replayed
+// the recordings) was removed 2026-11-15: slower than the callbacks it saved (720p 130 vs 155 FPS), wrong fog
+// contribution indices. Kept at git tag experiments-2026-11-15.
 void PrintCasterCensus(FILE* f); // CRYMT_CASTERCENSUS
-bool g_recordingNow; // BeginCommand appends to g_recCommands, PublishCommand does nothing
-std::vector<CasterRecording> g_recordings;
-std::vector<Command> g_recCommands;
-std::unordered_map<uint64_t, uint32_t> g_recIndex; // (caster, frustum) -> g_recordings index
-uint64_t g_recCasters, g_recReplays, g_recFallbacks, g_recParamMismatch;
 // Terrain mesh ownership (CRYMT_TERRAINOWN, fill mode). A terrain sector update that would edit the mesh the render
 // thread may still draw recreates it instead (TerrainReuseHook). Main creates meshes without a sync (the global mesh
 // list is guarded by g_meshListCs in the constructor and destructor hooks) and edits the meshes it created in this
@@ -1477,9 +1434,6 @@ void WriteStats()
         fprintf(f, "scaleform draws queued=%llu (%.1f KB a frame) fallbacks=%llu, ClearBuffer queued=%llu\n", static_cast<unsigned long long>(g_sfQueued),
                 g_sfBytes / 1024.0 / frames, static_cast<unsigned long long>(g_sfFallbacks), static_cast<unsigned long long>(g_sfClears));
         fprintf(f, "particle object rays trimmed on the render thread: %.2f/frame\n", g_particleRaysTrimmed / frames);
-        fprintf(f, "physics turn %s: particle waits %.3f/frame (%.3f ms/frame), past %u ms %llu\n", g_physicsTurnOn ? "on" : "off",
-                g_physicsTurnWaits / frames, g_physicsTurnWaitTicks * g_qpcToMs / frames, static_cast<unsigned>(kPhysicsTurnWaitMs),
-                static_cast<unsigned long long>(g_physicsTurnTimeouts));
         fprintf(f, "fill mesh SetIndices queued=%llu SetChunk queued=%llu, resource AddRef/Release queued=%llu (releases %llu)\n",
                 static_cast<unsigned long long>(g_meshIndicesQueued), static_cast<unsigned long long>(g_meshChunksQueued),
                 static_cast<unsigned long long>(g_resourceAddRefsQueued), static_cast<unsigned long long>(g_resourceReleasesQueued));
@@ -1490,10 +1444,6 @@ void WriteStats()
         fprintf(f, "texture updates queued=%llu checked=%llu mismatches=%llu, occlusion reads queued=%llu\n",
                 static_cast<unsigned long long>(g_texUpdatesQueued), static_cast<unsigned long long>(g_texUpdateChecks),
                 static_cast<unsigned long long>(g_texUpdateMismatch), static_cast<unsigned long long>(g_occlusionReadsQueued));
-        if (g_shadowRec)
-            fprintf(f, "shadow recording: casters recorded=%llu replays=%llu fallbacks=%llu parameter mismatches=%llu\n",
-                    static_cast<unsigned long long>(g_recCasters), static_cast<unsigned long long>(g_recReplays),
-                    static_cast<unsigned long long>(g_recFallbacks), static_cast<unsigned long long>(g_recParamMismatch));
         fprintf(f, "level-loading profiler sections skipped off the loading thread=%llu\n", static_cast<unsigned long long>(g_loadSectionsSkipped));
         if (g_terrainOwn)
             fprintf(f, "terrain ownership: rebuilds=%llu surfaces=%llu meshes created on main=%llu direct calls=%llu handoffs=%llu pooled REs used=%llu pool empty=%llu\n",
@@ -2349,14 +2299,12 @@ uint8_t* EmitFillThunk(uint8_t* c, uint64_t original, int method)
 }
 
 void InstallMeshListHooks();
-void InstallShadowRecording();
 
 void InstallFillHooks()
 {
     if (!LoadRendererClasses())
         return;
     InstallMeshListHooks();
-    InstallShadowRecording();
     constexpr size_t kThunkMax = 160; // EmitFillThunk writes 136 bytes
     auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, g_rendererMethods * kThunkMax, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!mem)
@@ -3714,15 +3662,12 @@ void WaitIdle(int reason)
     const uint64_t target = g_write.load(std::memory_order_relaxed);
     const int64_t start = Now();
     const bool lockDropped = ReleaseEngineLockForWait();
-    const bool turnDropped = DropPhysicsTurn(); // the flush's particles may be waiting for it
     for (uint32_t spin = 0; g_read.load(std::memory_order_acquire) != target; spin++)
     {
         _mm_pause();
         if ((spin & 0xFFF) == 0xFFF)
             PumpSentMessages();
     }
-    if (turnDropped) // the turn before the engine lock, the order the render thread takes them in
-        RetakePhysicsTurn();
     if (lockDropped)
         RetakeEngineLock();
     g_pendingMeshCount = 0; // the render thread has run every queued mesh edit
@@ -3733,8 +3678,7 @@ void WaitIdle(int reason)
     g_invalidReason = 1000 + reason;
     g_async = false;
     RunDeferredFrees();
-    if (!g_recordingNow) // recorded commands keep their arena data until the flush replays them
-        g_arenaUsed = 0;
+    g_arenaUsed = 0;
     g_dynPtr = nullptr;
     g_mainWaitTicks += waited;
     if (reason >= 0)
@@ -3762,17 +3706,6 @@ namespace
 {
 Command& BeginCommand(uint32_t slot)
 {
-    if (g_recordingNow)
-    {
-        Command& c = g_recCommands.emplace_back();
-        c.kind = Kind::Call;
-        c.slot = slot;
-        c.mxcsr = _mm_getcsr();
-        c.count = 0;
-        c.target = g_orig[slot];
-        c.payload = nullptr;
-        return c;
-    }
     if (!g_async)
     {
         RefreshShadows();
@@ -3783,11 +3716,8 @@ Command& BeginCommand(uint32_t slot)
     {
         g_ringFullWaits++;
         const bool lockDropped = ReleaseEngineLockForWait();
-        const bool turnDropped = DropPhysicsTurn();
         while (w - g_read.load(std::memory_order_acquire) >= kRingSize)
             _mm_pause();
-        if (turnDropped)
-            RetakePhysicsTurn();
         if (lockDropped)
             RetakeEngineLock();
     }
@@ -3803,8 +3733,6 @@ Command& BeginCommand(uint32_t slot)
 
 void PublishCommand()
 {
-    if (g_recordingNow)
-        return;
     g_write.store(g_write.load(std::memory_order_relaxed) + 1, std::memory_order_release);
     g_commands++;
     if (g_rtSleeping.load(std::memory_order_seq_cst))
@@ -5429,88 +5357,6 @@ void PrintCasterCensus(FILE* f)
     }
 }
 
-// At dispatch, render thread idle: record every shadow caster's Render for every frustum the flush will prepare
-// (CRYMT_SHADOWREC; see CasterRecording). Main stands in the fill window at the shadow pass's recursion level.
-void RecordShadowCasters(uint8_t* renderer)
-{
-    g_recordings.clear();
-    g_recCommands.clear();
-    g_recIndex.clear();
-    if (!g_shadowRec || *reinterpret_cast<const int*>(kShadowPrepGlobal) == 0)
-        return;
-    const uint8_t* list = renderer + kRdLevelLights + 16;
-    auto** lights = *reinterpret_cast<uint8_t** const*>(list);
-    const int count = *reinterpret_cast<const int*>(list + 8);
-    void* sys = *reinterpret_cast<void* const*>(kRenderSystemGlobal);
-    if (!lights || !sys)
-        return;
-    using MatrixFn = const float*(__fastcall*)(void*);
-    const float* cam = reinterpret_cast<MatrixFn>((*static_cast<void***>(sys))[0x280 / 8])(sys);
-    const float eye[3] = {cam[3], cam[7], cam[11]};
-    const int savedLevel = g_shadowLevel;
-    const bool savedWindow = g_fillWindow;
-    g_shadowLevel = savedLevel + 1; // PrepareDepthMap's EF_StartEf
-    g_fillWindow = true;
-    g_recordingNow = true;
-    for (int i = 0; i < count; i++)
-    {
-        uint8_t* light = lights[i];
-        if (!light)
-            continue;
-        const uint32_t flags = *reinterpret_cast<const uint32_t*>(light + kLightFlags);
-        if (!(flags & 0x10) || (*reinterpret_cast<const int*>(kShadowStaticGlobal) != 0 && (flags & 2)))
-            continue;
-        auto** frustums = *reinterpret_cast<uint8_t** const*>(light + kLightFrustums);
-        for (int k = 0; frustums && k < 8 && frustums[k]; k++)
-        {
-            uint8_t* frustum = frustums[k];
-            const uint8_t* casters = *reinterpret_cast<const uint8_t* const*>(frustum + kFrustumCasters);
-            if (!casters)
-                continue;
-            auto** data = *reinterpret_cast<uint8_t** const*>(casters);
-            const int n = *reinterpret_cast<const int*>(casters + 8);
-            for (int c = 0; c < n && data; c++)
-            {
-                uint8_t* caster = data[c];
-                if (!caster)
-                    continue;
-                float box[6] = {};
-                using BoxFn = void(__fastcall*)(void*, float*);
-                reinterpret_cast<BoxFn>((*reinterpret_cast<void***>(caster))[2])(caster, box);
-                float d2 = 0;
-                for (int j = 0; j < 3; j++)
-                    if (eye[j] < box[j])
-                        d2 += (box[j] - eye[j]) * (box[j] - eye[j]);
-                    else if (eye[j] > box[3 + j])
-                        d2 += (eye[j] - box[3 + j]) * (eye[j] - box[3 + j]);
-                alignas(16) uint8_t rp[200] = {};
-                const float one = 1.0f;
-                const int technique = 4, renderList = 2, afterWater = 1;
-                const int objFlags = 0xF | ((*reinterpret_cast<const uint32_t*>(caster + 0xC) & 0x200) ? 0x200 : 0);
-                const float distance = sqrtf(d2);
-                memcpy(rp + 0x1C, &technique, 4);
-                memcpy(rp + 0x38, &one, 4);
-                memcpy(rp + 0x3C, &renderList, 4);
-                memcpy(rp + 0x50, &distance, 4);
-                memcpy(rp + 0x54, &objFlags, 4);
-                memcpy(rp + 0x78, &caster, 8);
-                memcpy(rp + 0x80, &one, 4);
-                rp[0xA0] = static_cast<uint8_t>(afterWater);
-                const uint32_t first = static_cast<uint32_t>(g_recCommands.size());
-                using RenderFn = void(__fastcall*)(void*, void*);
-                reinterpret_cast<RenderFn>((*reinterpret_cast<void***>(caster))[1])(caster, rp);
-                g_recIndex[RecKey(reinterpret_cast<uintptr_t>(caster), reinterpret_cast<uintptr_t>(frustum))] = static_cast<uint32_t>(g_recordings.size());
-                g_recordings.push_back({reinterpret_cast<uintptr_t>(caster), reinterpret_cast<uintptr_t>(frustum), first,
-                                        static_cast<uint32_t>(g_recCommands.size() - first), distance});
-                g_recCasters++;
-            }
-        }
-    }
-    g_recordingNow = false;
-    g_fillWindow = savedWindow;
-    g_shadowLevel = savedLevel;
-}
-
 // Load overlay (CRYMT_OVERLAY=1; Ctrl+F11 toggles): frame time, work and waits of main and the render thread, CPU use
 // of the busiest game threads and of every logical core, refreshed twice a second, drawn with Draw2dLabel.
 struct OverlayThread
@@ -5904,8 +5750,6 @@ void* __fastcall HookEndEf3D(void* self, void* a, void* b, void* c)
             RunPendingGc();
             TrackEngineLocks();
         }
-        if (g_fillOn)
-            RecordShadowCasters(static_cast<uint8_t*>(self)); // before the pose capture: casters add characters
         CasterCensus(static_cast<uint8_t*>(self));
         if (g_frame >= g_warmupFrames)
             PrepareSkinning(reinterpret_cast<uintptr_t>(self));
@@ -6467,8 +6311,8 @@ void EnvCubeUpdate()
     // (CRYMT_ENVCUBE_KEEPIDS=0: not).
     // fleet's crash, the list [f, 0, 0, 0, f]: GetShadowFrustumsList takes each item from the light's owner (+0x90, the
     // light entity) +0x2D0 (its shadow map info: the frustum pointers by cascade). Its first 8 pointers of every light
-    // entity are compared after the face (the first changes logged); CRYMT_ENVCUBE_KEEPGSM=1 puts them back.
-    static const int keepGsm = EnvCubeSetting("CRYMT_ENVCUBE_KEEPGSM", 0);
+    // entity are compared after the face (the first changes logged; putting them back, CRYMT_ENVCUBE_KEEPGSM, changed
+    // nothing and was removed 2026-11-15: tag experiments-2026-11-15).
     struct GsmSave
     {
         uint64_t* at;
@@ -6726,11 +6570,8 @@ void EnvCubeUpdate()
                 {
                     logged++;
                     FocusLog("frame %llu: engine cube face changed light entity %d's shadow frustum %d: %llx -> %llx%s", static_cast<unsigned long long>(g_frame),
-                             s.entity, k, static_cast<unsigned long long>(s.value[k]), static_cast<unsigned long long>(s.at[k]),
-                             keepGsm ? " (put back)" : "");
+                             s.entity, k, static_cast<unsigned long long>(s.value[k]), static_cast<unsigned long long>(s.at[k]), "");
                 }
-                if (keepGsm)
-                    s.at[k] = s.value[k];
             }
     // ... and every light's id (lightIdsAll above).
     for (auto it = lightIdsAll.rbegin(); it != lightIdsAll.rend(); ++it)
@@ -8005,7 +7846,6 @@ void WaitShadowPrep(int site = 0)
     if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
         return;
     const int64_t start = Now();
-    const bool turnDropped = DropPhysicsTurn(); // shadow prep may draw particles
     for (uint32_t spin = 0;; spin++)
     {
         if (g_shadowDoneSeq.load(std::memory_order_acquire) == g_frameSeq || g_read.load(std::memory_order_acquire) > g_flushCmdIndex)
@@ -8014,8 +7854,6 @@ void WaitShadowPrep(int site = 0)
         if ((spin & 0xFFF) == 0xFFF)
             PumpSentMessages();
     }
-    if (turnDropped)
-        RetakePhysicsTurn();
     g_shadowFenceWaits[site]++;
     g_shadowFenceTicks[site] += Now() - start;
 }
@@ -9161,90 +8999,6 @@ void InstallMeshListHooks()
     SetupLog(g_terrainOwn ? "terrain ownership: mesh list guarded" : "terrain ownership: mesh constructor/destructor not hooked");
 }
 
-// PrepareDepthMap's caster call (render thread): replay main's recording of this caster for this frustum, else render.
-extern "C" void __fastcall CasterRenderHook(void* caster, uint8_t* rp, uint8_t* frustum)
-{
-    if (g_shadowRec && !g_recIndex.empty() && GetCurrentThreadId() == g_rtTid)
-    {
-        static uint8_t* lastCopy;
-        static uint64_t lastSeq;
-        static uintptr_t lastOrig;
-        if (frustum != lastCopy || lastSeq != g_rtFrameSeq)
-        {
-            lastCopy = frustum;
-            lastSeq = g_rtFrameSeq;
-            lastOrig = reinterpret_cast<uintptr_t>(frustum);
-            for (const FlushCopy& c : g_flushCopies)
-                if (c.copy == frustum)
-                {
-                    lastOrig = reinterpret_cast<uintptr_t>(c.orig);
-                    break;
-                }
-        }
-        const auto it = g_recIndex.find(RecKey(reinterpret_cast<uintptr_t>(caster), lastOrig));
-        if (it != g_recIndex.end())
-        {
-            CasterRecording& r = g_recordings[it->second];
-            if (r.caster == reinterpret_cast<uintptr_t>(caster) && r.frustum == lastOrig)
-            {
-                float distance, alpha;
-                memcpy(&distance, rp + 0x50, 4);
-                memcpy(&alpha, rp + 0x38, 4);
-                if (fabsf(distance - r.distance) > 0.01f + 0.001f * r.distance || alpha != 1.0f)
-                    g_recParamMismatch++;
-                for (uint32_t k = 0; k < r.count; k++)
-                    ExecuteCommand(g_recCommands[r.first + k]);
-                g_recReplays++;
-                return;
-            }
-        }
-        g_recFallbacks++;
-    }
-    using RenderFn = void(__fastcall*)(void*, void*);
-    reinterpret_cast<RenderFn>((*static_cast<void***>(caster))[1])(caster, rp);
-}
-
-// Replaces the 17 bytes at kCasterRenderCall with "call cave" + nops; the cave passes caster (rbx), the SRendParams
-// (rsp+0x2C0 of PrepareDepthMap, +8 for the return address) and the frustum (rdi) to CasterRenderHook.
-bool PatchCasterCall()
-{
-    auto* site = reinterpret_cast<uint8_t*>(kCasterRenderCall);
-    if (memcmp(site, kCasterRenderCode, sizeof(kCasterRenderCode)) != 0)
-        return false;
-    uint8_t* cave = nullptr;
-    for (uintptr_t hint = kRenderBase + kRenderSize + 0x200000; hint < kRenderBase + 0x40000000 && !cave; hint += 0x10000)
-        cave = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
-    if (!cave)
-        return false;
-    const uint8_t thunk[] = {0x48, 0x8D, 0x94, 0x24, 0xC8, 0x02, 0x00, 0x00, // lea rdx, [rsp+0x2C8]
-                             0x48, 0x8B, 0xCB,                               // mov rcx, rbx
-                             0x4C, 0x8B, 0xC7,                               // mov r8, rdi
-                             0x48, 0xB8};                                    // movabs rax, CasterRenderHook
-    memcpy(cave, thunk, sizeof(thunk));
-    const auto hook = reinterpret_cast<uint64_t>(&CasterRenderHook);
-    memcpy(cave + sizeof(thunk), &hook, 8);
-    cave[sizeof(thunk) + 8] = 0xFF; // jmp rax
-    cave[sizeof(thunk) + 9] = 0xE0;
-    DWORD old;
-    VirtualProtect(cave, 4096, PAGE_EXECUTE_READ, &old);
-    VirtualProtect(site, sizeof(kCasterRenderCode), PAGE_EXECUTE_READWRITE, &old);
-    const int32_t rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(cave) - reinterpret_cast<intptr_t>(site + 5));
-    site[0] = 0xE8;
-    memcpy(site + 1, &rel, 4);
-    memset(site + 5, 0x90, sizeof(kCasterRenderCode) - 5);
-    VirtualProtect(site, sizeof(kCasterRenderCode), old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, sizeof(kCasterRenderCode));
-    return true;
-}
-
-void InstallShadowRecording()
-{
-    if (!GetEnvironmentVariableW(L"CRYMT_SHADOWREC", nullptr, 0))
-        return;
-    g_shadowRec = PatchCasterCall();
-    SetupLog(g_shadowRec ? "shadow casters recorded on main" : "shadow caster call differs, recording off");
-}
-
 // CTerrainNode::RenderSector's in-place update (0x300C3139): build the vertices as for a LOD change and recreate the
 // mesh, so main never edits a mesh the render thread may be drawing.
 using TerrainUpdateFn = void(__fastcall*)(uintptr_t, uintptr_t, uint64_t);
@@ -10213,98 +9967,6 @@ void Capture10Install()
     state = 2;
 }
 
-// The particles' side of the physics turn (see g_physicsTurn): shared around each particle element on the render thread.
-uintptr_t g_origParticlePrepare;
-uintptr_t g_origEntityUpdate; // main's side, EntityUpdateHook
-thread_local int t_particleTurn;
-
-void ParticlePrepareHook(void* re)
-{
-    bool got = false;
-    // After a wait past the limit the rest of that flush goes on without waiting (one stall a frame at most).
-    static uint64_t giveUpSeq = ~0ull;
-    if (g_physicsTurnOn && t_particleTurn == 0 && GetCurrentThreadId() == g_rtTid && g_origEntityUpdate && giveUpSeq != g_rtFrameSeq)
-    {
-        got = TryAcquireSRWLockShared(&g_physicsTurn);
-        if (!got)
-        {
-            g_physicsTurnWaits++;
-            const int64_t start = Now();
-            const DWORD t0 = GetTickCount();
-            for (uint32_t spin = 1; !(got = TryAcquireSRWLockShared(&g_physicsTurn)) && GetTickCount() - t0 < kPhysicsTurnWaitMs; spin++)
-            {
-                _mm_pause();
-                if ((spin & 0xFF) == 0)
-                    SwitchToThread();
-            }
-            g_physicsTurnWaitTicks += Now() - start;
-            if (!got)
-            {
-                g_physicsTurnTimeouts++;
-                giveUpSeq = g_rtFrameSeq;
-            }
-        }
-    }
-    t_particleTurn++;
-    reinterpret_cast<void (*)(void*)>(g_origParticlePrepare)(re);
-    t_particleTurn--;
-    if (got)
-        ReleaseSRWLockShared(&g_physicsTurn);
-}
-
-void InstallPhysicsTurn()
-{
-    if (!g_physicsTurnOn || g_mode != 2)
-        return;
-    const auto* vtable = reinterpret_cast<const uintptr_t*>(kParticleReVtable);
-    // Fill mode wraps the renderer classes' methods first (g_methodOrig keeps the originals): then the hook goes on top
-    // of that thunk.
-    bool known = vtable[2] == kParticleRePrepare;
-    for (int i = 0; i < g_rendererMethods && !known && vtable[2] - kRenderBase >= kRenderSize; i++)
-        known = g_methodOrig[i] == kParticleRePrepare;
-    if (!known)
-    {
-        g_physicsTurnOn = false;
-        SetupLog("physics turn: CREParticle vtable differs, off");
-        return;
-    }
-    PatchVtableSlot(kParticleReVtable, 2, &g_origParticlePrepare, reinterpret_cast<const void*>(&ParticlePrepareHook));
-    SetupLog("physics turn: particle elements on the render thread wait for main's game update");
-}
-
-// Main's side: the turn only through CEntitySystem::Update (vtable RVA 0xB6878 slot 2, 0x1E0A0; the module may be
-// relocated), where main stood in the deadlock. Holding it through all of PreUpdate stalled the flush: level loading
-// and its frames run inside PreUpdate, with waits for the render thread the turn did not know (first frame 24 s).
-constexpr uintptr_t kEntitySystemVtableRva = 0xB6878;
-constexpr uintptr_t kEntitySystemUpdateRva = 0x1E0A0;
-
-void EntityUpdateHook(void* self, uint64_t a, uint64_t b, uint64_t c)
-{
-    using Fn = void (*)(void*, uint64_t, uint64_t, uint64_t);
-    if (!g_physicsTurnOn || g_mainHoldsPhysicsTurn || GetCurrentThreadId() != g_mainThread)
-        return reinterpret_cast<Fn>(g_origEntityUpdate)(self, a, b, c);
-    RetakePhysicsTurn();
-    reinterpret_cast<Fn>(g_origEntityUpdate)(self, a, b, c);
-    DropPhysicsTurn();
-}
-
-void InstallEntityTurn()
-{
-    static bool tried;
-    if (tried || !g_physicsTurnOn || !g_origParticlePrepare)
-        return;
-    tried = true;
-    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(L"CryEntitySystem.dll"));
-    if (!base || reinterpret_cast<const uintptr_t*>(base + kEntitySystemVtableRva)[2] != base + kEntitySystemUpdateRva)
-    {
-        g_physicsTurnOn = false;
-        SetupLog("physics turn: CEntitySystem vtable differs, off");
-        return;
-    }
-    PatchVtableSlot(base + kEntitySystemVtableRva, 2, &g_origEntityUpdate, reinterpret_cast<const void*>(&EntityUpdateHook));
-    SetupLog("physics turn: main holds it through the entity update");
-}
-
 void InstallParticleRays()
 {
     static bool tried;
@@ -10322,7 +9984,6 @@ void InstallParticleRays()
 bool PreUpdateTurn(void* framework, bool engineFocus, unsigned int flags)
 {
     InstallParticleRays();
-    InstallEntityTurn();
     return g_origPreUpdate(framework, engineFocus, flags);
 }
 
@@ -11288,7 +10949,6 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
             InstallDlssHooks();
         else if (g_passNames && !InstallGpuProf())
             SetupLog("pass names: render list hook not installed");
-        InstallPhysicsTurn();
         zpass::Install();
         if (g_gpuProf)
         {
@@ -11383,7 +11043,6 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
         if (GetEnvironmentVariableW(L"CRYMT_LEVEL", level, 8))
             g_level = _wtoi(level);
         g_sfQueue = !(GetEnvironmentVariableW(L"CRYMT_SFQUEUE", level, 8) && wcscmp(level, L"0") == 0);
-        g_physicsTurnOn = GetEnvironmentVariableW(L"CRYMT_PHYSTURN", level, 8) && wcscmp(level, L"0") != 0;
         g_particleObjectRays = GetEnvironmentVariableW(L"CRYMT_PARTICLERAYS", level, 8) && wcscmp(level, L"0") != 0;
         SetPolicies();
         if (g_mode == 2 && !GetEnvironmentVariableW(L"CRYMT_NODEFERFREE", level, 8))
