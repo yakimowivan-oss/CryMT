@@ -14,6 +14,8 @@ struct GiControl
     std::atomic<int> view{0}; // voxel debug view: 0 off, 1 wire, 2 solid
     std::atomic<int> geometry{-1}; // voxel geometry: 0 off, 1 on, 2 with foliage as partly open
     std::atomic<int> gtao{-1};     // GTAO in place of the engine's SSAO 1, the SSAO 0
+    std::atomic<int> gtaoHistory{-1}; // GTAO's own history weight, the panel's index: 0 off, 1 0.5, 2 0.7, 3 0.9; -1 as
+                                      // CRYMT_GI_GTAOHISTORY says
     std::atomic<int> contact{-1};  // contact shadows: 0 off, 1 the old 12 steps, 2 Bend's screen-space shadows
     std::atomic<int> sssReach{-1}; // the screen-space shadows' reach (metres); -1 as CRYMT_SSS_REACH says
     std::atomic<int> sssWeapon{-1}; // their thickness on the weapon and hands, the panel's list index; -1 as CRYMT_SSS_WEAPONTHICK

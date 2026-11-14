@@ -3086,8 +3086,10 @@ void gtaoBlur(uint3 id : SV_DispatchThreadID)
         if (prevClip.w > 0 && all(prevUv >= 0) && all(prevUv <= 1))
         {
             float2 prev = historyTex.SampleLevel(pointClamp, prevUv, 0).xy;
+            // the weight: visAreas[kProbeOptions].w (CRYMT_GI_GTAOHISTORY / the AO page's "Накопление GTAO"; was 0.9)
+            const float w = visAreas[kProbeOptions].w > 0 ? visAreas[kProbeOptions].w : 0.9;
             if (abs(prev.y - prevClip.w) < 0.04 * prevClip.w + 0.05)
-                result = lerp(current, clamp(prev.x, current - 1.5 * sigma - 0.03, current + 1.5 * sigma + 0.03), 0.9);
+                result = lerp(current, clamp(prev.x, current - 1.5 * sigma - 0.03, current + 1.5 * sigma + 0.03), w);
         }
     }
     outTex[id.xy] = float4(result, zc, 0, 0);
@@ -3128,14 +3130,18 @@ void gtaoApply(uint3 id : SV_DispatchThreadID)
     // (the ambient floor). Grass (the mask 0.6): times CRYMT_GI_GRASSGI and no GTAO - the engine's SSAO stays on it (its
     // blend with the terrain's colour takes only that; with GTAO in its place and the leaves' 1.5 it came out flat and too
     // bright, the user). motionParams.z for this pass: the leaves' factor + 4 x floor(the grass's x 100).
+    // + 4096 x floor(the leaves' bounce factor x 100): the leaves' bounce light apart from their occlusion
+    // (CRYMT_GI_FOLIAGEBOUNCE; the user, 2026-11-14: bounce +50% overall, -50% on the leaves).
     float mask = historyTex.Load(int3(id.xy, 0)).x;
     if (mask > 0.5)
     {
-        float packed = floor(motionParams.z / 4);
-        float k = mask < 0.8 ? packed / 100 : motionParams.z - packed * 4;
+        float b100 = floor(motionParams.z / 4096);
+        float rest = motionParams.z - b100 * 4096;
+        float packed = floor(rest / 4);
+        float k = mask < 0.8 ? packed / 100 : rest - packed * 4;
         if (mask < 0.8)
             ao = 0;
-        g.rgb *= k;
+        g.rgb *= mask < 0.8 ? k : b100 / 100;
         share = min(share * k, max(share, 0.9));
     }
     outTex[id.xy] = float4(g.rgb * (1 - ao), 1 - (1 - share) * (1 - ao) + 2 * flags);
@@ -7711,9 +7717,10 @@ public:
         bool lampTest = false;             // CRYMT_GI_LAMPTEST=1: also on cells the screen coloured (to see it in the voxel view)
         int mipOpacity = 4;                // CRYMT_GI_MIPOPACITY: coarse cells' opacity, 0 the mean, 1/2/3 by rays through, 4 per axis (downsample)
         float ambientFloor = 0.1f;         // CRYMT_GI_FLOOR: the share of the flat ambient full occlusion keeps (Strengthen)
-        float outdoorStrength = 0.45f;     // CRYMT_GI_OUTDOOR: the occlusion strength outdoors (Num4 / Num7 set the indoor one);
+        float outdoorStrength = 0.7f;      // CRYMT_GI_OUTDOOR: the occlusion strength outdoors (Num4 / Num7 set the indoor one);
                                            // 1.0 before 2026-11-14 (with the voxels' occlusion 1.2 the cones darkened open
-                                           // yards x0.15-0.2 against no GI; the indoor strength keeps the rooms dark)
+                                           // yards x0.15-0.2 against no GI; the indoor strength keeps the rooms dark), then
+                                           // 0.45 (forest lighter than no GI), 0.7 the user's pick (forest 44.7, no GI 49.9)
         bool foliageSmooth = false;        // CRYMT_GI_FOLIAGESMOOTH=1: grass and leaves take the GI texels around by place
                                            // (upsample). Off: the "flicker" it was made for was the test camera's drift
                                            // after the teleport (2026-11-14; a still view: GI 1.27 = no GI 1.3)
@@ -7734,9 +7741,10 @@ public:
         bool probeVisibility = true;       // CRYMT_GI_PROBEVIS=0: no visibility test (measures the light it keeps out)
         bool probePrecise = false;         // CRYMT_GI_PROBEPRECISE=1: the probes' rays as before the speed-ups (2026-11-14,
                                            // 3.2 ms for two cascades against 1.17; the panel's "Probe rays", to compare)
-        float probeStrength = 1.0f;        // CRYMT_GI_PROBESTRENGTH: their bounce light's factor (the cones' is voxelStrength
-                                           // 1.5: coarse mips lose light; the probes' thin rays see the cells' full light,
-                                           // and at 1.5 the loop through the screen's colour lit closed rooms by itself)
+        float probeStrength = 1.5f;        // CRYMT_GI_PROBESTRENGTH: their bounce light's factor (the cones' is voxelStrength
+                                           // 1.5: coarse mips lose light; the probes' thin rays see the cells' full light).
+                                           // 1.0 until 2026-11-14 (at 1.5 the loop through the screen's colour once lit
+                                           // closed rooms by itself, before the probes' fixes); 1.5: the user's +50%
         float gtaoRadius = 0.5f;          // CRYMT_GI_GTAORADIUS, metres
         bool contactShadows = true;        // CRYMT_CONTACTSHADOWS=0: no screen-space contact shadows in the sun's shadow mask
         float contactLength = 0.35f;       // CRYMT_CONTACTLENGTH: the march's length at 10 m (metres; scales with distance)
@@ -7770,6 +7778,9 @@ public:
         bool gtaoFull = false;             // CRYMT_GI_GTAOFULL=1: GTAO at full size (island 5120x1440: 3.5 ms against 1.2)
         bool gtaoNoFoliage = false;        // CRYMT_GI_GTAOFOLIAGE=0: grass and leaves (the foliage mask) occlude nothing in GTAO
                                            // (the user: plants looked worse without their occlusion)
+        float foliageBounce = 0.5f;        // CRYMT_GI_FOLIAGEBOUNCE: the bounce light on leaves times this (their occlusion
+                                           // keeps CRYMT_GI_FOLIAGEGI); 0.5 with the bounce +50% overall = half of before
+                                           // (the user, 2026-11-14)
         float grassGi = 1.0f;              // CRYMT_GI_GRASSGI: the same for grass (marked apart by the z-prepass), which keeps
                                            // the engine's SSAO in place of GTAO (2026-11-10, the user: grass flat, too bright)
         float foliageGi = 1.5f;            // CRYMT_GI_FOLIAGEGI: the GI's occlusion and bounce on grass and leaves (the foliage
@@ -7785,6 +7796,9 @@ public:
                                            // shadow (the user: there it was too strong; in sunlight fine): 0.2 there
         bool gtaoHistory = false;          // CRYMT_GI_GTAOHISTORY=1: its own history (0.9, reprojected): it swam on camera
                                            // turns; without, the slice turns move per frame and DLAA accumulates them
+        float gtaoHistoryWeight = 0.9f;    // ... the history's weight: CRYMT_GI_GTAOHISTORY=<under 1> or the AO page's
+                                           // "Накопление GTAO" (the user, 2026-11-14: GTAO noisy on small objects and
+                                           // leaves while moving; 0.9 swam)
     };
     static const GiSettings& GiBase() // the ini / environment values
     {
@@ -7893,8 +7907,14 @@ public:
             read(L"CRYMT_GI_TERRAINAONEAR", v.terrainAoNear);
             v.gtaoFull = GetEnvironmentVariableW(L"CRYMT_GI_GTAOFULL", text, 32) && wcscmp(text, L"0") != 0;
             v.gtaoHistory = GetEnvironmentVariableW(L"CRYMT_GI_GTAOHISTORY", text, 32) && wcscmp(text, L"0") != 0;
+            if (v.gtaoHistory)
+            {
+                const float w = static_cast<float>(_wtof(text));
+                v.gtaoHistoryWeight = w > 0.0f && w < 1.0f ? w : 0.9f; // "1": the old 0.9
+            }
             v.gtaoNoFoliage = GetEnvironmentVariableW(L"CRYMT_GI_GTAOFOLIAGE", text, 32) && wcscmp(text, L"0") == 0;
             read(L"CRYMT_GI_FOLIAGEGI", v.foliageGi);
+            read(L"CRYMT_GI_FOLIAGEBOUNCE", v.foliageBounce);
             read(L"CRYMT_GI_GRASSGI", v.grassGi);
             v.particlesGi = !(GetEnvironmentVariableW(L"CRYMT_GI_PARTICLES", text, 32) && wcscmp(text, L"0") == 0);
             read(L"CRYMT_GI_PARTICLECELL", v.particleCell);
@@ -7985,6 +8005,13 @@ public:
         g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 2) : b.dirLight;
         g.probes = g_giControl.probes >= 0 ? std::min(g_giControl.probes.load(), 2) : b.probes;
         g.probePrecise = g_giControl.probePrecise >= 0 ? g_giControl.probePrecise > 0 : b.probePrecise;
+        if (g_giControl.gtaoHistory >= 0) // the AO page's "Накопление GTAO": off, 0.5, 0.7, 0.9
+        {
+            static constexpr float kWeights[4] = {0.0f, 0.5f, 0.7f, 0.9f};
+            const int i = std::min(g_giControl.gtaoHistory.load(), 3);
+            g.gtaoHistory = i > 0;
+            g.gtaoHistoryWeight = i > 0 ? kWeights[i] : b.gtaoHistoryWeight;
+        }
         if (g_giControl.particles < 0)
             g_giControl.particles = b.particlesGi ? 1 : 0;
         g.particlesGi = g_giControl.particles > 0;
@@ -9993,6 +10020,7 @@ public:
             f[(kVisFloat4s - 1) * 4] = Gi().probePrecise ? 1.0f : 0.0f; // [161].x: the probes' precise rays
             f[(kVisFloat4s - 1) * 4 + 1] = Gi().canopyStrength;        // [161].y: the occlusion strength under cover outdoors
             f[(kVisFloat4s - 1) * 4 + 2] = Gi().foliageSmooth ? 1.0f : 0.0f; // [161].z: grass and leaves take the GI around (upsample)
+            f[(kVisFloat4s - 1) * 4 + 3] = Gi().gtaoHistoryWeight;          // [161].w: GTAO's history weight (gtaoBlur)
         }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
         D3D12_GPU_DESCRIPTOR_HANDLE gpu;
@@ -10384,7 +10412,8 @@ public:
                 m_list->SetPipelineState(m_aoApplyPso);
                 m_list->SetComputeRootDescriptorTable(1, {gpu.ptr + (aoTables + 12) * g.srvInc});
                 // motionParams.z for this pass: the leaves' factor (< 4) + 4 x floor(the grass's x 100)
-                const float foliageGi = std::min(s.foliageGi, 3.99f) + 4.0f * std::floor(std::max(s.grassGi, 0.0f) * 100.0f + 0.5f);
+                const float foliageGi = std::min(s.foliageGi, 3.99f) + 4.0f * std::floor(std::min(std::max(s.grassGi, 0.0f), 10.0f) * 100.0f + 0.5f) +
+                                        4096.0f * std::floor(std::min(std::max(s.foliageBounce, 0.0f), 3.0f) * 100.0f + 0.5f);
                 m_list->SetComputeRoot32BitConstants(0, 1, &foliageGi, 34);
                 m_list->Dispatch((m_giFullW + 7) / 8, (m_giFullH + 7) / 8, 1);
                 m_barriers.push_back(Transition(m_aoRaw, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
@@ -12008,6 +12037,13 @@ public:
     static constexpr int kSssReaches[6] = {100, 200, 500, 1000, 2000, 4000};
     static constexpr float kSssWeaponThick[5] = {0.005f, 0.02f, 0.05f, 0.1f, 0.2f}; // the panel's list for the weapon and hands
     static constexpr int kGiNears[4] = {30, 40, 50, 62}; // the panel's "GI at full strength up to" (metres; 62: the field's top)
+    // The AO page's "Накопление GTAO" index for the ini / environment value: 0 off, 1 0.5, 2 0.7, 3 0.9 (the nearest).
+    static int GtaoHistoryIndex(const GiSettings& s)
+    {
+        if (!s.gtaoHistory)
+            return 0;
+        return s.gtaoHistoryWeight < 0.6f ? 1 : s.gtaoHistoryWeight < 0.8f ? 2 : 3;
+    }
     static int GiNearIndex(float metres)
     {
         int best = 0;
@@ -12048,6 +12084,7 @@ public:
         static const char* const onOff[] = {"ВЫКЛ|OFF", "ВКЛ|ON"};
         static const char* const parts[] = {"ЭКРАН+ВОКСЕЛИ|SCREEN+VOXELS", "ВОКСЕЛИ|VOXELS"};
         static const char* const ao[] = {"SSAO ИГРЫ|GAME'S SSAO", "GTAO"};
+        static const char* const gtaoAcc[] = {"ВЫКЛ|OFF", "0.5", "0.7", "0.9"};
         static const char* const contact[] = {"ВЫКЛ|OFF", "СТАРЫЕ, 12 ШАГОВ|OLD, 12 STEPS", "SSS (BEND)"};
         static const char* const sssReach[] = {"100 М|100 M", "200 М|200 M", "500 М|500 M", "1000 М|1000 M", "2000 М|2000 M", "4000 М|4000 M"};
         static const char* const sssWeapon[] = {"КАК МИР|AS THE WORLD", "+2%", "+5%", "+10%", "+20%"}; // a second window, the darker
@@ -12096,6 +12133,11 @@ public:
             {1, "Затенение|Ambient occlusion", 0, 1, 1, true, ao, 0, nullptr,
              [] { const int v = g_giControl.gtao; return v < 0 ? (GiBase().replaceSsao ? 1 : 0) : v; },
              [] { return GiBase().replaceSsao ? 1 : 0; }, [](int v) { g_giControl.gtao = v; }, true, nullptr},
+            // GTAO's own history (the user, 2026-11-14: noisy on small objects and leaves while moving; 0.9 swam): off as
+            // before (DLAA accumulates the turning pattern), or mixed with the last frame at 0.5 / 0.7 / 0.9.
+            {1, "Накопление GTAO|GTAO accumulation", 0, 3, 1, false, gtaoAcc, 0, nullptr,
+             [] { const int v = g_giControl.gtaoHistory; return v >= 0 ? std::min(v, 3) : GtaoHistoryIndex(GiBase()); },
+             [] { return GtaoHistoryIndex(GiBase()); }, [](int v) { g_giControl.gtaoHistory = v; }, true, nullptr},
             {1, "Контактные тени|Contact shadows", 0, 2, 1, true, contact, 0, nullptr,
              [] { const int v = g_giControl.contact; return v < 0 ? BaseContact() : v; },
              [] { return BaseContact(); }, [](int v) { g_giControl.contact = v; }, true, nullptr},
