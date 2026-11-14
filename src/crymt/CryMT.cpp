@@ -9533,6 +9533,43 @@ void RunTestCommands()
         FocusLog("frame %llu: water sky %.2f", static_cast<unsigned long long>(g_frame), g_giControl.waterSky.load());
         return;
     }
+    // crymt_gictl <name> <value> (tests that switch the GI's parts within one run, as the panel does): gi 0/1, gtao 0/1,
+    // contact 0/1/2, probes 0/1/2, geometry 0/1/2, env 0/1, envall 0/1, dirlight 0/1/2, occlusion / bounce (factors).
+    if (_strnicmp(command, "crymt_gictl ", 12) == 0)
+    {
+        char name[32] = {};
+        float value = 0;
+        if (sscanf_s(command + 12, "%31s %f", name, static_cast<unsigned>(sizeof(name)), &value) == 2)
+        {
+            const int v = static_cast<int>(value);
+            bool known = true;
+            if (_stricmp(name, "gi") == 0)
+                g_giControl.enabled = v != 0;
+            else if (_stricmp(name, "gtao") == 0)
+                g_giControl.gtao = v;
+            else if (_stricmp(name, "contact") == 0)
+                g_giControl.contact = v;
+            else if (_stricmp(name, "probes") == 0)
+                g_giControl.probes = v;
+            else if (_stricmp(name, "geometry") == 0)
+                g_giControl.geometry = v;
+            else if (_stricmp(name, "env") == 0)
+                g_giControl.env = v;
+            else if (_stricmp(name, "envall") == 0)
+                g_giControl.envAll = v != 0;
+            else if (_stricmp(name, "dirlight") == 0)
+                g_giControl.dirLight = v;
+            else if (_stricmp(name, "occlusion") == 0)
+                g_giControl.occlusionScale = value;
+            else if (_stricmp(name, "bounce") == 0)
+                g_giControl.bounceScale = value;
+            else
+                known = false;
+            g_giControl.active = true;
+            FocusLog("frame %llu: crymt_gictl %s %.3f%s", static_cast<unsigned long long>(g_frame), name, value, known ? "" : " (unknown name)");
+        }
+        return;
+    }
     if (_strnicmp(command, "crymt_envcubeclouds ", 20) == 0) // clouds in the engine cube 1 / 0
     {
         g_giControl.envCubeClouds = atoi(command + 20) != 0 ? 1 : 0;

@@ -26,6 +26,11 @@ foreach ($v in $Variants) {
         $k++
         Copy-Item $n.FullName "D:\Games\Crysis-RE\logs\spot\${Tag}_${v}_c$k.ppm" -Force
     }
+    # the capture's extra dumps of the first frame that has them (contact shadows, foliage mask, GI)
+    foreach ($pat in @('*_sss.pgm', '*_foliage.pgm', '*_gi_rgb.ppm', '*_gi_occ.ppm', '*_shadowmask.pgm')) {
+        $x = $new | Where-Object { $_.Name -like $pat } | Sort-Object Name | Select-Object -First 1
+        if ($x) { Copy-Item $x.FullName ("D:\Games\Crysis-RE\logs\spot\${Tag}_${v}_" + ($pat -replace '^\*_', '')) -Force }
+    }
     $new | Remove-Item -Force -ErrorAction SilentlyContinue
     "$v done: $k frames"
 }

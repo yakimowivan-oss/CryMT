@@ -103,6 +103,30 @@ $defs = [ordered]@{
     # A lamp going out every 5th frame (2026-11-14): the engine cube off / its own frame id; the light log on.
     lamp_cube = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_LIGHTLOG = '1'}}
     lamp_nocube = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE = '0'; CRYMT_ENVMAP = 'voxels'; CRYMT_LIGHTLOG = '1'}}
+    # The occlusion strength under cover outdoors (CRYMT_GI_CANOPY, 2026-11-14: the forest at 0.45 came out lighter than
+    # with no GI), with the probes' light (the Full preset's high GI).
+    can0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'}}
+    can0_eq = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_OCCSTRENGTH = '0.45'}} # the cover rays out (both strengths alike)
+    can0_nosss = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_CONTACTSHADOWS = '0'}}
+    can0_nogtao = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_SSAO = '1'}}
+    can0_novox = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_VOXELS = '0'}}
+    can0_gtao0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_GTAO = '0'}}
+    can0_vox0gtao0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_GTAO = '0'; CRYMT_GI_VOXELS = '0'}}
+    can0_envgame = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_ENVMAP = 'game'; CRYMT_ENVCUBE = '0'}}
+    can0_envvox = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_ENVMAP = 'voxels'; CRYMT_ENVCUBE = '0'}}
+    # GI off on grass and leaves (the foliage mask): the user's test, 2026-11-14
+    can0_nosmooth = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_FOLIAGESMOOTH = '0'}}
+    can0_sss95 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_SSS_TEMPORAL = '0.95'}}
+    can0_fixed = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_FIXEDNOISE = '1'}}
+    can0_fixednosss = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_FIXEDNOISE = '1'; CRYMT_CONTACTSHADOWS = '0'}}
+    can0_leafvox0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_FOLIAGE = '0'}} # leaves not in the voxels
+    can0_fol0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_FOLIAGEGI = '0'; CRYMT_GI_GRASSGI = '0'}}
+    can0_sss0 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_SSS_TEMPORAL = '0'}}
+    can0_near = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_NEAREST = '1'}}
+    can0_cones = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '0'; CRYMT_GI_CANOPY = '0'}}
+    can07 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0.7'}}
+    can10 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '1.0'}}
+    can14 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '1.4'}}
     cube_down = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE_DOWN = '1'}}
     lamp_k3 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE_KEEPVIS = '3'; CRYMT_LIGHTLOG = '1'}}
     lamp_k15 = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_ENVCUBE_KEEPVIS = '15'; CRYMT_LIGHTLOG = '1'}}
