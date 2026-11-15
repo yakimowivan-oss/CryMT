@@ -1110,6 +1110,82 @@ std::string Crlf(const std::string& s)
 // metre; y its reach, m; w 4242, the mark): without the mark (no CryMT back end, the editor's other viewports, a pass the
 // volume was not made for) the engine's fog exactly, whatever the engine left bound there (2026-11-15: the editor). The
 // pixel shader is renamed so no cached build of the old one (ShaderCache.pak) is used.
+const char* const kPom = R"(// CryMT: parallax occlusion mapping for the terrain's detail layers and decals, in place of shadeLib's
+// ParallaxOcclusionMap (15 fixed steps; a step of view.xy / view.z that ran away at grazing views: the smear on steep
+// ground, the user 2026-11-15). Steps by the angle (8 looking down, 32 at a grazing view), the relief faded out below
+// ~8 degrees to the surface (gone at 2; fading from 17 flattened the ruts), the start dithered by a hash of the texture position (the DLAA jitter moves it each frame: the
+// layers' steps become noise the temporal AA averages, as DTAAPOM), a second linear search in fifths inside the step
+// where the ray went under (as CRPM's contact refinement), then the crossing between its two ends. The GI texture's
+// top-left texel's green 1: shadeLib's own (crymt_gictl pomold, the A/B).
+#if D3D10
+bool CryMT_POMOld()
+{
+  return tex2Dlod(CryMT_GISampler, float4(0, 0, 0, 0)).g > 0.5;
+}
+#else
+bool CryMT_POMOld()
+{
+  return false;
+}
+#endif
+
+float2 CryMT_POM(float2 baseTC, float lod, float3 viewDir, float displacement)
+{
+  float3 v = normalize(viewDir);
+  float vz = max(-v.z, 1e-3);
+  float scale = displacement * saturate((vz - 0.035) / 0.105); // gone below ~2 degrees, full from ~8
+  if (scale <= 0)
+    return baseTC;
+  float steps = floor(lerp(32, 8, saturate(vz)));
+  float stepH = 1.0 / steps;
+  float2 delta = v.xy * scale / (vz * steps);
+  float jitter = frac(sin(dot(baseTC, float2(12.9898, 78.233))) * 43758.5453);
+  float2 uv0 = baseTC + delta * jitter;
+  float h0 = 1 - stepH * jitter;
+  float d0 = tex2Dlod(bumpHeightMapSampler, float4(uv0, 0, lod)).w;
+  if (d0 >= h0)
+    return uv0;
+  float2 uv1 = uv0;
+  float h1 = h0, d1 = d0;
+  [loop] for (int i = 0; i < 32; i++)
+  {
+    if (i >= steps)
+      break;
+    uv1 = uv0 + delta;
+    h1 = h0 - stepH;
+    d1 = tex2Dlod(bumpHeightMapSampler, float4(uv1, 0, lod)).w;
+    if (d1 >= h1)
+      break;
+    uv0 = uv1;
+    h0 = h1;
+    d0 = d1;
+  }
+  if (d1 < h1)
+    return uv1;
+  float2 subUV = (uv1 - uv0) * 0.2;
+  float subH = (h0 - h1) * 0.2;
+  [loop] for (int k = 0; k < 4; k++)
+  {
+    float2 uvm = uv0 + subUV;
+    float hm = h0 - subH;
+    float dm = tex2Dlod(bumpHeightMapSampler, float4(uvm, 0, lod)).w;
+    if (dm >= hm)
+    {
+      uv1 = uvm;
+      h1 = hm;
+      d1 = dm;
+      break;
+    }
+    uv0 = uvm;
+    h0 = hm;
+    d0 = dm;
+  }
+  float a = h0 - d0, b = d1 - h1;
+  return lerp(uv0, uv1, saturate(a / max(a + b, 1e-5)));
+}
+
+)";
+
 const char* const kVFogDecl = R"(// CryMT: the GI in the fog (see CryMT_VFog)
 #if D3D10
 sampler3D CryMT_VFogSampler = sampler_state
@@ -1437,6 +1513,11 @@ std::wstring InstallGi()
                     // the engine composes its own (shaded by the light reaching the surface, times the gloss map and the
                     // specular colour), Schlick's fresnel; Metal stronger (it defines CRYMT_ENV_STRENGTH).
                     Replace(frag, "  // do custom pass setup\n  frag_custom_begin(pPass);", kEnvAll) &&
+                    // The terrain's and decals' parallax occlusion mapping (kPom).
+                    Replace(frag, "half4 frag_shared_output(inout fragPass pPass)\n{", std::string(kPom) + "half4 frag_shared_output(inout fragPass pPass)\n{") &&
+                    Replace(frag, "   \tfloat2 offsetBest = ParallaxOcclusionMap(bumpTC.xy, lodBump, viewDir, 15, dispAmount);\n",
+                            "   \tfloat2 offsetBest = CryMT_POMOld() ? ParallaxOcclusionMap(bumpTC.xy, lodBump, viewDir, 15, dispAmount)\n"
+                            "                                       : CryMT_POM(bumpTC.xy, lodBump, viewDir, dispAmount); // CryMT\n") &&
                     Replace(metal, "void frag_custom_begin(inout fragPass pPass)\n{\n",
                             "void frag_custom_begin(inout fragPass pPass)\n{\n  // CryMT: Metal's environment reflection at 1.0 (fragLib's is 0.35; no preprocessor: CryFX failed on it)\n"
                             "  if (pPass.nReflectionMapping == 3)\n    pPass.cEnvironment *= 2.85;\n") &&

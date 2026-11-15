@@ -10,7 +10,7 @@ cbuffer GiConstants : register(b0)
                                                                  // 2026-11-15); the motion, GTAO and exposure passes' own
     float maxDistance; float frame; float debug; float options; // options: 1 fixed sample pattern, 2 nearest depth of the 2x2 block, 4 far probes (CRYMT_GI_FARPROBES),
                                                                  // 8 narrow normals, 16 the first-person view takes the camera's GI (upsample t2),
-                                                                 // 32 unused, 64 opacity per axis,
+                                                                 // 32 the game's POM (CRYMT_POM_OLD), 64 opacity per axis,
                                                                  // 128 the roof texture (CRYMT_GI_ROOFCELLS), 256 thin features
                                                                  // take their surroundings' GI (CRYMT_GI_THIN, on); upsample:
                                                                  // 512 the GI replaces the engine's SSAO (GTAO), 1024 GTAO's
@@ -1294,7 +1294,7 @@ void upsample(uint3 id : SV_DispatchThreadID)
     {
         // 32: the particles' GI (options 2^21); 64 x half TerrainAO's distance (options >> 16, 5 bits): a / 2 < 2048.
         uint control = mask | ((((uint)options >> 21) & 1u) << 5) | ((((uint)options >> 16) & 31u) << 6);
-        outTex[id.xy] = float4(0, 0, 0, 2.0 * control);
+        outTex[id.xy] = float4(0, ((uint)options & 32) ? 1 : 0, 0, 2.0 * control); // green: shadeLib's POM (fragLib's A/B)
         return;
     }
     if (d < kWeaponDepth)

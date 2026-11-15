@@ -15,11 +15,13 @@ $all = @{
     y1 = @(2389, 2345, 236, -1, -1); y2 = @(2388, 2319, 236, -2, -2); y3 = @(2387, 2306, 236, -2, -2)
     y4 = @(2387, 2293, 236, -2, -2); y5 = @(2386, 2283, 236, -2, 2)
     m1 = @(2401, 2274, 236, 0, -159); stair = @(1248, 1548, 107.2, -3, -32)
+    # the user's POM ground on mine (2026-11-15): standing and lying down
+    pom1 = @(2337, 2296, 238, -42, -138); pom2 = @(2337, 2296, 237, -21, -129); pom3 = @(2337, 2296, 238, -21, -129)
 }
 $vars = @()
 foreach ($v in $Variants) { $p = $v -split '=', 2; $vars += , @($p[0], $p[1]) }
 $order = @()
-$c = "crymt_waitlevel;crymt_wait 2;#g_localActor:EnablePhysics(false);crymt_wait 1;crymt_capture 1;crymt_wait 1" # warm-up capture (no dumps)
+$c = "crymt_waitlevel;r_MotionBlur 0;crymt_wait 2;#g_localActor:EnablePhysics(false);crymt_wait 1;crymt_capture 1;crymt_wait 1" # no motion blur in captures; a warm-up capture (no dumps)
 foreach ($name in $Spots) {
     $s = $all[$name]
     if (-not $s) { "unknown spot $name"; return }

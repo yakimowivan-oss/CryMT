@@ -9071,6 +9071,8 @@ void RunTestCommands()
                 g_giControl.skyOcc = v;
             else if (_stricmp(name, "cellaxes") == 0) // the cones' surface test by the cell read 1 / 0
                 g_giControl.cellAxes = v;
+            else if (_stricmp(name, "pomold") == 0) // the game's parallax occlusion mapping 1 / CryMT's 0
+                g_giControl.pomOld = v;
             else
                 known = false;
             g_giControl.active = true;
