@@ -68,6 +68,12 @@
                                            // turning were 93-98% surfaces the cube cannot see (backs, hidden parts), and
                                            // inside the light change on turning grew (> 48/255: 14% of cells vs 1.4%)
         float lampLight = 1.0f;            // CRYMT_GI_LAMPS: the lamps' light on the geometry's cells (0 none)
+        bool cellAxes = false;             // CRYMT_GI_CELLAXES=1: a cone's own surface test by the cell read, not the cone's width
+                                           // (mine yard 2026-11-15: occlusion -0.01..-0.04, light up to x2: mixed, off)
+        bool farProbes = true;             // CRYMT_GI_FARPROBES=0: the cones' occlusion everywhere (with the probes past 32 m:
+                                           // their occlusion, no cones traced there)
+        bool skyOcclusion = false;         // CRYMT_GI_SKYOCC=1: the cones' occlusion from their part above the horizon only (the
+                                           // engine's ambient is the sky; the ground below is bounce, not lost sky)
         bool probeFast = true;             // CRYMT_GI_PROBEFAST=0: GI v2's probes at their fixed pace (no faster response to a
                                            // change beyond their rays' noise: kGiShader "probes")
         bool lampTest = false;             // CRYMT_GI_LAMPTEST=1: also on cells the screen coloured (to see it in the voxel view)
@@ -213,6 +219,9 @@
             v.cubeInject = GetEnvironmentVariableW(L"CRYMT_GI_CUBEINJECT", text, 32) && wcscmp(text, L"0") != 0;
             read(L"CRYMT_GI_LAMPS", v.lampLight);
             v.probeFast = !(GetEnvironmentVariableW(L"CRYMT_GI_PROBEFAST", text, 32) && wcscmp(text, L"0") == 0);
+            v.skyOcclusion = GetEnvironmentVariableW(L"CRYMT_GI_SKYOCC", text, 32) && wcscmp(text, L"0") != 0;
+            v.cellAxes = GetEnvironmentVariableW(L"CRYMT_GI_CELLAXES", text, 32) && wcscmp(text, L"0") != 0;
+            v.farProbes = !(GetEnvironmentVariableW(L"CRYMT_GI_FARPROBES", text, 32) && wcscmp(text, L"0") == 0);
             v.lampTest = GetEnvironmentVariableW(L"CRYMT_GI_LAMPTEST", text, 32) && wcscmp(text, L"0") != 0;
             if (GetEnvironmentVariableW(L"CRYMT_GI_MIPOPACITY", text, 32))
                 v.mipOpacity = _wtoi(text);
@@ -356,6 +365,10 @@
         g.terrainAoNear = g_giControl.giNear >= 0 && g_giControl.giNear < 4 ? static_cast<float>(kGiNears[g_giControl.giNear]) : b.terrainAoNear;
         g.dirLight = g_giControl.dirLight >= 0 ? std::min(g_giControl.dirLight.load(), 2) : b.dirLight;
         g.probes = g_giControl.probes >= 0 ? std::min(g_giControl.probes.load(), 2) : b.probes;
+        g.probeFast = g_giControl.probeFast >= 0 ? g_giControl.probeFast != 0 : b.probeFast;
+        g.farProbes = g_giControl.farProbes >= 0 ? g_giControl.farProbes != 0 : b.farProbes;
+        g.skyOcclusion = g_giControl.skyOcc >= 0 ? g_giControl.skyOcc != 0 : b.skyOcclusion;
+        g.cellAxes = g_giControl.cellAxes >= 0 ? g_giControl.cellAxes != 0 : b.cellAxes;
         if (g_giControl.gtaoHistory >= 0) // the AO page's "Накопление GTAO": off, 0.5, 0.7, 0.9
         {
             static constexpr float kWeights[4] = {0.0f, 0.5f, 0.7f, 0.9f};

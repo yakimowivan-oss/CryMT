@@ -20,7 +20,7 @@ const INTERNAL = /^CRYMT_(CAPTURE_|.*CENSUS|.*VERIFY|.*TRACE|.*DUMP$|.*LOG$|PSOL
 const HIDDEN = new Set([
     'ASYNCPSO', 'ASYNCSAVE', 'BUFFERS', 'COMPILEFENCE', 'D3DWRAP', 'DLSS_AUTOEXPOSURE', 'DLSS_CLAMP',
     'DLSS_EXPOSURE', 'DLSS_EXPOSUREKEY', 'DLSS_EXPOSURESCALE', 'DLSS_JITTER', 'DLSS_MVSCALE',
-    'FENCE', 'FENCEAT', 'FRUSTUMTEST', 'GI_CONELIFT', 'SSR_PREV', 'SSR_PARTICLES', 'GI_PROBEFAST', 'GI_FLASHLIGHT', 'GI_CONESTART', 'GI_DISTANCE', 'GI_VOXELS',
+    'FENCE', 'FENCEAT', 'FRUSTUMTEST', 'GI_CONELIFT', 'SSR_PREV', 'SSR_PARTICLES', 'GI_PROBEFAST', 'GI_FLASHLIGHT', 'GI_SKYOCC', 'GI_CELLAXES', 'GI_FARPROBES', 'PAK_RESTORE', 'PAK_RESTORED', 'GI_CONESTART', 'GI_DISTANCE', 'GI_VOXELS',
     'GI_FIXEDNOISE', 'GI_FLOOR', 'GI_FOLIAGE', 'GI_LAMPS', 'GI_MATERIALS', 'GI_MIPOPACITY', 'GI_NARROWNORMALS',
     'GI_NEAREST', 'GI_NEAROCC', 'GI_OCCRANGE', 'GI_OCCSTRENGTH', 'GI_PARTICLECELL', 'GI_ROOFCELLS', 'GI_SCALE', 'GI_CUBEGEOM', 'GI_CUBEINJECT', 'GI_SUNMARCH', 'GI_ROOMLIGHT', 'GI_DIRLIGHT', 'ENVCUBE_DOWNMOVE', 'ENVCUBE_PLAYER', 'ENVCUBE_NEARHIDDEN', 'ENVCUBE_CLOUDS', 'GI_PROBES', 'GI_PROBESTRENGTH', 'VFOG', 'VFOG_GI', 'VFOG_OUT', 'VFOG_SUN', 'VFOG_HAZE', 'VFOG_HAZEREACH', 'VFOG_SAMPLES', 'GI_PROBEVIS', 'GI_PROBEPRECISE',
     // 2026-11-14: guards and A/B switches of the cube, fleet and editor fixes; experiments kept off
@@ -38,7 +38,8 @@ const FROM_MODE = new Set(['CRYMT_MODE', 'CRYMT_LEVEL', 'CRYMT_FILL', 'CRYMT_TER
                            'CRYMT_GI', 'CRYMT_BORDERLESS', 'CRYMT_PAUSEONFOCUS']);
 
 const src = path.join(repo, 'src', 'crymt');
-const files = ['CryMT.cpp', 'D3D12Backend.cpp', 'D3DLayer.cpp', 'Dlss.cpp', 'ZPass.cpp', 'Window.cpp', 'RenderDocCapture.cpp', 'MemoryFix.cpp'].map(f => fs.readFileSync(path.join(src, f), 'utf8'));
+const files = ['CryMT.cpp', 'D3D12Backend.cpp', 'D3DLayer.cpp', 'Dlss.cpp', 'ZPass.cpp', 'Window.cpp', 'RenderDocCapture.cpp', 'MemoryFix.cpp'].concat(fs.readdirSync(path.join(src, 'd3d12')).filter(f => f.endsWith('.inc')).map(f => path.join('d3d12', f))).concat(['proxy/DbgHelpProxy.cpp'])
+    .map(f => fs.readFileSync(path.join(src, f), 'utf8')); // the back end's pieces (d3d12/*.inc since 2026-11-15), the loader
 const code = new Set();
 files.forEach(t => (t.match(/"CRYMT_[A-Z0-9_]+"/g) || []).forEach(m => code.add(m.slice(1, -1))));
 const launcher = new Map(); // key -> option

@@ -116,6 +116,10 @@ $defs = [ordered]@{
     probeslow = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_PROBEFAST = '0'}} # ... at their fixed pace (before 2026-11-15)
     probefast_gpu = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_PROBEFAST = '1'; CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}} # ... with GPU time per pass
     probeslow_gpu = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_PROBEFAST = '0'; CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
+    skyocc = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_SKYOCC = '1'}} # the cones' occlusion from the sky only (relative GI, step 1)
+    cellaxes = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CELLAXES = '1'}} # the cones' surface test by the cell read (default since 2026-11-15)
+    farprobes = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_FARPROBES = '1'}} # five cascades, the probes' light and occlusion past 32 m
+    farprobes_gpu = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_FARPROBES = '1'; CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}}
     vfog = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_MARKERS = '1'; CRYMT_GPUPASSES = '1'}} # can0 + GPU time per pass (CryMT VFog)
     can0_eq = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_GI_OCCSTRENGTH = '0.45'}} # the cover rays out (both strengths alike)
     can0_nosss = @{Gi = '1'; Env = @{CRYMT_GI_PROBES = '2'; CRYMT_GI_CANOPY = '0'; CRYMT_CONTACTSHADOWS = '0'}}

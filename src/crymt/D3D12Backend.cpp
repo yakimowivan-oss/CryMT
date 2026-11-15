@@ -264,7 +264,7 @@ constexpr int kVoxLevels = 4;  // cells of voxelSize (0.25 m), 2, 4 and 8 times 
 // The GI root's second table (kGiShader t3..t41): per level the grid, per-axis opacity, L1 and six directions (9), the
 // VisAreas, the roof, the probes' atlases (t41 light and states, t42 distances).
 constexpr UINT kGiVoxTable = 9 * kVoxLevels + 5; // ... t41, t42 the probes' atlases, t43 the foliage mask
-constexpr UINT kProbeCascades = 3; // GI v2's probe cascades (kGiShader's kProbeCascades: 0.5, 1 and 2 m apart)
+constexpr UINT kProbeCascades = 5; // GI v2's probe cascades (kGiShader's kProbeCascades: 0.5 .. 8 m apart)
 constexpr UINT kVoxTable = 23; // descriptors per table: t0..t2, u0..u19 (u6/u7 the light direction, u8..u19 the six
                                // directions: CRYMT_GI_DIRLIGHT)
 const char* const kVoxShader =

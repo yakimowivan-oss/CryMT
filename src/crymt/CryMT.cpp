@@ -9063,6 +9063,14 @@ void RunTestCommands()
                 g_giControl.vfogHaze = static_cast<int>(value * 100.0f + 0.5f);
             else if (_stricmp(name, "vfogsamples") == 0) // ... the sun's shadow samples per cell (1, 4, 8)
                 g_giControl.vfogSamples = v;
+            else if (_stricmp(name, "probefast") == 0) // GI v2's probes: the faster response (MSME) 1 / 0
+                g_giControl.probeFast = v;
+            else if (_stricmp(name, "farprobes") == 0) // ... the probes' occlusion past 32 m, no cones there 1 / 0
+                g_giControl.farProbes = v;
+            else if (_stricmp(name, "skyocc") == 0) // the cones' occlusion from the sky only 1 / 0
+                g_giControl.skyOcc = v;
+            else if (_stricmp(name, "cellaxes") == 0) // the cones' surface test by the cell read 1 / 0
+                g_giControl.cellAxes = v;
             else
                 known = false;
             g_giControl.active = true;

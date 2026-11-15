@@ -8,7 +8,7 @@ cbuffer GiConstants : register(b0)
     float2 depthParams; // proj._33, proj._43 (right-handed): distance = _43 / (d + _33)
     float radius; float bounce; float occlusion; float temporal; // radius..occlusion: 0 in trace (its screen part's, removed
                                                                  // 2026-11-15); the motion, GTAO and exposure passes' own
-    float maxDistance; float frame; float debug; float options; // options: 1 fixed sample pattern, 2 nearest depth of the 2x2 block, 4 unused,
+    float maxDistance; float frame; float debug; float options; // options: 1 fixed sample pattern, 2 nearest depth of the 2x2 block, 4 far probes (CRYMT_GI_FARPROBES),
                                                                  // 8 narrow normals, 16 the first-person view takes the camera's GI (upsample t2),
                                                                  // 32 unused, 64 opacity per axis,
                                                                  // 128 the roof texture (CRYMT_GI_ROOFCELLS), 256 thin features
@@ -322,7 +322,12 @@ float4 ConeTrace(float3 O, float3 dir, float halfTan, float start, float reach, 
         // Opacity per axis (CRYMT_GI_MIPOPACITY=4): a wall stops what crosses it. From a surface (Ps, Ns) the axis along
         // its normal counts only once the sample is clear of it by half its size: a coarse cell around a cone from the
         // ground holds the ground, opaque across, which darkened open ground; the far wall or the ceiling count fully.
-        float3 axes = surface ? lerp(1, saturate(2 * dot(X - Ps, Ns) / diameter - 1), Ns * Ns) : 1;
+        // The test takes the cell actually read (vs * 2^(level + mip)) when it is wider than the cone (visAreas[kProbeOptions]
+        // .z, CRYMT_GI_CELLAXES): past level 0's 16 m a cone from 0.5 m off its surface reads 1-4 m cells that hold that
+        // surface, and the cone's own width (0.6 m there) let them count: the cones' occlusion took 90% of the ambient at
+        // 32-75 m with almost no light back (mine yard, 2026-11-15).
+        const float footprint = visAreas[kProbeOptions].z > 0.5 ? max(diameter, vs * exp2(level + mip)) : diameter;
+        float3 axes = surface ? lerp(1, saturate(2 * dot(X - Ps, Ns) / footprint - 1), Ns * Ns) : 1;
         if (((uint)options & 64) != 0)
             v.a = dot(dir * dir * axes, SampleDir(level, X, mip));
         if (edge < 1)
@@ -591,8 +596,9 @@ static const int3 kProbeN = int3(32, 32, 16);
 // A far one, 2 m (+-32 m), was tried and dropped (2026-11-14): +0.4 ms, and under eaves its probes 2 m apart against
 // roofs a third of that thick leaked light down at mid range; past 16 m the cones go on, their light matched to the
 // probes' at the grid's edge (probeMatch).
-static const int kProbeCascades = 3; // 0.5, 1 and 2 m apart: +-8, +-16, +-32 m (the third back 2026-11-15: the dip past
-                                     // the probes at 15-22 m on mine's walk test, x0.47 of no GI)
+static const int kProbeCascades = 5; // 0.5, 1, 2, 4 and 8 m apart: +-8, 16, 32, 64, 128 m. The light is the probes' to the
+                                     // GI's end (2026-11-15: past 16 / 32 m the cones' light, matched to the probes by one
+                                     // ratio per frame, was too dark or too bright by view - mine yard x0.76 .. x1.20)
 float CascadeSpacing(int c) { return 0.5 * (1 << c); }
 static const float2 kProbeAtlas = float2(1024 * kProbeCascades, 1152);
 // Phase 2, visibility (DDGI's): per probe the mean distance to what its rays hit and its square over the sphere, a tile
@@ -771,7 +777,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const bool fast = visAreas[kProbeOptions].x > 0.5;
     const float hot = fast ? offsetHot.w : 0;
     const bool calm = hot < -7.5;
-    const uint base = c == 0 ? 3u : c == 1 ? 7u : 15u; // every 4th, 8th, 16th frame; calm probes half as often
+    const uint base = (4u << c) - 1u; // every 4th, 8th, 16th, 32nd, 64th frame; calm probes half as often
     const uint period = calm ? base * 2 + 1 : base;
     const bool due = !valid || hot > 0.5 || (((uint)slot + (uint)frame) & period) == 0;
     float4 ray = 0;
@@ -1062,21 +1068,33 @@ void trace(uint3 id : SV_DispatchThreadID)
             }
             float3 farLight = 0;
             float farOcc = 0;
-            if (probeIn < 1 || probeLightOnly)
+            // Far (options & 4, CRYMT_GI_FARPROBES): with the probes there, past 32 m their occlusion too (from 16 m on,
+            // blended) and no cones traced; the cones keep the near occlusion the probes miss (a probe hangs up to a
+            // spacing off the surface).
+            const bool farProbes = ((uint)options & 4) != 0 && probeIn >= 1 && P.z > 32;
+            if (!farProbes && (probeIn < 1 || probeLightOnly))
             {
+                // Occlusion as the engine's ambient means it: the sky taken away (visAreas[kProbeOptions].y, CRYMT_GI_SKYOCC).
+                // Each cone's occlusion counts by its share above the horizon (0.5 + its direction's z: a 30-degree cone is
+                // wholly above at z 0.5); the ground a wall's lower cones meet is no lost sky, its light still comes as
+                // bounce. Without it open walls came out x0.6 of no GI past the probes (mine walk test, 2026-11-15).
+                const bool skyOcc = visAreas[kProbeOptions].y > 0.5;
                 float4 cone = ConeTrace(O, Nw, 0.577, start, voxParams.z, false, true, Pw, Nw, noise);
+                float occWeight = skyOcc ? saturate(0.5 + Nw.z) : 1;
                 farLight = cone.rgb;
-                farOcc = cone.a;
+                farOcc = cone.a * occWeight;
                 [unroll] for (int c = 0; c < 4; c++)
                 {
                     float a = (c + noise) * 1.5707963;
                     float3 dir = normalize(Nw * 0.5 + (T * cos(a) + B * sin(a)) * 0.866);
                     cone = ConeTrace(O, dir, 0.577, start, voxParams.z, false, true, Pw, Nw, noise + c * 0.25);
+                    const float sky = skyOcc ? saturate(0.5 + dir.z) : 1;
                     farLight += cone.rgb * 0.5;
-                    farOcc += cone.a * 0.5;
+                    farOcc += cone.a * 0.5 * sky;
+                    occWeight += 0.5 * sky;
                 }
                 farLight *= voxParams.w / 3;
-                farOcc /= 3;
+                farOcc = occWeight > 0.05 ? farOcc / occWeight : 0; // facing straight down: no sky to lose
             }
             if (visAreas[0].w != 0 && probeIn < 1)
             {
@@ -1097,6 +1115,8 @@ void trace(uint3 id : SV_DispatchThreadID)
             farLight = lerp(farLight, probe.rgb * probeStrength, probeIn); // the probes' own strength (CRYMT_GI_PROBESTRENGTH)
             if (!probeLightOnly)
                 farOcc = lerp(farOcc, probe.a, probeIn);
+            else if (((uint)options & 4) != 0)
+                farOcc = lerp(farOcc, probe.a, probeIn * saturate((P.z - 16) / 16));
             // Indoors: a VisArea; else the cover above (houses without one): the roof texture half a metre off the
             // surface and, when the two strengths differ, a ray up leaned off the surface and turned per texel. The
             // VisArea is asked half a metre in front of the surface: its 0.3 m margin took a building's outer walls for

@@ -95,7 +95,8 @@
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
             f[(kVisFloat4s - 1) * 4 + 0] = Gi().probeFast ? 1.0f : 0.0f;   // [161].x: the probes' faster response (probes)
-            // [161].y..z: free (canopy, foliage smoothing removed 2026-11-15)
+            f[(kVisFloat4s - 1) * 4 + 1] = Gi().skyOcclusion ? 1.0f : 0.0f; // [161].y: the cones' occlusion from the sky only
+            f[(kVisFloat4s - 1) * 4 + 2] = Gi().cellAxes ? 1.0f : 0.0f;     // [161].z: the cones' surface test by the cell read
             f[(kVisFloat4s - 1) * 4 + 3] = Gi().gtaoHistoryWeight;          // [161].w: GTAO's history weight (gtaoBlur)
         }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;
@@ -288,7 +289,7 @@
         float c[kGiConstants] = {static_cast<float>(m_giFullW), static_cast<float>(m_giFullH), static_cast<float>(m_giW), static_cast<float>(m_giH),
                                  1.0f / m_giProj[0], 1.0f / m_giProj[5], m_giProj[10], m_giProj[14],
                                  0.0f, 0.0f, 0.0f, m_giReset ? 0.0f : s.temporal,
-                                 s.maxDistance, static_cast<float>(m_giFrame & 1023), s.debug, (s.fixedNoise ? 1.0f : 0.0f) + (s.nearest ? 2.0f : 0.0f) + (s.narrowNormals ? 8.0f : 0.0f) +
+                                 s.maxDistance, static_cast<float>(m_giFrame & 1023), s.debug, (s.fixedNoise ? 1.0f : 0.0f) + (s.nearest ? 2.0f : 0.0f) + (s.farProbes && s.probes > 0 ? 4.0f : 0.0f) + (s.narrowNormals ? 8.0f : 0.0f) +
                                  (cones && s.weaponGi && m_giCam && m_giPsoCamera ? 16.0f : 0.0f) +
                                  (s.mipOpacity >= 4 ? 64.0f : 0.0f) + (s.roofCells ? 128.0f : 0.0f) + (s.thinFix ? 256.0f : 0.0f) +
                                  (s.replaceSsao ? 512.0f : 0.0f) + static_cast<float>((s.bakedOff & 30) << 10) + (s.gtaoFull ? 32768.0f : 0.0f) + (s.gtaoHistory ? 1024.0f : 0.0f) + (s.gtaoNoFoliage ? 4194304.0f : 0.0f) +

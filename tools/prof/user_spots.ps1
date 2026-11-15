@@ -21,6 +21,9 @@ $all = @{
     # third set (mine's yard: blotches under eaves, the bands near / mid / far)
     m1 = @('mine', 2401, 2274, 236, 0, -159); m2 = @('mine', 2385, 2292, 236, -1, 2); m3 = @('mine', 2385, 2300, 236, 0, 2)
     m4 = @('mine', 2385, 2326, 236, -2, -1); m5 = @('mine', 2387, 2343, 236, 1, -5)
+    # the user's walk of 2026-11-15 (mine's yard, backing off the two-storey building: near / mid / far)
+    y1 = @('mine', 2389, 2345, 236, -1, -1); y2 = @('mine', 2388, 2319, 236, -2, -2); y3 = @('mine', 2387, 2306, 236, -2, -2)
+    y4 = @('mine', 2387, 2293, 236, -2, -2); y5 = @('mine', 2386, 2283, 236, -2, 2)
 }
 foreach ($name in $Spots) {
     $s = $all[$name]
