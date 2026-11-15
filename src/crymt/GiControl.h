@@ -32,6 +32,7 @@ struct GiControl
     std::atomic<int> vfogSamples{-1}; // ... the sun's shadow samples per cell (1, 4, 8); -1 as CRYMT_VFOG_SAMPLES
     // GI v2's probes and the cones, live for tests in one run (crymt_gictl); -1 as their CRYMT_GI_* variables say
     std::atomic<int> probeFast{-1}, farProbes{-1}, skyOcc{-1}, cellAxes{-1};
+    std::atomic<int> resetSerial{0}; // crymt_gictl: the GI's history (probes, accumulation) starts over at each change
     std::atomic<int> fixCopies{1}; // DLSS's picture into the copies of the scene made before it this frame
     std::atomic<int> dlssPreset{-1}; // the DLAA model, the panel's list index (K J L M F E); -1 as CRYMT_DLSS_PRESET
     std::atomic<int> dlssCompare{-1}; // a second DLAA model for the right half of the screen (same index), -1 off

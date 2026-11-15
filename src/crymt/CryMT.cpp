@@ -9074,6 +9074,7 @@ void RunTestCommands()
             else
                 known = false;
             g_giControl.active = true;
+            g_giControl.resetSerial++;
             FocusLog("frame %llu: crymt_gictl %s %.3f%s", static_cast<unsigned long long>(g_frame), name, value, known ? "" : " (unknown name)");
         }
         return;

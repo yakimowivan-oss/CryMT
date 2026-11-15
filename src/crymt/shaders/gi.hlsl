@@ -823,12 +823,20 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     float2 m = 0;
     float mw = 0;
     float sL = 0, sL2 = 0, sW2 = 0; // the rays' luminance: weighted sum, of squares, the weights' squares
+    // The occlusion as the sky taken away (visAreas[kProbeOptions].y, CRYMT_GI_SKYOCC): the rays above the horizon only
+    // (soft over +-7 degrees); the ground below a wall is bounce, not lost sky. The probes give the occlusion past 32 m
+    // (far probes), where their rays down to the ground made open walls x0.85 of no GI (mine yard, 2026-11-15).
+    const bool skyOccP = visAreas[kProbeOptions].y > 0.5;
+    float sA = 0, wA = 0;
     const float maxDistance = ProbeMaxDistance(sp);
     [loop] for (int r = 0; r < 64; r++)
     {
         const float w = max(dot(n, g_probeDir[r].xyz), 0);
         sum += g_probeRay[r] * w;
         weights += w;
+        const float sky = skyOccP ? saturate(g_probeDir[r].z * 4 + 0.5) : 1;
+        sA += g_probeRay[r].a * w * sky;
+        wA += w * sky;
         const float lr = dot(g_probeRay[r].rgb, float3(0.2126, 0.7152, 0.0722));
         sL += lr * w;
         sL2 += lr * lr * w;
@@ -838,7 +846,9 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
         m += float2(dist, dist * dist) * wd;
         mw += wd;
     }
-    const float4 fresh = sum / max(weights, 1e-4);
+    float4 fresh = sum / max(weights, 1e-4);
+    if (skyOccP)
+        fresh.a = wA > 0.05 ? sA / wA : 0; // facing down: no sky to lose
     const float2 freshM = mw > 1e-4 ? m / mw : oldM;
     // Hysteresis 0.95 (64 rays a fourth frame: ~1300 rays' worth; at 0.8 the probes boiled and one frame's look at the
     // stair varied by 2.5 of 255 between runs). A faster blend on big changes (0.6 when the light doubled or halved) made

@@ -313,6 +313,8 @@
         return b.contactShadows ? (b.sss ? 2 : 1) : 0;
     }
 
+    int m_giResetSerial = 0; // the last crymt_gictl change seen (GiApplyControl: the history starts over)
+
     void GiApplyControl()
     {
         static const bool fixCopiesEnv = [] { // CRYMT_DLSS_FIXCOPIES=0: off from the start (key "]")
@@ -328,6 +330,11 @@
         GiSettings& g = Gi();
         const float occlusion = g_giControl.occlusionScale, bounce = g_giControl.bounceScale;
         const bool wasOn = g.on;
+        if (g_giControl.resetSerial != m_giResetSerial)
+        {
+            m_giResetSerial = g_giControl.resetSerial;
+            m_giReset = true;
+        }
         g.on = b.on && g_giControl.enabled;
         if (g.on && !wasOn)
             m_giReset = true; // the history is from before
