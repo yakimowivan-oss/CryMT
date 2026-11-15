@@ -124,6 +124,31 @@ void LoadCryMT(HMODULE self)
         GetPrivateProfileStringW(L"CryMT", L"GI", L"0", gi, 8, ini.c_str());
     if (mode != L"mt" && gi[0] && wcscmp(gi, L"0") != 0)
         SetEnvironmentVariableW(L"CRYMT_GI", gi); // GI, D3D12 modes; needs the patched shaders
+    // GI needs CryMT's shader pak (Game\zzCryMT.pak). The launcher removes it for a run without CryMT (the editor's stock
+    // mode); a later start that does not go through the launcher (a shortcut, a .cmd, the tests) then had GI on and no GI
+    // at all (2026-11-15). It is put back here, before the engine mounts its paks (CryMTSettings.exe --gi-install, up to a
+    // minute); CryMT.dll logs it (CRYMT_PAK_RESTORED). CRYMT_PAK_RESTORE=0: not.
+    wchar_t restore[8] = {};
+    if (GetEnvironmentVariableW(L"CRYMT_GI", nullptr, 0) &&
+        !(GetEnvironmentVariableW(L"CRYMT_PAK_RESTORE", restore, 8) && wcscmp(restore, L"0") == 0) &&
+        GetFileAttributesW((root + L"Game\\zzCryMT.pak").c_str()) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((dir + L"CryMTSettings.exe").c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        std::wstring command = L"\"" + dir + L"CryMTSettings.exe\" --gi-install";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        DWORD code = ~0u;
+        if (CreateProcessW(nullptr, &command[0], nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi))
+        {
+            if (WaitForSingleObject(pi.hProcess, 60000) == WAIT_OBJECT_0)
+                GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        const bool back = GetFileAttributesW((root + L"Game\\zzCryMT.pak").c_str()) != INVALID_FILE_ATTRIBUTES;
+        SetEnvironmentVariableW(L"CRYMT_PAK_RESTORED", back ? L"1" : L"0");
+    }
     // The Full preset's quality switches (the launcher's card, 2026-11-14): [CryMT] GIQuality high = the probes' light
     // with the cones' occlusion (CRYMT_GI_PROBES=2), normal = the cones; Reflections high = the engine's live cube for
     // the water and the materials (the DLL's defaults), normal = the voxel cube. A variable already set (a test

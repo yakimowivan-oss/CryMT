@@ -10229,6 +10229,9 @@ VOID CALLBACK OnDll(ULONG reason, const LdrNotification* data, PVOID)
         wchar_t mask[16] = {};
         int fences = GetEnvironmentVariableW(L"CRYMT_FENCE", mask, 16) ? _wtoi(mask) : 0;
         g_casterCensus = GetEnvironmentVariableW(L"CRYMT_CASTERCENSUS", nullptr, 0) != 0;
+        if (GetEnvironmentVariableW(L"CRYMT_PAK_RESTORED", mask, 16))
+            SetupLog(wcscmp(mask, L"1") == 0 ? "GI: Game\\zzCryMT.pak was missing, the loader put it back (CryMTSettings.exe --gi-install)"
+                                             : "GI: Game\\zzCryMT.pak is missing and could not be put back: no GI");
         g_overlay.on = GetEnvironmentVariableW(L"CRYMT_OVERLAY", nullptr, 0) != 0; // Ctrl+F11 toggles it in game
         if (fences & 1)
             FenceVtableEntry(0x301D3840, 0x300F5450, 401); // C3DEngine::OnFrameStart
