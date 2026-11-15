@@ -94,7 +94,8 @@
                             : 0.0f;
             for (uint32_t k = 0; k < m_giVisAreaCount; k++)
                 memcpy(f + 4 + k * 40, m_giVisAreas[k], sizeof(m_giVisAreas[k]));
-            // [161].x..z: free (precise rays, canopy, foliage smoothing removed 2026-11-15)
+            f[(kVisFloat4s - 1) * 4 + 0] = Gi().probeFast ? 1.0f : 0.0f;   // [161].x: the probes' faster response (probes)
+            // [161].y..z: free (canopy, foliage smoothing removed 2026-11-15)
             f[(kVisFloat4s - 1) * 4 + 3] = Gi().gtaoHistoryWeight;          // [161].w: GTAO's history weight (gtaoBlur)
         }
         D3D12_CPU_DESCRIPTOR_HANDLE cpu;

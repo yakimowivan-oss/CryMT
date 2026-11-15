@@ -604,6 +604,7 @@ static const float kProbeDepthSharpness = 8;
 float ProbeMaxDistance(float sp) { return 1.5 * 1.7320508 * sp; }
 groupshared float4 g_probeRay[64]; // a ray's light and occlusion
 groupshared float4 g_probeDir[64]; // its direction; w its distance (clamped)
+groupshared uint g_probeHot;       // a texel of the probe changed beyond its rays' noise this update
 
 int3 ProbeOrigin(int c) { return (int3)floor(float3(toWorldX.w, toWorldY.w, toWorldZ.w) / CascadeSpacing(c)) - kProbeN / 2; }
 float3 ProbePos(int3 wc, int c) { return (wc + 0.5) * CascadeSpacing(c); }
@@ -759,11 +760,15 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const int2 st = ProbeStateTexel(slot, c), texel = ProbeTile(slot, c) + int2(tid.xy);
     const float4 state = historyTex.Load(int3(st, 0));
     const bool valid = state.w >= 1 && all(state.xyz == ProbeKey(wc)) && temporal > 0;
-    // The outer cascades every 8th frame, the near one every 4th.
-    const uint period = c == 0 ? 3u : 7u;
-    const bool due = !valid || (((uint)slot + (uint)frame) & period) == 0;
     const int2 ot = ProbeOffsetTexel(slot, c);
-    const float3 offset = valid ? historyTex.Load(int3(ot, 0)).xyz : 0;
+    const float4 offsetHot = valid ? historyTex.Load(int3(ot, 0)) : 0;
+    const float3 offset = offsetHot.xyz;
+    // The outer cascades every 8th frame, the near one every 4th; a probe whose light changed beyond its rays' noise at
+    // its last update (hot: the offset texel's w, frames left) every frame (visAreas[kProbeOptions].x, CRYMT_GI_PROBEFAST).
+    const bool fast = visAreas[kProbeOptions].x > 0.5;
+    const float hot = fast ? offsetHot.w : 0;
+    const uint period = c == 0 ? 3u : 7u;
+    const bool due = !valid || hot > 0.5 || (((uint)slot + (uint)frame) & period) == 0;
     float4 ray = 0;
     float3 dir = 0;
     float hit = 0;
@@ -779,6 +784,8 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     // probes under the beach (the ground's fill is thinner than three cells).
     g_probeRay[gi] = ray;
     g_probeDir[gi] = float4(dir, min(hit, 16));
+    if (gi == 0)
+        g_probeHot = 0;
     GroupMemoryBarrierWithGroupSync();
     const float4 old = historyTex.Load(int3(texel, 0));
     const int2 dt = ProbeDepthTile(slot, c) + int2(tid.xy); // the distances' texel, laid out as the light's
@@ -801,12 +808,17 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     float weights = 0;
     float2 m = 0;
     float mw = 0;
+    float sL = 0, sL2 = 0, sW2 = 0; // the rays' luminance: weighted sum, of squares, the weights' squares
     const float maxDistance = ProbeMaxDistance(sp);
     [loop] for (int r = 0; r < 64; r++)
     {
         const float w = max(dot(n, g_probeDir[r].xyz), 0);
         sum += g_probeRay[r] * w;
         weights += w;
+        const float lr = dot(g_probeRay[r].rgb, float3(0.2126, 0.7152, 0.0722));
+        sL += lr * w;
+        sL2 += lr * lr * w;
+        sW2 += w * w;
         const float c2 = w * w, c4 = c2 * c2, wd = c4 * c4; // cos^8 (kProbeDepthSharpness)
         const float dist = min(g_probeDir[r].w, maxDistance);
         m += float2(dist, dist * dist) * wd;
@@ -818,7 +830,17 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     // Hysteresis 0.95 (64 rays a fourth frame: ~1300 rays' worth; at 0.8 the probes boiled and one frame's look at the
     // stair varied by 2.5 of 255 between runs). A faster blend on big changes (0.6 when the light doubled or halved) made
     // dim probes jump at their updates: the noise of 64 rays crossed that line (the user: voxels light up and go out).
-    outTex[texel] = valid ? lerp(fresh, old, 0.95) : fresh;
+    // A change beyond the rays' noise (4 sigma of this texel's weighted mean, and 10% of its light) is taken faster (0.7)
+    // and keeps the probe updating every frame for 12 frames: a flashlight, a lamp switched on, a fire (the user,
+    // 2026-11-15: the shotgun's flashlight did not show with the probes). The noise alone keeps 0.95 (the fixed faster
+    // blend on big changes before made dim probes jump).
+    const float meanL = sL / max(weights, 1e-4), oldL = dot(old.rgb, float3(0.2126, 0.7152, 0.0722));
+    const float noise = sqrt(max(sL2 / max(weights, 1e-4) - meanL * meanL, 0) * sW2) / max(weights, 1e-4);
+    const bool changed = fast && valid && abs(meanL - oldL) > 4 * noise + 0.1 * max(meanL, oldL) + 0.002;
+    if (changed)
+        InterlockedOr(g_probeHot, 1u);
+    outTex[texel] = valid ? lerp(fresh, old, changed ? 0.7 : 0.95) : fresh;
+    GroupMemoryBarrierWithGroupSync();
     if (gi == 0)
     {
         // Inside geometry: most rays end within 0.35 m (in a wall); or under the ground: the rays going up nearly all
@@ -861,7 +883,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
             moved.z += upMin + 0.25 * sp;
         else if (frontMin < 0.3 * sp)
             moved -= frontDir * (0.3 * sp - frontMin);
-        outTex[ot] = float4(clamp(moved, -0.45 * sp, 0.45 * sp), 0);
+        outTex[ot] = float4(clamp(moved, -0.45 * sp, 0.45 * sp), g_probeHot != 0 ? 12 : max(hot - 1, 0));
     }
 }
 

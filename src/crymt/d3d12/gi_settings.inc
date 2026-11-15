@@ -68,6 +68,8 @@
                                            // turning were 93-98% surfaces the cube cannot see (backs, hidden parts), and
                                            // inside the light change on turning grew (> 48/255: 14% of cells vs 1.4%)
         float lampLight = 1.0f;            // CRYMT_GI_LAMPS: the lamps' light on the geometry's cells (0 none)
+        bool probeFast = true;             // CRYMT_GI_PROBEFAST=0: GI v2's probes at their fixed pace (no faster response to a
+                                           // change beyond their rays' noise: kGiShader "probes")
         bool lampTest = false;             // CRYMT_GI_LAMPTEST=1: also on cells the screen coloured (to see it in the voxel view)
         int mipOpacity = 4;                // CRYMT_GI_MIPOPACITY: coarse cells' opacity, 0 the mean, 1/2/3 by rays through, 4 per axis (downsample)
         float ambientFloor = 0.1f;         // CRYMT_GI_FLOOR: the share of the flat ambient full occlusion keeps (Strengthen)
@@ -210,6 +212,7 @@
             v.cubeGeometry = GetEnvironmentVariableW(L"CRYMT_GI_CUBEGEOM", text, 32) && wcscmp(text, L"0") != 0;
             v.cubeInject = GetEnvironmentVariableW(L"CRYMT_GI_CUBEINJECT", text, 32) && wcscmp(text, L"0") != 0;
             read(L"CRYMT_GI_LAMPS", v.lampLight);
+            v.probeFast = !(GetEnvironmentVariableW(L"CRYMT_GI_PROBEFAST", text, 32) && wcscmp(text, L"0") == 0);
             v.lampTest = GetEnvironmentVariableW(L"CRYMT_GI_LAMPTEST", text, 32) && wcscmp(text, L"0") != 0;
             if (GetEnvironmentVariableW(L"CRYMT_GI_MIPOPACITY", text, 32))
                 v.mipOpacity = _wtoi(text);

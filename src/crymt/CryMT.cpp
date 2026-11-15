@@ -410,6 +410,7 @@ uint64_t g_cubeShadowListsKept, g_cubeShadowListsLost; // EnvCubeUpdate: shadow 
 uint64_t g_particleSoundSkipped; // ParticleSoundHook: particle sound updates left to main
 uint64_t g_cubeIdsAllRestored;   // EnvCubeUpdate: light ids (+0) put back after a face beyond its EF_ADDDlight ones
 uint64_t g_renderSysEventSyncs;  // RenderSysEventHook: renderer system events on main with the render thread made idle
+uint64_t g_flashlightLamps;      // frames x projectors near the camera (the player's flashlight) given to the GI's lamps
 uint64_t g_renderSysEvents[32];  // ... all of them on main, by event (31: 31 and above)
 uint64_t g_cubeGsmChanged;       // EnvCubeUpdate: light entities' shadow frustum pointers a face changed
 const volatile uint64_t* g_nullFrustumsSkipped; // PatchNoNullFrustums: the cave's counter of null cascades left out
@@ -1083,6 +1084,8 @@ void WriteStats()
                 static_cast<unsigned long long>(g_cubeShadowListsKept), static_cast<unsigned long long>(g_cubeShadowListsLost));
         fprintf(f, "particle sound updates skipped on the render thread (left to main) %llu\n", static_cast<unsigned long long>(g_particleSoundSkipped));
         fprintf(f, "engine cube: light ids (+0) put back after a face beyond its own EF_ADDDlight's %llu\n", static_cast<unsigned long long>(g_cubeIdsAllRestored));
+        fprintf(f, "GI lamps: the player's flashlight (projectors within 1.5 m of the camera) %llu frames\n",
+                static_cast<unsigned long long>(g_flashlightLamps));
         fprintf(f, "renderer system events on main with the render thread made idle first %llu; all on main by event:",
                 static_cast<unsigned long long>(g_renderSysEventSyncs));
         for (int k = 0; k < 32; k++)
@@ -2839,7 +2842,9 @@ void DlssBeforeList(uintptr_t renderer)
         }
         // The lamps: the level's lamps (SnapshotLamps) or, without them, the frame's point lights and projectors but
         // those within 1.5 m of the camera (the flashlight, muzzle flashes: they move with the view); the 8 nearest the
-        // camera by their edge.
+        // camera by their edge. The player's flashlight (a projector within 1.5 m) is taken in either case: it is no
+        // level lamp, and only lit the voxels through the screen's colour (the user, 2026-11-15: the shotgun's flashlight
+        // showed in the GI with the voxel cones, not with the probes). CRYMT_GI_FLASHLIGHT=0: not.
         struct Lamp
         {
             float key;
@@ -2879,6 +2884,24 @@ void DlssBeforeList(uintptr_t renderer)
             const float d[3] = {o[0] - cam[3], o[1] - cam[7], o[2] - cam[11]};
             if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= 1.5f * 1.5f && LampData(lights[i], found[lampCount].data))
                 lampCount++;
+        }
+        static const bool flashlight = !(GetEnvironmentVariableW(L"CRYMT_GI_FLASHLIGHT", nullptr, 0) &&
+                                         [] {
+                                             wchar_t v[8] = {};
+                                             GetEnvironmentVariableW(L"CRYMT_GI_FLASHLIGHT", v, 8);
+                                             return wcscmp(v, L"0") == 0;
+                                         }());
+        for (int i = 0; flashlight && lights && i < count && i < 32 && lampCount < kLampSnapMax; i++)
+        {
+            const uint32_t flags = *reinterpret_cast<const uint32_t*>(lights[i] + kLightFlags);
+            const float* o = reinterpret_cast<const float*>(lights[i] + kLightOrigin);
+            const float d[3] = {o[0] - cam[3], o[1] - cam[7], o[2] - cam[11]};
+            if ((flags & kLightFlagProjector) && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1.5f * 1.5f &&
+                LampData(lights[i], found[lampCount].data))
+            {
+                lampCount++;
+                g_flashlightLamps++;
+            }
         }
         for (int i = 0; i < lampCount; i++)
         {
