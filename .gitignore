@@ -14,7 +14,8 @@
 !/src/crymt/
 /src/crymt/build/
 /src/crymt/build2/
-/src/crymt/shaders/
+/src/crymt/shaders/orig/
+/src/crymt/shaders/patched/
 !/src/launcher/
 /src/launcher/build/
 
