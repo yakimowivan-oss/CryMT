@@ -1139,6 +1139,7 @@ const ResourceInfo* g_envPlaceholder;     // Textures/CryMT/env.dds (fragLib's C
 const ResourceInfo* g_waterEnvPlaceholder; // Textures/CryMT/waterenv.dds (Water.cfx's CryMT_WaterEnvSampler), see IsWaterEnvPlaceholder
 const ResourceInfo* g_hizPlaceholder;      // Textures/CryMT/hiz.dds (Water.cfx's CryMT_HiZSampler), see IsHizPlaceholder
 const ResourceInfo* g_ssrPrevPlaceholder;  // Textures/CryMT/ssrprev.dds (Water.cfx's CryMT_WaterPrevSampler), see IsSsrPrevPlaceholder
+const ResourceInfo* g_ssrPartPlaceholder;  // Textures/CryMT/ssrpart.dds (Water.cfx's CryMT_WaterPartSampler), see IsSsrPartPlaceholder
 const ResourceInfo* g_vfogPlaceholder;     // Textures/CryMT/vfog.dds (PostProcess.cfx's CryMT_VFogSampler), see IsVfogPlaceholder
 
 // The 2D environment map from the engine's cube (Device::RunEnv2D; the first-person weapons' Metal reads its own 2D map
@@ -5014,6 +5015,7 @@ public:
     bool discards = false;
     bool writesTarget1 = false; // a pixel shader writing SV_Target1 (the patched z-prepass: the foliage mask)
     bool writesTarget2 = false; // ... SV_Target2 (the patched z-prepass: wind-bent vegetation's screen move)
+    bool particleLayer = false; // ... a one-component SV_Target2: the patched particles' layer (BindParticleLayer)
     bool plainCopy = false;     // a pixel shader that only samples one texture into its output (IsPlainCopy)
     // The engine's fog constants where the shader declares them (constant buffer slot, byte offset; -1 none): vfParams,
     // vfFogColor, slHazeColPartialMieInScatter, slHazeColPartialRayleighInScatter (RunVfog reads them in the fog pass).
@@ -5184,7 +5186,10 @@ public:
                 if (_stricmp(o.SemanticName, "SV_Target") == 0 && o.SemanticIndex == 1) // reflected with system value 0
                     writesTarget1 = true;
                 if (_stricmp(o.SemanticName, "SV_Target") == 0 && o.SemanticIndex == 2)
+                {
                     writesTarget2 = true;
+                    particleLayer = o.Mask == 0x1;
+                }
             }
         }
         // The fog's constants (fogSlot): the buffer's slot from its binding by name.
@@ -8232,6 +8237,84 @@ public:
         Bind(m_rtv[2], m_bendRtv);
     }
 
+    // The particle layer for the water's SSR (R16F, the scene's size; two, a frame each, so the water reads the last frame's
+    // while this frame's is drawn): the patched particles' SV_Target2, the nearest kept (Pso: MIN), cleared to far (65504)
+    // at the frame's first particle draw. CRYMT_SSR_PARTICLES=0: none.
+    void BindParticleLayer()
+    {
+        static const bool on = [] {
+            wchar_t v[8] = {};
+            return !(GetEnvironmentVariableW(L"CRYMT_SSR_PARTICLES", v, 8) && wcscmp(v, L"0") == 0);
+        }();
+        if (!on || !WaterSsrOn())
+            return;
+        const UINT w = m_foliageW, h = m_foliageH;
+        if (!m_partRtv[0] || w != m_partW || h != m_partH)
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                if (m_partSrv[i])
+                    m_partSrv[i]->Release();
+                if (m_partRtv[i])
+                    m_partRtv[i]->Release();
+                if (m_partTex[i])
+                    m_partTex[i]->Release();
+                m_partSrv[i] = nullptr;
+                m_partRtv[i] = nullptr;
+                m_partTex[i] = nullptr;
+                m_partFrame[i] = ~0ull;
+            }
+            D3D10_TEXTURE2D_DESC td{};
+            td.Width = w;
+            td.Height = h;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R16_FLOAT;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D10_USAGE_DEFAULT;
+            td.BindFlags = D3D10_BIND_RENDER_TARGET | D3D10_BIND_SHADER_RESOURCE;
+            for (int i = 0; i < 2; i++)
+            {
+                ID3D10Texture2D* tex = nullptr;
+                ID3D10RenderTargetView* rtv = nullptr;
+                ID3D10ShaderResourceView* srv = nullptr;
+                if (FAILED(CreateTexture2D(&td, nullptr, &tex)) || FAILED(CreateRenderTargetView(tex, nullptr, &rtv)) ||
+                    FAILED(CreateShaderResourceView(tex, nullptr, &srv)))
+                {
+                    if (rtv)
+                        rtv->Release();
+                    if (tex)
+                        tex->Release();
+                    Log("particle layer %ux%u: failed", w, h);
+                    return;
+                }
+                m_partTex[i] = tex;
+                m_partRtv[i] = static_cast<Rtv12*>(rtv);
+                m_partSrv[i] = static_cast<Srv12*>(srv);
+            }
+            m_partW = w;
+            m_partH = h;
+            Log("particle layer %ux%u (the water's SSR)", w, h);
+        }
+        const int k = static_cast<int>(m_frame & 1);
+        if (m_partFrame[k] != m_frame)
+        {
+            static const FLOAT kFar[4] = {65504.0f, 65504.0f, 65504.0f, 65504.0f};
+            ClearRenderTargetView(m_partRtv[k], kFar);
+            m_partFrame[k] = m_frame;
+        }
+        m_partDraws++;
+        m_partRtv[k]->info->outputBound++;
+        Bind(m_rtv[2], m_partRtv[k]);
+        m_omDirty = m_psoDirty = true;
+    }
+
+    // The last frame's particle layer, when it was drawn (the water's SSR).
+    Srv12* LastParticleLayer() const
+    {
+        const int k = static_cast<int>((m_frame + 1) & 1);
+        return m_frame > 0 && m_partSrv[k] && m_partFrame[k] == m_frame - 1 ? m_partSrv[k] : nullptr;
+    }
+
     // DLSS's bias towards the current colour (R16F, the scene's size): the patched water and particle pixel shaders'
     // SV_Target1, blended like the colour (Pso: red only), cleared at the frame's first such draw.
     void BindBiasMask()
@@ -8433,6 +8516,26 @@ public:
     // A^-1; the previous view is (H + c - c') R', then its projection.
     void WaterPrevFrame(const DlssSceneInfo* info, float* out)
     {
+        // The frame texture is updated at every main camera of a frame (6 at once seen on island): the frame's latest
+        // camera is kept as this frame's, and moves to the previous one only when the frame changes (2026-11-15: each
+        // later call took this frame's camera for the last one's and switched the previous frame off for the water).
+        if (m_ssrCurFrame != m_frame)
+        {
+            if (m_ssrCurFrame != ~0ull)
+            {
+                memcpy(m_ssrPrevView, m_ssrCurView, sizeof(m_ssrPrevView));
+                memcpy(m_ssrPrevProj, m_ssrCurProj, sizeof(m_ssrPrevProj));
+                memcpy(m_ssrPrevCamPos, m_ssrCurCamPos, sizeof(m_ssrPrevCamPos));
+                memcpy(m_ssrPrevShift, m_ssrCurShift, sizeof(m_ssrPrevShift));
+                m_ssrPrevCamFrame = m_ssrCurFrame;
+            }
+            m_ssrCurFrame = m_frame;
+        }
+        memcpy(m_ssrCurView, info->view, sizeof(m_ssrCurView));
+        memcpy(m_ssrCurProj, info->proj, sizeof(m_ssrCurProj));
+        memcpy(m_ssrCurCamPos, info->camPos, sizeof(m_ssrCurCamPos));
+        m_ssrCurShift[0] = info->shiftU;
+        m_ssrCurShift[1] = info->shiftV;
         const bool prevCamera = m_ssrPrevCamFrame + 1 == m_frame;
         // CRYMT_SSR_PREV=0: the current scene copy only, as before (A/B).
         static const bool allowed = [] {
@@ -8440,6 +8543,17 @@ public:
             return !(GetEnvironmentVariableW(L"CRYMT_SSR_PREV", v, 8) && wcscmp(v, L"0") == 0);
         }();
         m_ssrPrevOn = allowed && WaterSsrOn() && !m_hizFailed && m_giColor && m_giColorFrame + 1 == m_frame && prevCamera && !info->reset;
+        static uint64_t logged, loggedFrame = ~0ull;
+        if (logged < 3 && (m_frame % 600) == 599 && loggedFrame != m_frame)
+        {
+            logged++;
+            loggedFrame = m_frame;
+            Log("water SSR previous frame at frame %llu: on %d (allowed %d, SSR %d, pyramid failed %d, GI colour %d, its frame %llu, "
+                "previous camera frame %llu, reset %u; particle layer last frame %d, draws %llu)",
+                static_cast<unsigned long long>(m_frame), m_ssrPrevOn ? 1 : 0, allowed ? 1 : 0, WaterSsrOn() ? 1 : 0, m_hizFailed ? 1 : 0,
+                m_giColor ? 1 : 0, static_cast<unsigned long long>(m_giColorFrame), static_cast<unsigned long long>(m_ssrPrevCamFrame),
+                info->reset, LastParticleLayer() ? 1 : 0, static_cast<unsigned long long>(m_partDraws));
+        }
         if (m_ssrPrevOn && m_ssrPrevRes != m_giColor)
         {
             if (!m_ssrPrevSrv.ptr)
@@ -8528,16 +8642,15 @@ public:
                     out[8 + i] = static_cast<float>(w);
                 }
                 out[12] = 1.0f;
+                static const bool partDebug = [] {
+                    wchar_t v[8] = {};
+                    return GetEnvironmentVariableW(L"CRYMT_SSR_PARTICLES", v, 8) && wcscmp(v, L"2") == 0;
+                }();
+                out[13] = LastParticleLayer() ? (partDebug ? 2.0f : 1.0f) : 0.0f;
                 out[14] = static_cast<float>(m_giFullW);
                 out[15] = static_cast<float>(m_giFullH);
             }
         }
-        memcpy(m_ssrPrevView, info->view, sizeof(m_ssrPrevView));
-        memcpy(m_ssrPrevProj, info->proj, sizeof(m_ssrPrevProj));
-        memcpy(m_ssrPrevCamPos, info->camPos, sizeof(m_ssrPrevCamPos));
-        m_ssrPrevShift[0] = info->shiftU;
-        m_ssrPrevShift[1] = info->shiftV;
-        m_ssrPrevCamFrame = m_frame;
     }
 
     void UpdateFrameTexture(const DlssSceneInfo* info)
@@ -14587,6 +14700,12 @@ private:
     Srv12* m_biasSrv = nullptr;
     UINT m_biasW = 0, m_biasH = 0;
     uint64_t m_biasFrame = ~0ull;
+    ID3D10Texture2D* m_partTex[2] = {}; // BindParticleLayer
+    Rtv12* m_partRtv[2] = {};
+    Srv12* m_partSrv[2] = {};
+    UINT m_partW = 0, m_partH = 0;
+    uint64_t m_partFrame[2] = {~0ull, ~0ull};
+    uint64_t m_partDraws = 0;
     ID3D10Texture2D* m_bendTex = nullptr; // BindBendVelocity
     Rtv12* m_bendRtv = nullptr;
     Srv12* m_bendSrv = nullptr;
@@ -14609,6 +14728,8 @@ private:
     ID3D12Resource* m_ssrPrevRes = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE m_ssrPrevSrv{};
     float m_ssrPrevView[16] = {}, m_ssrPrevProj[16] = {}, m_ssrPrevCamPos[4] = {}, m_ssrPrevShift[2] = {};
+    float m_ssrCurView[16] = {}, m_ssrCurProj[16] = {}, m_ssrCurCamPos[4] = {}, m_ssrCurShift[2] = {};
+    uint64_t m_ssrCurFrame = ~0ull;
     ID3D12Resource* m_giColor = nullptr;   // previous frame's HDR scene colour
     ID3D12Resource* m_giHist[2] = {};      // half-resolution GI, ping-pong
     D3D12_CPU_DESCRIPTOR_HANDLE m_giHistSrv[2] = {};
@@ -15354,6 +15475,17 @@ ID3D12PipelineState* Device::Pso(bool indexed)
         r.blend.IndependentBlendEnable = TRUE;
         r.blend.RenderTarget[1] = r.blend.RenderTarget[0];
         r.blend.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+        if (numRtv >= 3 && k.rtv[2] == DXGI_FORMAT_R16_FLOAT)
+        {
+            // The particle layer (BindParticleLayer): the nearest depth kept.
+            D3D12_RENDER_TARGET_BLEND_DESC& p = r.blend.RenderTarget[2];
+            p = {};
+            p.BlendEnable = TRUE;
+            p.SrcBlend = p.DestBlend = p.SrcBlendAlpha = p.DestBlendAlpha = D3D12_BLEND_ONE;
+            p.BlendOp = p.BlendOpAlpha = D3D12_BLEND_OP_MIN;
+            p.LogicOp = D3D12_LOGIC_OP_NOOP;
+            p.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+        }
     }
     else if (numRtv >= 2 && k.rtv[0] == DXGI_FORMAT_R16G16B16A16_FLOAT && k.rtv[1] == DXGI_FORMAT_R16G16B16A16_FLOAT && m_vs->motionBlur)
     {
@@ -15532,10 +15664,13 @@ bool Device::ApplyOnce(bool indexed)
         m_rtv[0]->samples == 1)
         BindObjectMotion();
     // Water and particles (the patched pixel shaders write DLSS's bias mask in SV_Target1) into the scene's colour.
-    if (m_ps && m_ps->writesTarget1 && !m_ps->writesTarget2 && !(m_vs && m_vs->motionBlur) && m_rtv[0] && !m_rtv[1] && m_rtv[0]->format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
-        m_rtv[0]->samples == 1 && m_foliageW && static_cast<const TextureCore*>(m_rtv[0]->info)->width == m_foliageW &&
-        static_cast<const TextureCore*>(m_rtv[0]->info)->height == m_foliageH)
+    if (m_ps && m_ps->writesTarget1 && (!m_ps->writesTarget2 || m_ps->particleLayer) && !(m_vs && m_vs->motionBlur) && m_rtv[0] && !m_rtv[1] &&
+        m_rtv[0]->format == DXGI_FORMAT_R16G16B16A16_FLOAT && m_rtv[0]->samples == 1 && m_foliageW &&
+        static_cast<const TextureCore*>(m_rtv[0]->info)->width == m_foliageW && static_cast<const TextureCore*>(m_rtv[0]->info)->height == m_foliageH)
         BindBiasMask();
+    // The particles' layer for the water's SSR (SV_Target2) beside the bias mask.
+    if (m_ps && m_ps->particleLayer && m_biasRtv && m_rtv[1] == m_biasRtv && !m_rtv[2])
+        BindParticleLayer();
     if (m_pastScene && m_rtv[0] && m_rtv[0]->info == m_doneColour)
     {
         m_note.lateDraws++;
@@ -15727,6 +15862,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                     Require(&m_sss, kSrvState);
                 if (s == kPS && v->info == g_hizPlaceholder && m_hizFrame == m_frame)
                     Require(&m_hiz, kSrvState);
+                if (s == kPS && v->info == g_ssrPartPlaceholder && m_ssrPrevOn && LastParticleLayer())
+                    Require(LastParticleLayer()->info, kSrvState);
                 // The deferred shadow pass (patched ShadowMaskGen: it reads the frame texture) draws into the screen's
                 // shadow mask (the sun in red, as the shaders read it): kept for GTAO.
                 if (s == kPS && v->info == g_jitterPlaceholder && m_rtv[0] && m_rtv[0]->samples == 1 && m_rtv[0] != m_shadowMaskRtv)
@@ -15815,6 +15952,8 @@ void Device::ApplyStage(Stage s, uint32_t cbMask, UINT srvEnd, UINT samplerEnd)
                 src[i] = m_sssSrv;
             if (v && s == kPS && v->info == g_hizPlaceholder && m_hizFrame == m_frame)
                 src[i] = m_hizSrv;
+            if (v && s == kPS && v->info == g_ssrPartPlaceholder && m_ssrPrevOn && LastParticleLayer())
+                src[i] = LastParticleLayer()->cpu;
             if (v && s == kPS && v->info == g_ssrPrevPlaceholder && m_ssrPrevOn && m_ssrPrevSrv.ptr)
             {
                 src[i] = m_ssrPrevSrv;
@@ -16324,6 +16463,21 @@ bool IsJitterPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_
     return true;
 }
 
+// Textures/CryMT/ssrpart.dds: CryMT's 2x1 placeholder for the previous frame's particle layer (the water's SSR): the first
+// texel zero, the second 4F4F4F4F (the mark).
+bool IsSsrPartPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
+{
+    if (!init || !init->pSysMem || d.Width != 2 || d.Height != 1 || d.ArraySize != 1 ||
+        (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+         d.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
+        return false;
+    const auto* p = static_cast<const uint8_t*>(init->pSysMem);
+    for (int i = 0; i < 8; i++)
+        if (p[i] != (i < 4 ? 0 : 0x4F))
+            return false;
+    return true;
+}
+
 // Textures/CryMT/ssrprev.dds: CryMT's 2x1 placeholder for the previous frame's scene (the water's SSR, patched Water.cfx):
 // the first texel zero, the second 4E4E4E4E (the mark).
 bool IsSsrPrevPlaceholder(const D3D10_TEXTURE2D_DESC& d, const D3D10_SUBRESOURCE_DATA* init)
@@ -16520,6 +16674,11 @@ HRESULT Device::CreateTexture2D(const D3D10_TEXTURE2D_DESC* desc, const D3D10_SU
     {
         g_ssrPrevPlaceholder = Info(t);
         Log("water previous-frame placeholder texture recognized");
+    }
+    else if (IsSsrPartPlaceholder(*desc, init))
+    {
+        g_ssrPartPlaceholder = Info(t);
+        Log("water particle-layer placeholder texture recognized");
     }
     else if (desc->Width == 4 && desc->Height <= 4 && Gi().on)
     {
@@ -17531,9 +17690,12 @@ HRESULT Device::PresentFrame(IDXGISwapChain3* chain, ID3D12Resource* target, Tex
         }
         static uint64_t envBindsBefore, env2DBefore;
         static uint64_t ssrPrevBefore;
-        Log("environment map binds per frame: %.1f (2D maps %.1f); water SSR on the previous frame %.1f", (g_device->m_envBinds - envBindsBefore) / 3600.0,
-            (g_device->m_env2DBinds - env2DBefore) / 3600.0, (g_device->m_ssrPrevBinds - ssrPrevBefore) / 3600.0);
+        static uint64_t partDrawsBefore;
+        Log("environment map binds per frame: %.1f (2D maps %.1f); water SSR on the previous frame %.1f, particle layer draws %.1f",
+            (g_device->m_envBinds - envBindsBefore) / 3600.0, (g_device->m_env2DBinds - env2DBefore) / 3600.0,
+            (g_device->m_ssrPrevBinds - ssrPrevBefore) / 3600.0, (g_device->m_partDraws - partDrawsBefore) / 3600.0);
         ssrPrevBefore = g_device->m_ssrPrevBinds;
+        partDrawsBefore = g_device->m_partDraws;
         envBindsBefore = g_device->m_envBinds;
         env2DBefore = g_device->m_env2DBinds;
         Log("heaps at frame %llu: video memory %.0f of %.0f MB, shared %.0f MB; upload pages %llu (+%llu dedicated), %.1f MB in free lists; "

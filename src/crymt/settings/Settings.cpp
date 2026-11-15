@@ -254,6 +254,7 @@ struct pixout_crymask
 {
   float4 Color : COLOR0;
   float4 Mask  : COLOR1;
+  float Layer  : COLOR2; // one component: the back end tells it from the z-prepass's SV_Target2 by that
 };
 
 pixout_crymask CryMT_ParticlePS(v2f IN)
@@ -263,9 +264,14 @@ pixout_crymask CryMT_ParticlePS(v2f IN)
   OUT.Color = c.Color;
 #if %_RT_ALPHABLEND
   OUT.Mask = float4(0.8, 0, 0, c.Color.a);
+  float cover = c.Color.a;
 #else
   OUT.Mask = float4(saturate(dot(c.Color.rgb, 0.333)) * 0.8, 0, 0, c.Color.a);
+  float cover = saturate(dot(c.Color.rgb, 0.333));
 #endif
+  // The particle layer for the water's SSR (the back end keeps the nearest: MIN): this pixel's depth along the view
+  // (metres) where the particle is dense enough to show in a reflection, else far.
+  OUT.Layer = cover > 0.2 ? IN.screenProj.w : 65000;
   return OUT;
 }
 #else
@@ -369,7 +375,8 @@ samplerCUBE CryMT_WaterEnvSampler = sampler_state
 // HDR copy of it with mips (D3D's layout), 3 + L that copy at mip level L (debug); z the camera's near plane, w 2 when the
 // water's SSR is on (the depth pyramid has the screen's size: from the screen coordinate's derivatives); 8..10 this
 // frame's homogeneous screen point (u w, v w, w, 1; w 0 for a direction) to the previous frame's (u w, v w, w), both with
-// their jitter; 11: x 1 when CryMT_WaterPrevSampler holds the previous frame's finished scene, zw its size.
+// their jitter; 11: x 1 when CryMT_WaterPrevSampler holds the previous frame's finished scene, y 1 when
+// CryMT_WaterPartSampler holds its particle layer (2: its hits shown magenta, CRYMT_SSR_PARTICLES=2), zw its size.
 sampler2D CryMT_WaterFrameSampler = sampler_state
 {
   Texture = Textures/CryMT/jitter.dds;
@@ -417,6 +424,18 @@ float4 CryMT_WaterFrame(float i)
 {
   return tex2Dlod(CryMT_WaterFrameSampler, float4((i + 0.5) / 16, 0.5, 0, 0));
 }
+
+// The previous frame's particle layer (the back end's, in place of Textures/CryMT/ssrpart.dds): per pixel the depth along
+// the view (metres) of the nearest dense particle, 65000 none; read only when the frame texture's texel 11.y is 1.
+sampler2D CryMT_WaterPartSampler = sampler_state
+{
+  Texture = Textures/CryMT/ssrpart.dds;
+  MinFilter = POINT;
+  MagFilter = POINT;
+  MipFilter = POINT;
+  AddressU = Clamp;
+  AddressV = Clamp;
+};
 
 // Where a point of this frame's screen (u w, v w, w, 1; a direction: w 0) was on the previous frame's; false off it.
 bool CryMT_PrevUv(float4 s, out float2 uv)
@@ -548,13 +567,53 @@ half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 sc
   bool valid;
   float3 hit = CryMT_HiZMarch(origin, endPoint - origin, screenSize, valid);
   float confidence = valid ? CryMT_HiZConfidence(hit, uvP, screenSize, hz.z) : 0;
-  if (confidence <= 0)
-    return base;
-  half3 seen = tex2Dlod(sceneMap, float4(hit.xy, 0, 0)).rgb;
+  half4 result = base;
   float wHit = hz.z / max(hit.z, 1e-7);
-  if (prevOn && CryMT_PrevUv(float4(hit.xy * wHit, wHit, 1), uvPrev))
-    seen = tex2Dlod(CryMT_WaterPrevSampler, float4(uvPrev, 0, 0)).rgb;
-  return half4(lerp(base.rgb, seen, confidence), base.a);
+  if (confidence > 0)
+  {
+    half3 seen = tex2Dlod(sceneMap, float4(hit.xy, 0, 0)).rgb;
+    if (prevOn && CryMT_PrevUv(float4(hit.xy * wHit, wHit, 1), uvPrev))
+      seen = tex2Dlod(CryMT_WaterPrevSampler, float4(uvPrev, 0, 0)).rgb;
+    result.rgb = lerp(base.rgb, seen, confidence);
+  }
+  // Particles (smoke, dust, fire) write no depth: the rays above pass through them. The previous frame's particle layer
+  // is marched along the ray's screen path (16 steps, turned per pixel) up to the scene's hit, else towards the ray's far
+  // end, clipped to the screen; where the ray lies behind a particle's front by less than its thickness (2 m, 10% far
+  // away), the previous frame's scene there: the particle over what lay behind it.
+  if (prevOn && pf.y > 0.5)
+  {
+    float4 q0 = CryMT_WaterFrame(8), q1 = CryMT_WaterFrame(9), q2 = CryMT_WaterFrame(10);
+    float3 Ef = float3(uvP * wP, wP) + (wR > 0 ? (min(64 * wP, 2000) - wP) / max(wR, 0.05) : t0) * Rh;
+    float2 uv1 = confidence > 0 ? hit.xy : Ef.xy / Ef.z;
+    float iw0 = 1 / wP, iw1 = 1 / max(confidence > 0 ? wHit : Ef.z, 1e-3);
+    float2 d = uv1 - uvP;
+    float aMax = 1;
+    if (d.x != 0)
+      aMax = min(aMax, ((d.x > 0 ? 1 : 0) - uvP.x) / d.x);
+    if (d.y != 0)
+      aMax = min(aMax, ((d.y > 0 ? 1 : 0) - uvP.y) / d.y);
+    float jitter = frac(52.9829189 * frac(dot(uvP * screenSize, float2(0.06711056, 0.00583715))));
+    [loop] for (int k = 1; k <= 16; k++)
+    {
+      float a = aMax * (k - jitter) / 16;
+      float2 uv = uvP + d * a;
+      float w = 1 / lerp(iw0, iw1, a);
+      float4 s4 = float4(uv * w, w, 1);
+      float wPrev = dot(s4, q2);
+      float2 pu = float2(dot(s4, q0), dot(s4, q1)) / max(wPrev, 1e-7);
+      if (wPrev <= 0 || any(pu < 0) || any(pu > 1))
+        continue;
+      float front = tex2Dlod(CryMT_WaterPartSampler, float4(pu, 0, 0)).r;
+      if (wPrev > front && wPrev < front + max(2.0, 0.1 * front))
+      {
+        float2 edge = smoothstep(0, 0.05, uv) * (1 - smoothstep(0.95, 1, uv));
+        half3 particle = pf.y > 1.5 ? half3(4, 0, 4) : tex2Dlod(CryMT_WaterPrevSampler, float4(pu, 0, 0)).rgb; // 2: debug
+        result.rgb = lerp(result.rgb, particle, edge.x * edge.y);
+        break;
+      }
+    }
+  }
+  return result;
 }
 #else
 half4 CryMT_WaterReflection(half4 planar, half3 viewVec, half3 normal, float4 screenProj, sampler2D sceneMap)
@@ -1331,6 +1390,8 @@ std::wstring InstallGi()
                 skin = Lf(ReadAll(tmp + L"\\" + kHumanSkin)), waterSurface = Lf(ReadAll(tmp + L"\\" + kWaterSurface));
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
+    // CRYMT_VFOG_SHADERS=0 (tests): the fog pass as the game's (the editor showed no fog, 2026-11-15).
+    const bool vfogShaders = !(GetEnvironmentVariableW(L"CRYMT_VFOG_SHADERS", fpv, 8) && fpv[0] == L'0');
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
                                "  float tcIterParam = LightInfoTC_DB.w;\n  for (int i=0; i<LightsNum_DB; i++, tcLI.x+=tcIter)\n#else\n";
     const bool ok = // The ocean's reflection from CryMT's cube when it is bound (kWaterEnvDecl).
@@ -1437,14 +1498,15 @@ std::wstring InstallGi()
                     Replace(motionBlur, "    PixelShader = compile ps_Auto Common_MotionBlurPassPS() MotionBlurPS;\n",
                             "    PixelShader = compile ps_Auto CryMT_MotionBlurPassPS() MotionBlurPS;\n") &&
                     // The GI in the fog (kVFogDecl): the fog pass's colour darkened by the back end's volume.
-                    Replace(postProcess, "void FogPassCommon (in vert2fragFog IN, out half sceneDepth, out half4 localFogColor, out half3 worldPos, out half3 cameraToWorldPos)\n",
+                    (!vfogShaders ||
+                    (Replace(postProcess, "void FogPassCommon (in vert2fragFog IN, out half sceneDepth, out half4 localFogColor, out half3 worldPos, out half3 cameraToWorldPos)\n",
                             std::string(kVFogDecl) + "void FogPassCommon (in vert2fragFog IN, out half sceneDepth, out half4 localFogColor, out half3 worldPos, out half3 cameraToWorldPos)\n") &&
                     Replace(postProcess, "pixout FogPassPS(vert2fragFog IN)\n", "pixout CryMT_FogPassPS(vert2fragFog IN)\n") &&
                     Replace(postProcess, "\tFogPassCommon(IN, sceneDepth, localFogColor, worldPos, cameraToWorldPos);\n\t\n\tlocalFogColor.a = 1.0 - localFogColor.a;\n",
                             "\tFogPassCommon(IN, sceneDepth, localFogColor, worldPos, cameraToWorldPos);\n"
                             "\tCryMT_VFog(IN.baseTC.xy, cameraToWorldPos, sceneDepth, localFogColor); // CryMT: the GI in the fog\n"
                             "\t\n\tlocalFogColor.a = 1.0 - localFogColor.a;\n") &&
-                    Replace(postProcess, "    PixelShader = compile PROFILE_PS FogPassPS();\n", "    PixelShader = compile PROFILE_PS CryMT_FogPassPS();\n") &&
+                    Replace(postProcess, "    PixelShader = compile PROFILE_PS FogPassPS();\n", "    PixelShader = compile PROFILE_PS CryMT_FogPassPS();\n"))) &&
                     // Rivers: the water's reflection with the engine's cube (kRiverReflection).
                     Replace(waterSurface, "sampler2D screenMapSampler = sampler_state\n", std::string(kWaterEnvDecl) + "sampler2D screenMapSampler = sampler_state\n") &&
                     Replace(waterSurface, "    reflectColor = tex2D(envMapSampler, vReflect.xy).xyz * cSunShading;  \n  #endif\n\n#endif\n",
@@ -1523,6 +1585,9 @@ std::wstring InstallGi()
     // The previous frame's scene for the water's SSR: 2x1, the first texel zero, the second 4E4E4E4E (the mark).
     std::string ssrPrev = foliage;
     memset(&ssrPrev[132], 0x4E, 4);
+    // The particle layer for the water's SSR: 2x1, the first texel zero, the second 4F4F4F4F (the mark).
+    std::string ssrPart = foliage;
+    memset(&ssrPart[132], 0x4F, 4);
     // The screen-space shadows' placeholder: 2x1, the first texel zero (no shadow), the second 005C005C (the mark: its
     // red is zero in either byte order, as fragLib reads the whole screen from it).
     std::string sss = foliage;
@@ -1565,6 +1630,7 @@ std::wstring InstallGi()
                               {"Textures/CryMT/waterenv.dds", waterEnv},
                               {"Textures/CryMT/hiz.dds", hiz},
                               {"Textures/CryMT/ssrprev.dds", ssrPrev},
+                              {"Textures/CryMT/ssrpart.dds", ssrPart},
                               {"Textures/CryMT/env.dds", env},
                               {"Textures/CryMT/gi.dds", dds},
                               {"Textures/CryMT/jitter.dds", jitter},
