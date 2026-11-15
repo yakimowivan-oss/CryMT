@@ -189,7 +189,7 @@
             pd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             pd.Texture2D.MipLevels = 1;
             D3D12_SHADER_RESOURCE_VIEW_DESC pdd = pd;
-            pdd.Format = DXGI_FORMAT_R16G16_FLOAT;
+            pdd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             g.dev->CreateShaderResourceView(probeCur, &pd, at(24 + kGiVoxTable - 3));
             g.dev->CreateShaderResourceView(probeDepthCur, &pdd, at(24 + kGiVoxTable - 2));
             // t43: the foliage mask for the upsample's smoothing on grass and leaves (null: none)

@@ -789,11 +789,13 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     GroupMemoryBarrierWithGroupSync();
     const float4 old = historyTex.Load(int3(texel, 0));
     const int2 dt = ProbeDepthTile(slot, c) + int2(tid.xy); // the distances' texel, laid out as the light's
-    const float2 oldM = srcTex.Load(int3(dt, 0)).xy;
+    const float4 oldMF = srcTex.Load(int3(dt, 0));
+    const float2 oldM = oldMF.xy;
+    const float oldFast = oldMF.z; // the texel's short-term luminance (MSME below)
     if (!due)
     {
         outTex[texel] = old;
-        probeDepthOut[dt] = float4(oldM, 0, 1);
+        probeDepthOut[dt] = float4(oldM, oldFast, 1);
         if (gi == 0)
         {
             outTex[st] = state;
@@ -826,20 +828,29 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     }
     const float4 fresh = sum / max(weights, 1e-4);
     const float2 freshM = mw > 1e-4 ? m / mw : oldM;
-    probeDepthOut[dt] = float4(valid ? lerp(freshM, oldM, 0.95) : freshM, 0, 1);
     // Hysteresis 0.95 (64 rays a fourth frame: ~1300 rays' worth; at 0.8 the probes boiled and one frame's look at the
     // stair varied by 2.5 of 255 between runs). A faster blend on big changes (0.6 when the light doubled or halved) made
     // dim probes jump at their updates: the noise of 64 rays crossed that line (the user: voxels light up and go out).
-    // A change beyond the rays' noise (4 sigma of this texel's weighted mean, and 10% of its light) is taken faster (0.7)
-    // and keeps the probe updating every frame for 12 frames: a flashlight, a lamp switched on, a fire (the user,
-    // 2026-11-15: the shotgun's flashlight did not show with the probes). The noise alone keeps 0.95 (the fixed faster
-    // blend on big changes before made dim probes jump).
-    const float meanL = sL / max(weights, 1e-4), oldL = dot(old.rgb, float3(0.2126, 0.7152, 0.0722));
+    // Two means of the texel's light (as MSME): the long-term one (the texel, 0.95 of the old at each update) and a
+    // short-term one of the luminance (0.4 of each update, the distances' z). Where they part by more than the short
+    // one's noise (6 sigma: its noise is about half of one update's, the rays' weighted mean) and 5%, the light is
+    // changing - a flashlight, a lamp switched on, a fire, a door opened: the long-term light is taken to the short-term
+    // level (scaled) and the probe updates every frame for 12 frames (hot). A gradual change (the voxels' light builds
+    // up over updates) parts them as well as a jump; the rays' noise alone does not (a fixed faster blend on big changes
+    // made dim probes jump). The user, 2026-11-15: the shotgun's flashlight did not show with the probes.
+    const float3 kLumP = float3(0.2126, 0.7152, 0.0722);
+    const float meanL = sL / max(weights, 1e-4), oldL = dot(old.rgb, kLumP);
     const float noise = sqrt(max(sL2 / max(weights, 1e-4) - meanL * meanL, 0) * sW2) / max(weights, 1e-4);
-    const bool changed = fast && valid && abs(meanL - oldL) > 4 * noise + 0.1 * max(meanL, oldL) + 0.002;
-    if (changed)
+    const float fastL = valid ? lerp(oldFast, meanL, 0.4) : meanL;
+    const bool drift = fast && valid && abs(fastL - oldL) > 3 * noise + 0.05 * max(fastL, oldL) + 0.002;
+    float4 light = valid ? lerp(fresh, old, drift ? 0.7 : 0.95) : fresh;
+    if (drift)
+    {
+        light.rgb *= clamp(fastL / max(dot(light.rgb, kLumP), 1e-4), 0.25, 4);
         InterlockedOr(g_probeHot, 1u);
-    outTex[texel] = valid ? lerp(fresh, old, changed ? 0.7 : 0.95) : fresh;
+    }
+    outTex[texel] = light;
+    probeDepthOut[dt] = float4(valid ? lerp(freshM, oldM, 0.95) : freshM, fastL, 1);
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0)
     {

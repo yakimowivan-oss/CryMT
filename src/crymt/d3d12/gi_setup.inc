@@ -364,7 +364,7 @@
         D3D12_RESOURCE_DESC dd = d;
         dd.Width = 1024 * kProbeCascades;
         dd.Height = 1024;
-        dd.Format = DXGI_FORMAT_R16G16_FLOAT;
+        dd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; // xy the distances' moments, z the short-term luminance (probes)
         for (int i = 0; i < 2; i++)
         {
             if (FAILED(g.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
