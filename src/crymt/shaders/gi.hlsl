@@ -764,10 +764,13 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const float4 offsetHot = valid ? historyTex.Load(int3(ot, 0)) : 0;
     const float3 offset = offsetHot.xyz;
     // The outer cascades every 8th frame, the near one every 4th; a probe whose light changed beyond its rays' noise at
-    // its last update (hot: the offset texel's w, frames left) every frame (visAreas[kProbeOptions].x, CRYMT_GI_PROBEFAST).
+    // its last update every frame (hot), one that has not changed for 8 updates in a row half as often (calm: the rays go
+    // where the light moves). The offset texel's w: > 0 the hot frames left, <= 0 minus the calm updates (to -8).
+    // visAreas[kProbeOptions].x, CRYMT_GI_PROBEFAST.
     const bool fast = visAreas[kProbeOptions].x > 0.5;
     const float hot = fast ? offsetHot.w : 0;
-    const uint period = c == 0 ? 3u : 7u;
+    const bool calm = hot < -7.5;
+    const uint period = c == 0 ? (calm ? 7u : 3u) : (calm ? 15u : 7u);
     const bool due = !valid || hot > 0.5 || (((uint)slot + (uint)frame) & period) == 0;
     float4 ray = 0;
     float3 dir = 0;
@@ -792,14 +795,15 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const float4 oldMF = srcTex.Load(int3(dt, 0));
     const float2 oldM = oldMF.xy;
     const float oldFast = oldMF.z; // the texel's short-term luminance (MSME below)
+    const float oldVar = oldMF.w;  // ... and the variance of one update's luminance over time
     if (!due)
     {
         outTex[texel] = old;
-        probeDepthOut[dt] = float4(oldM, oldFast, 1);
+        probeDepthOut[dt] = float4(oldM, oldFast, oldVar);
         if (gi == 0)
         {
             outTex[st] = state;
-            outTex[ot] = float4(offset, 0);
+            outTex[ot] = float4(offset, hot);
         }
         return;
     }
@@ -841,8 +845,18 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const float3 kLumP = float3(0.2126, 0.7152, 0.0722);
     const float meanL = sL / max(weights, 1e-4), oldL = dot(old.rgb, kLumP);
     const float noise = sqrt(max(sL2 / max(weights, 1e-4) - meanL * meanL, 0) * sW2) / max(weights, 1e-4);
+    // The noise is measured over time (as MSME): the variance of the updates around the short-term mean, which holds the
+    // voxels' own flicker too (their levels update in turns, the screen's colour comes in with the jitter), not only the
+    // rays' (a test on the rays' noise alone kept many still probes hot: 2.7 x the probes' time on the village stair).
+    // The test takes the variance as it was before this update, and the variance learns only from deviations within 3
+    // sigma (a change is no noise: taken in, it raised the line faster than the means parted and nothing was found).
+    // The line 2.5 sigma of one update: the two means' difference has about half that noise.
+    const float varPrev = valid ? max(oldVar, 0.25 * noise * noise) : noise * noise;
+    const float sigma = sqrt(varPrev);
+    const float dev = clamp(meanL - oldFast, -3 * sigma, 3 * sigma);
+    const float var = valid ? lerp(varPrev, dev * dev, 0.1) : noise * noise;
     const float fastL = valid ? lerp(oldFast, meanL, 0.4) : meanL;
-    const bool drift = fast && valid && abs(fastL - oldL) > 3 * noise + 0.05 * max(fastL, oldL) + 0.002;
+    const bool drift = fast && valid && abs(fastL - oldL) > 2.5 * sigma + 0.05 * max(fastL, oldL) + 0.002;
     float4 light = valid ? lerp(fresh, old, drift ? 0.7 : 0.95) : fresh;
     if (drift)
     {
@@ -850,7 +864,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
         InterlockedOr(g_probeHot, 1u);
     }
     outTex[texel] = light;
-    probeDepthOut[dt] = float4(valid ? lerp(freshM, oldM, 0.95) : freshM, fastL, 1);
+    probeDepthOut[dt] = float4(valid ? lerp(freshM, oldM, 0.95) : freshM, fastL, var);
     GroupMemoryBarrierWithGroupSync();
     if (gi == 0)
     {
@@ -894,7 +908,7 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
             moved.z += upMin + 0.25 * sp;
         else if (frontMin < 0.3 * sp)
             moved -= frontDir * (0.3 * sp - frontMin);
-        outTex[ot] = float4(clamp(moved, -0.45 * sp, 0.45 * sp), g_probeHot != 0 ? 12 : max(hot - 1, 0));
+        outTex[ot] = float4(clamp(moved, -0.45 * sp, 0.45 * sp), !fast ? 0 : g_probeHot != 0 ? 12 : max(hot - 1, -8));
     }
 }
 
