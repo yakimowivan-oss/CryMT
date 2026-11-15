@@ -591,7 +591,8 @@ static const int3 kProbeN = int3(32, 32, 16);
 // A far one, 2 m (+-32 m), was tried and dropped (2026-11-14): +0.4 ms, and under eaves its probes 2 m apart against
 // roofs a third of that thick leaked light down at mid range; past 16 m the cones go on, their light matched to the
 // probes' at the grid's edge (probeMatch).
-static const int kProbeCascades = 2;
+static const int kProbeCascades = 3; // 0.5, 1 and 2 m apart: +-8, +-16, +-32 m (the third back 2026-11-15: the dip past
+                                     // the probes at 15-22 m on mine's walk test, x0.47 of no GI)
 float CascadeSpacing(int c) { return 0.5 * (1 << c); }
 static const float2 kProbeAtlas = float2(1024 * kProbeCascades, 1152);
 // Phase 2, visibility (DDGI's): per probe the mean distance to what its rays hit and its square over the sphere, a tile
@@ -770,7 +771,8 @@ void probes(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uint gi : SV_G
     const bool fast = visAreas[kProbeOptions].x > 0.5;
     const float hot = fast ? offsetHot.w : 0;
     const bool calm = hot < -7.5;
-    const uint period = c == 0 ? (calm ? 7u : 3u) : (calm ? 15u : 7u);
+    const uint base = c == 0 ? 3u : c == 1 ? 7u : 15u; // every 4th, 8th, 16th frame; calm probes half as often
+    const uint period = calm ? base * 2 + 1 : base;
     const bool due = !valid || hot > 0.5 || (((uint)slot + (uint)frame) & period) == 0;
     float4 ray = 0;
     float3 dir = 0;

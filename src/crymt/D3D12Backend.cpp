@@ -264,7 +264,7 @@ constexpr int kVoxLevels = 4;  // cells of voxelSize (0.25 m), 2, 4 and 8 times 
 // The GI root's second table (kGiShader t3..t41): per level the grid, per-axis opacity, L1 and six directions (9), the
 // VisAreas, the roof, the probes' atlases (t41 light and states, t42 distances).
 constexpr UINT kGiVoxTable = 9 * kVoxLevels + 5; // ... t41, t42 the probes' atlases, t43 the foliage mask
-constexpr UINT kProbeCascades = 2; // GI v2's probe cascades (kGiShader's kProbeCascades: 0.5 and 1 m apart)
+constexpr UINT kProbeCascades = 3; // GI v2's probe cascades (kGiShader's kProbeCascades: 0.5, 1 and 2 m apart)
 constexpr UINT kVoxTable = 23; // descriptors per table: t0..t2, u0..u19 (u6/u7 the light direction, u8..u19 the six
                                // directions: CRYMT_GI_DIRLIGHT)
 const char* const kVoxShader =
@@ -987,7 +987,7 @@ private:
     ID3D12PipelineState* m_giPsoProbes = nullptr;   // GI v2: the probes' rays and atlas (kGiShader "probes")
     ID3D12Resource* m_probeAtlas[2] = {};           // their atlases, written in turn (1024 x kProbeCascades by 1152 RGBA16F: tiles, states)
     ID3D12Resource* m_probeMatch = nullptr;         // GI v2: the cones' light matched to the probes' (kGiShader probeMatch, 16 uints)
-    ID3D12Resource* m_probeDepth[2] = {};           // their distances (1024 x kProbeCascades by 1024 RG16F, tiles as the light's), with the atlas of the same index
+    ID3D12Resource* m_probeDepth[2] = {};           // their distances (1024 x kProbeCascades by 1024 RGBA16F: moments, short-term luminance, its variance; tiles as the light's), with the atlas of the same index
     D3D12_RESOURCE_STATES m_probeAtlasState[2] = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
     int m_probeCur = 0;                             // the one written next
     bool m_probeFailed = false;
