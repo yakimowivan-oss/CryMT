@@ -1294,7 +1294,8 @@ void upsample(uint3 id : SV_DispatchThreadID)
     {
         // 32: the particles' GI (options 2^21); 64 x half TerrainAO's distance (options >> 16, 5 bits): a / 2 < 2048.
         uint control = mask | ((((uint)options >> 21) & 1u) << 5) | ((((uint)options >> 16) & 31u) << 6);
-        outTex[id.xy] = float4(0, ((uint)options & 32) ? 1 : 0, 0, 2.0 * control); // green: shadeLib's POM (fragLib's A/B)
+        outTex[id.xy] = float4(0, ((uint)options & 32) ? 1 : 0, ((uint)frame & 2048) ? 1 : 0, 2.0 * control); // green: the
+                                                     // game's POM, blue: PBR-lite off (frame + 2048; fragLib's A/B)
         return;
     }
     if (d < kWeaponDepth)

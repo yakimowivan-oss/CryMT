@@ -100,6 +100,14 @@ const char* const kEnvAll = R"(#if D3D10
 
   // do custom pass setup
   frag_custom_begin(pPass);)";
+// PBR-lite's specular AA after the material's own setup (Illum scales the power by its gloss map there): the derivatives
+// taken unconditionally, the switch by lerp (gradients in a branch do not compile under D3D10; the engine then skips the
+// shader: flat unlit materials, 2026-11-15).
+const char* const kPbrLiteAA = R"(
+  {
+    float crymtAA = CryMT_SpecAA(pPass.fSpecPow, pPass.vNormal.xyz); // CryMT PBR-lite
+    pPass.fSpecPow = lerp(crymtAA, pPass.fSpecPow, CryMT_PBRLiteOff() ? 1.0 : 0.0);
+  })";
 
 // The ocean's reflection (Water.cfx WaterPS) by CryMT (CRYMT_WATERCUBE, the reflections page "Water reflection"; the
 // engine's planar pass then off: r_WaterReflections 0): 1 the environment cube the D3D12 back end binds in place of
@@ -1110,6 +1118,72 @@ std::string Crlf(const std::string& s)
 // metre; y its reach, m; w 4242, the mark): without the mark (no CryMT back end, the editor's other viewports, a pass the
 // volume was not made for) the engine's fog exactly, whatever the engine left bound there (2026-11-15: the editor). The
 // pixel shader is renamed so no cached build of the old one (ShaderCache.pak) is used.
+const char* const kPbrLite = R"(// CryMT PBR-lite for the game's own materials, no new textures (the user, 2026-11-15): the specular lobe's AA by the
+// normal's change over the pixel (as Kaplanyan & Hill: alpha^2 += min(2 (|dN/dx|^2 + |dN/dy|^2), 0.18), alpha^2 = 2 /
+// (n + 2): a highlight no longer glitters between pixels on bumpy rocks and edges) and Schlick's Fresnel on the
+// specular colour (towards white at grazing views, damped for rough surfaces). The GI texture's top-left texel's blue
+// 1: off (crymt_gictl pbrlite 0, CRYMT_PBRLITE=0). The lobe's shape (GGX) is shadeLib's (kLobe).
+#if D3D10
+bool CryMT_PBRLiteOff()
+{
+  return tex2Dlod(CryMT_GISampler, float4(0, 0, 0, 0)).b > 0.5;
+}
+#else
+bool CryMT_PBRLiteOff()
+{
+  return true;
+}
+#endif
+
+float CryMT_SpecAA(float specPow, float3 N)
+{
+  float3 dx = ddx(N), dy = ddy(N);
+  float v = min(2 * (dot(dx, dx) + dot(dy, dy)), 0.18);
+  float a2 = 2 / (max(specPow, 0) + 2);
+  return max(2 / (a2 + v) - 2, 1);
+}
+
+half3 CryMT_SpecFresnel(half3 spec, half3 acc, half NdotE, half specPow)
+{
+  if (CryMT_PBRLiteOff())
+    return spec;
+  half f = 1 - saturate(NdotE);
+  half f2 = f * f;
+  return lerp(spec, acc, f2 * f2 * f * saturate((specPow - 4) / 60));
+}
+
+)";
+const char* const kLobe = R"(
+// CryMT PBR-lite: the game's Blinn and Phong lobes as GGX (its longer tail, a sharper core) with the power as the
+// roughness (Blinn: alpha^2 = 2 / (n + 2); Phong's power about a quarter of Blinn's for the same highlight), the peak
+// scaled as the game's at power 16 and growing with the power more gently than a normalized lobe ((n + 2) / 18 within
+// 0.5 .. 4: the materials were made for unnormalized lobes). The game's own: *_Game (CRYMT_PBR_LOBE=0 at --gi-install).
+half CryMT_Lobe(half NdotH, half blinnExp, half scaleExp)
+{
+  float a2 = 2 / (max(blinnExp, 0) + 2);
+  float d = NdotH * NdotH * (a2 - 1) + 1;
+  return (a2 * a2 / max(d * d, 1e-8)) * clamp((scaleExp + 2) / 18, 0.5, 4);
+}
+
+half Blinn(half3 N, half3 V, half3 L, half Exp)
+{
+  half3 H = normalize(V + L);
+  return CryMT_Lobe(saturate(dot(N, H)), Exp, Exp);
+}
+
+half Phong(half3 N, half3 V, half3 L, half Exp)
+{
+  half3 R = reflect(-L, N);
+  return CryMT_Lobe(sqrt(saturate(0.5 + 0.5 * dot(V, R))), 4 * Exp, Exp);
+}
+
+half Phong(half3 R, half3 L, half Exp)
+{
+  return CryMT_Lobe(sqrt(saturate(0.5 + 0.5 * dot(L, R))), 4 * Exp, Exp);
+}
+
+)";
+
 const char* const kPom = R"(// CryMT: parallax occlusion mapping for the terrain's detail layers and decals, in place of shadeLib's
 // ParallaxOcclusionMap (15 fixed steps; a step of view.xy / view.z that ran away at grazing views: the smear on steep
 // ground, the user 2026-11-15). Steps by the angle (8 looking down, 32 at a grazing view), the relief faded out below
@@ -1455,7 +1529,7 @@ std::wstring InstallGi()
         CopyTree(UserShaders(), backup);
     const std::wstring tmp = g_dir + L"cache\\shaders_src";
     SHCreateDirectoryExW(nullptr, tmp.c_str(), nullptr);
-    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi Shaders/HWScripts/CryFX/PostProcess.cfx Shaders/HWScripts/CryFX/HumanSkin.cfx Shaders/HWScripts/CryFX/WaterSurface.cfx"))
+    if (!Run(L"tar.exe -xf \"" + g_game + L"Game\\Shaders.pak\" -C \"" + tmp + L"\" Shaders/HWScripts/CryFX/fragLib.cfi Shaders/HWScripts/CryFX/Terrain.cfx Shaders/HWScripts/CryFX/ShadowMaskGen.cfx Shaders/HWScripts/CryFX/CommonZPass.cfi Shaders/HWScripts/CryFX/Particles.cfi Shaders/HWScripts/CryFX/Metal.cfx Shaders/HWScripts/CryFX/Vegetation.cfx Shaders/HWScripts/CryFX/Water.cfx Shaders/HWScripts/CryFX/WaterVols.cfx Shaders/HWScripts/CryFX/ModificatorVT.cfi Shaders/HWScripts/CryFX/CommonMotionBlurPass.cfi Shaders/HWScripts/CryFX/PostProcess.cfx Shaders/HWScripts/CryFX/HumanSkin.cfx Shaders/HWScripts/CryFX/WaterSurface.cfx Shaders/HWScripts/CryFX/shadeLib.cfi"))
         return T(L"не удалось распаковать Shaders.pak", L"could not unpack Shaders.pak");
     std::string frag = Lf(ReadAll(tmp + L"\\" + kFragLib)), terrain = Lf(ReadAll(tmp + L"\\" + kTerrain)),
                 shadowMask = Lf(ReadAll(tmp + L"\\" + kShadowMask)), zpass = Lf(ReadAll(tmp + L"\\" + kZPass)),
@@ -1463,11 +1537,26 @@ std::wstring InstallGi()
                 vegetation = Lf(ReadAll(tmp + L"\\" + kVegetation)), water = Lf(ReadAll(tmp + L"\\" + kWater)),
                 waterVols = Lf(ReadAll(tmp + L"\\" + kWaterVols)), modificator = Lf(ReadAll(tmp + L"\\" + kModificator)),
                 motionBlur = Lf(ReadAll(tmp + L"\\" + kMotionBlurPass)), postProcess = Lf(ReadAll(tmp + L"\\" + kPostProcess)),
-                skin = Lf(ReadAll(tmp + L"\\" + kHumanSkin)), waterSurface = Lf(ReadAll(tmp + L"\\" + kWaterSurface));
+                skin = Lf(ReadAll(tmp + L"\\" + kHumanSkin)), waterSurface = Lf(ReadAll(tmp + L"\\" + kWaterSurface)),
+                shadeLib = Lf(ReadAll(tmp + L"\\Shaders\\HWScripts\\CryFX\\shadeLib.cfi"));
+    // PBR-lite's lobe (kLobe): the game's Blinn / Phong renamed *_Game, the GGX ones after them (shadeLib itself uses
+    // Phong further on). CRYMT_PBR_LOBE=0: shadeLib as it is.
+    wchar_t lobeVar[8] = {};
+    if (!(GetEnvironmentVariableW(L"CRYMT_PBR_LOBE", lobeVar, 8) && lobeVar[0] == L'0') &&
+        !(Replace(shadeLib, "half Blinn(half3 N, half3 V, half3 L, half Exp)\n", "half Blinn_Game(half3 N, half3 V, half3 L, half Exp)\n") &&
+          Replace(shadeLib, "half Phong(half3 N, half3 V, half3 L, half Exp)\n", "half Phong_Game(half3 N, half3 V, half3 L, half Exp)\n") &&
+          Replace(shadeLib, "half Phong(half3 R, half3 L, half Exp)\n", "half Phong_Game(half3 R, half3 L, half Exp)\n") &&
+          Replace(shadeLib, "//////////////////////////////// Cook-Torrance model ////////////////////////",
+                  std::string(kLobe) + "//////////////////////////////// Cook-Torrance model ////////////////////////")))
+        return T(L"не удалось изменить shadeLib.cfi", L"could not patch shadeLib.cfi");
     wchar_t fpv[8] = {};
     const bool fplusLoop = !(GetEnvironmentVariableW(L"CRYMT_FPLUS_SHADERS", fpv, 8) && fpv[0] == L'0');
     // CRYMT_VFOG_SHADERS=0 (tests): the fog pass as the game's (the editor showed no fog, 2026-11-15).
     const bool vfogShaders = !(GetEnvironmentVariableW(L"CRYMT_VFOG_SHADERS", fpv, 8) && fpv[0] == L'0');
+    wchar_t pbrv[16] = {};
+    const bool pbrSet = GetEnvironmentVariableW(L"CRYMT_PBRLITE_SHADERS", pbrv, 16) != 0;
+    const bool pbrAA = !pbrSet || _wcsicmp(pbrv, L"all") == 0 || _wcsicmp(pbrv, L"aa") == 0;
+    const bool pbrFresnel = !pbrSet || _wcsicmp(pbrv, L"all") == 0 || _wcsicmp(pbrv, L"fresnel") == 0;
     const std::string dbLoop = "#if %DYN_BRANCHING\n  float2 tcLI = LightInfoTC_DB.xy;\n  float tcIter = LightInfoTC_DB.z;\n"
                                "  float tcIterParam = LightInfoTC_DB.w;\n  for (int i=0; i<LightsNum_DB; i++, tcLI.x+=tcIter)\n#else\n";
     const bool ok = // The ocean's reflection from CryMT's cube when it is bound (kWaterEnvDecl).
@@ -1482,7 +1571,7 @@ std::wstring InstallGi()
                     // A material's own cube map at the level of its gloss (the engine's copy holds GGX by level).
                     Replace(frag, "pPass.cEnvironment = GetEnvironmentCMap(envMapSamplerCUBE, pPass.vReflVec.xyz);",
                             "pPass.cEnvironment = texCUBElod(envMapSamplerCUBE, float4(pPass.vReflVec.xyz, 6 * sqrt(sqrt(2 / (pPass.fSpecPow + 2))))).xyz; // CryMT") &&
-                    Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl) &&
+                    Replace(frag, "#include \"CommonRAM.cfi\"\n", std::string(kGiDecl) + kFPlusDecl + kPbrLite) && // PBR-lite before frag_final_composition (its Fresnel)
                     // The sun's shadow mask with CryMT's screen-space shadows, also beyond the shadow maps.
                     Replace(frag, "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);",
                             "    pPass.cShadowOcclMap = tex2Dproj(shadowOccludeMapSampler, pPass.IN.screenProj.xyzw);\n"
@@ -1513,6 +1602,11 @@ std::wstring InstallGi()
                     // the engine composes its own (shaded by the light reaching the surface, times the gloss map and the
                     // specular colour), Schlick's fresnel; Metal stronger (it defines CRYMT_ENV_STRENGTH).
                     Replace(frag, "  // do custom pass setup\n  frag_custom_begin(pPass);", kEnvAll) &&
+                    // PBR-lite's parts in fragLib (CRYMT_PBRLITE_SHADERS: all, aa, fresnel, none).
+                    (!pbrAA || Replace(frag, "  // do custom pass setup\n  frag_custom_begin(pPass);", std::string("  // do custom pass setup\n  frag_custom_begin(pPass);") + kPbrLiteAA)) &&
+                    (!pbrFresnel || Replace(frag, "  half3 cSpecular = pPass.cSpecularAcc.xyz * pPass.cGlossMap.xyz;                    // 2 alu\n",
+                                            "  half3 cSpecular = pPass.cSpecularAcc.xyz * pPass.cGlossMap.xyz;                    // 2 alu\n"
+                                            "  cSpecular = CryMT_SpecFresnel(cSpecular, pPass.cSpecularAcc.xyz, pPass.fNdotE, pPass.fSpecPow); // CryMT PBR-lite\n")) &&
                     // The terrain's and decals' parallax occlusion mapping (kPom).
                     Replace(frag, "half4 frag_shared_output(inout fragPass pPass)\n{", std::string(kPom) + "half4 frag_shared_output(inout fragPass pPass)\n{") &&
                     Replace(frag, "   \tfloat2 offsetBest = ParallaxOcclusionMap(bumpTC.xy, lodBump, viewDir, 15, dispAmount);\n",
@@ -1706,6 +1800,7 @@ std::wstring InstallGi()
                               {"Shaders/HWScripts/CryFX/PostProcess.cfx", Crlf(postProcess)},
                               {"Shaders/HWScripts/CryFX/HumanSkin.cfx", Crlf(skin)},
                               {"Shaders/HWScripts/CryFX/WaterSurface.cfx", Crlf(waterSurface)},
+                              {"Shaders/HWScripts/CryFX/shadeLib.cfi", Crlf(shadeLib)},
                               {"Textures/CryMT/vfog.dds", vfog},
                               {"Textures/CryMT/vfogp.dds", vfogParams},
                               {"Textures/CryMT/waterenv.dds", waterEnv},
